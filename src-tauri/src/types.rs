@@ -37,6 +37,10 @@ pub struct Thread {
     pub subject: String,
     pub snippet: String,
     pub participants: Vec<String>,
+    /// Recipient participants (`Name <email>` / bare address) — union of the
+    /// messages' To/Cc. Powers `to:` in split queries.
+    #[serde(default)]
+    pub recipients: Vec<String>,
     pub message_count: i64,
     pub last_date: i64,
     pub unread: bool,
@@ -44,8 +48,18 @@ pub struct Thread {
     pub labels: Vec<String>,
     pub in_inbox: bool,
     pub snoozed_until: Option<i64>,
+    /// Home split id, materialized at sync/upsert time by the classifier in
+    /// splits.rs. Empty = not yet classified (boot pass fills it in).
+    #[serde(default)]
+    pub split: String,
+    /// Extra split tabs this thread also surfaces in (a home split with
+    /// alsoShow set forwards the thread where it would otherwise have landed).
+    #[serde(default)]
+    pub also_in: Vec<String>,
 }
 
+/// Legacy (pre-v0.23) structured rule — deserialized only so saved settings
+/// migrate to the query language; never written back.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct SplitRule {
@@ -59,9 +73,26 @@ pub struct Split {
     pub id: String,
     pub name: String,
     pub builtin: bool,
-    pub rules: Vec<SplitRule>,
-    pub op: String, // and | or
+    /// Gmail-style boolean query (see splits.rs). Empty = the catch-all.
+    #[serde(default)]
+    pub query: String,
+    /// None = the split applies to every account; Some(email) scopes it.
+    #[serde(default)]
+    pub account_id: Option<String>,
+    /// Also surface matching threads where they would otherwise land
+    /// (Important or the catch-all — Superhuman's "also show" toggle).
+    #[serde(default)]
+    pub also_show: bool,
     pub hide_when_empty: bool,
+    /// Legacy pre-v0.23 fields, migrated to `query` on read in get_settings.
+    #[serde(default, skip_serializing)]
+    pub rules: Vec<SplitRule>,
+    #[serde(default = "default_op", skip_serializing)]
+    pub op: String, // and | or
+}
+
+fn default_op() -> String {
+    "or".into()
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

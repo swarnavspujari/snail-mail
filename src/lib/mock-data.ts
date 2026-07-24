@@ -6,7 +6,10 @@ const D = 24 * H;
 const now = Date.now();
 
 interface Seed {
-  thread: Omit<Thread, "snippet" | "messageCount" | "lastDate" | "participants">;
+  thread: Omit<
+    Thread,
+    "snippet" | "messageCount" | "lastDate" | "participants" | "recipients" | "split" | "alsoIn"
+  >;
   account?: string; // defaults to the primary demo account
   messages: Array<
     Pick<Message, "from" | "fromName" | "to" | "cc" | "bodyText"> & {
@@ -545,9 +548,12 @@ export function buildSeedData(): {
       ...seed.thread,
       snippet: last.snippet,
       participants: [...new Set(msgs.map((m) => `${m.fromName} <${m.from}>`))],
+      recipients: [...new Set(msgs.flatMap((m) => [...m.to, ...m.cc]))],
       messageCount: msgs.length,
       lastDate: last.date,
       unread: msgs.some((m) => m.unread),
+      split: "", // classified by MockBackend (mirrors the Rust upsert path)
+      alsoIn: [],
     });
   }
   return { threads, messages, accountOf };

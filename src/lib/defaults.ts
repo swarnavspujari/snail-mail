@@ -7,16 +7,18 @@ export const DEFAULT_SPLITS: Split[] = [
     id: "important",
     name: "Important",
     builtin: true,
-    rules: [{ field: "label", contains: "IMPORTANT" }],
-    op: "or",
+    query: "label:IMPORTANT",
+    accountId: null,
+    alsoShow: false,
     hideWhenEmpty: false,
   },
   {
     id: "other",
     name: "Other",
     builtin: true,
-    rules: [], // empty rules = catch-all for threads no other split claims
-    op: "or",
+    query: "", // empty query = catch-all for threads no other split claims
+    accountId: null,
+    alsoShow: false,
     hideWhenEmpty: false,
   },
   // The old builtin "Calendar" split is gone as of v0.7 — the calendar lives
@@ -133,7 +135,7 @@ export const DEFAULT_SHORTCUTS: Record<string, string> = {
 
 export function defaultSettings(): Settings {
   return {
-    splits: DEFAULT_SPLITS.map((s) => ({ ...s, rules: [...s.rules] })),
+    splits: DEFAULT_SPLITS.map((s) => ({ ...s })),
     // NIM/DeepSeek is the default because it's the key the user supplied
     defaultAiProvider: "nim",
     providers: [

@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { backend, type MailView } from "@/lib/ipc";
-import { assignSplit } from "@/lib/mock";
+import { threadInSplit } from "@/lib/split-query";
 import { reconcilePendingMessages, type PendingMessage } from "@/lib/pending";
 import { useSettings } from "./settings";
 import type { Message, SearchResult, Thread, ThreadId } from "@/lib/types";
@@ -44,6 +44,9 @@ interface MailState {
 
   listView: MailView;
   activeSplitId: string;
+  /** Inbox conversation count per split id, from the backend's SQL over the
+   *  whole mailbox (tab badges; hideWhenEmpty). */
+  splitCounts: Record<string, number>;
   selectedIndex: number;
   /** Multi-select for bulk triage; cleared when the view changes. */
   selectedIds: Set<ThreadId>;
@@ -110,10 +113,22 @@ interface MailState {
   }) => Promise<number>;
 }
 
-/** Threads of the given split, using settings order; "counts show totals". */
+/** Threads of the given split. Membership is the backend-materialized
+ *  `split`/`alsoIn` fields — the UI never evaluates queries; unclassified
+ *  rows ("", boot backfill in flight) file under the catch-all. */
 export function splitThreads(inbox: Thread[], splitId: string): Thread[] {
-  const splits = useSettings.getState().settings.splits;
-  return inbox.filter((t) => assignSplit(t, splits) === splitId);
+  const st = useSettings.getState();
+  return inbox.filter((t) =>
+    threadInSplit(t, splitId, st.settings.splits, st.accounts.active)
+  );
+}
+
+/** The splits visible for the active account, in settings order. */
+export function accountSplits() {
+  const st = useSettings.getState();
+  return st.settings.splits.filter(
+    (sp) => sp.accountId == null || sp.accountId === st.accounts.active
+  );
 }
 
 export function visibleThreads(s: MailState): Thread[] {
@@ -135,6 +150,7 @@ export const useMail = create<MailState>((set, get) => ({
   labelThreads: [],
   listView: "inbox",
   activeSplitId: "important",
+  splitCounts: {},
   selectedIndex: 0,
   selectedIds: new Set<ThreadId>(),
   openThreadId: null,
@@ -157,6 +173,7 @@ export const useMail = create<MailState>((set, get) => ({
       backend.listThreads("reminders").then((reminders) => set({ reminders })),
       backend.listThreads("starred").then((starred) => set({ starred })),
       backend.listThreads("trash").then((trash) => set({ trash })),
+      backend.splitCounts().then((splitCounts) => set({ splitCounts })),
       labelView
         ? backend.listThreads(labelView).then((labelThreads) => {
             labelCache.set(labelView, labelThreads);
@@ -164,6 +181,14 @@ export const useMail = create<MailState>((set, get) => ({
           })
         : Promise.resolve(),
     ]);
+    // A deleted split (or an account switch that hides a scoped one) must not
+    // leave the active tab dangling — that used to fake inbox-zero.
+    {
+      const visible = accountSplits();
+      if (visible.length > 0 && !visible.some((sp) => sp.id === get().activeSplitId)) {
+        set({ activeSplitId: visible[0].id, selectedIndex: 0, selectedIds: new Set() });
+      }
+    }
     const s = get();
     const visible = visibleThreads(s);
     const max = visible.length - 1;
@@ -198,12 +223,13 @@ export const useMail = create<MailState>((set, get) => ({
     set({ activeSplitId: id, selectedIndex: 0, selectedIds: new Set() }),
 
   cycleSplit: (dir) => {
-    const { settings } = useSettings.getState();
     const s = get();
     if (s.listView !== "inbox") return;
-    const ids = settings.splits
+    const ids = accountSplits()
       .filter(
-        (sp) => !sp.hideWhenEmpty || splitThreads(s.inbox, sp.id).length > 0
+        (sp) =>
+          !sp.hideWhenEmpty ||
+          (s.splitCounts[sp.id] ?? splitThreads(s.inbox, sp.id).length) > 0
       )
       .map((sp) => sp.id);
     if (ids.length === 0) return;

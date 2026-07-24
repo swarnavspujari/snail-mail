@@ -103,6 +103,17 @@ pub fn open(path: &std::path::Path) -> Result<Connection, String> {
     // .ics attachment) captured at sync so the RSVP bar detects invites
     // without refetching the message.
     let _ = conn.execute("ALTER TABLE messages ADD COLUMN ics_data TEXT", []);
+    // v0.23: split membership is materialized at sync time (splits.rs), and
+    // threads carry their recipients so `to:` queries can match. NULL split_id
+    // = not yet classified; the boot pass backfills. The composite index also
+    // finally covers the hot account_id predicates (list/count/purge).
+    let _ = conn.execute("ALTER TABLE threads ADD COLUMN recipients TEXT NOT NULL DEFAULT '[]'", []);
+    let _ = conn.execute("ALTER TABLE threads ADD COLUMN split_id TEXT", []);
+    let _ = conn.execute("ALTER TABLE threads ADD COLUMN split_also TEXT NOT NULL DEFAULT '[]'", []);
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_threads_account_split ON threads(account_id, split_id)",
+        [],
+    );
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS drafts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -407,17 +418,23 @@ pub fn default_settings() -> Settings {
                 id: "important".into(),
                 name: "Important".into(),
                 builtin: true,
-                rules: vec![SplitRule { field: "label".into(), contains: "IMPORTANT".into() }],
-                op: "or".into(),
+                query: "label:IMPORTANT".into(),
+                account_id: None,
+                also_show: false,
                 hide_when_empty: false,
+                rules: vec![],
+                op: "or".into(),
             },
             Split {
                 id: "other".into(),
                 name: "Other".into(),
                 builtin: true,
+                query: String::new(), // empty query = catch-all
+                account_id: None,
+                also_show: false,
+                hide_when_empty: false,
                 rules: vec![],
                 op: "or".into(),
-                hide_when_empty: false,
             },
             // the builtin "Calendar" split became the side panel in v0.7;
             // get_settings drops saved copies on read
@@ -532,8 +549,8 @@ pub fn get_settings(conn: &Connection) -> Settings {
                     s.providers.push(p);
                 }
             }
-            // v0.7: the builtin Calendar split became the side panel
-            s.splits.retain(|sp| !(sp.builtin && sp.id == "calendar"));
+            // v0.7 (drop builtin Calendar) + v0.23 (rules -> query language)
+            migrate_splits(&mut s.splits);
             s
         }
     };
@@ -582,10 +599,15 @@ fn row_to_thread(r: &rusqlite::Row) -> rusqlite::Result<Thread> {
         labels: serde_json::from_str(&r.get::<_, String>(8)?).unwrap_or_default(),
         in_inbox: r.get::<_, i64>(9)? != 0,
         snoozed_until: r.get(10)?,
+        recipients: serde_json::from_str(&r.get::<_, String>(11)?).unwrap_or_default(),
+        // NULL = pre-migration row the boot pass hasn't reached; the UI files
+        // "" under the catch-all until then.
+        split: r.get::<_, Option<String>>(12)?.unwrap_or_default(),
+        also_in: serde_json::from_str(&r.get::<_, String>(13)?).unwrap_or_default(),
     })
 }
 
-const THREAD_COLS: &str = "id, subject, snippet, participants, message_count, last_date, unread, starred, labels, in_inbox, snoozed_until";
+const THREAD_COLS: &str = "id, subject, snippet, participants, message_count, last_date, unread, starred, labels, in_inbox, snoozed_until, recipients, split_id, split_also";
 
 pub fn list_threads(conn: &Connection, view: &str, account_id: &str) -> Result<Vec<Thread>, String> {
     // Every view except trash hides soft-deleted rows; trash IS those rows.
@@ -646,6 +668,109 @@ pub fn count_threads(conn: &Connection, account_id: &str) -> i64 {
         |r| r.get(0),
     )
     .unwrap_or(0)
+}
+
+/// Any thread the classifier hasn't touched yet (pre-v0.23 rows) — the boot
+/// pass checks this before spawning a backfill.
+pub fn has_unclassified_threads(conn: &Connection) -> bool {
+    conn.query_row("SELECT 1 FROM threads WHERE split_id IS NULL LIMIT 1", [], |_| Ok(()))
+        .is_ok()
+}
+
+/// Re-run the classifier over stored threads: every thread when `only_missing`
+/// is false (a split definition changed), else just NULL rows (boot backfill).
+/// One page per call so callers can chunk under the DB lock; returns
+/// (updated_rows, done). Resume by rowid keeps each page O(page).
+pub fn reclassify_page(
+    conn: &Connection,
+    after_rowid: i64,
+    page: usize,
+    only_missing: bool,
+) -> Result<(usize, i64, bool), String> {
+    let filter = if only_missing { "AND split_id IS NULL" } else { "" };
+    let sql = format!(
+        "SELECT rowid, {THREAD_COLS}, account_id FROM threads
+         WHERE rowid > ?1 {filter} ORDER BY rowid LIMIT ?2"
+    );
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let rows: Vec<(i64, Thread, String)> = stmt
+        .query_map(params![after_rowid, page as i64], |r| {
+            let rowid: i64 = r.get(0)?;
+            // row_to_thread reads columns 0.. — shift past rowid by hand
+            let t = Thread {
+                id: r.get(1)?,
+                subject: r.get(2)?,
+                snippet: r.get(3)?,
+                participants: serde_json::from_str(&r.get::<_, String>(4)?).unwrap_or_default(),
+                message_count: r.get(5)?,
+                last_date: r.get(6)?,
+                unread: r.get::<_, i64>(7)? != 0,
+                starred: r.get::<_, i64>(8)? != 0,
+                labels: serde_json::from_str(&r.get::<_, String>(9)?).unwrap_or_default(),
+                in_inbox: r.get::<_, i64>(10)? != 0,
+                snoozed_until: r.get(11)?,
+                recipients: serde_json::from_str(&r.get::<_, String>(12)?).unwrap_or_default(),
+                split: r.get::<_, Option<String>>(13)?.unwrap_or_default(),
+                also_in: serde_json::from_str(&r.get::<_, String>(14)?).unwrap_or_default(),
+            };
+            let account: String = r.get(15)?;
+            Ok((rowid, t, account))
+        })
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let done = rows.len() < page;
+    let last_rowid = rows.last().map(|(r, _, _)| *r).unwrap_or(after_rowid);
+    let splits = split_config(conn);
+    // compile once per account seen in this page
+    let mut specs: HashMap<String, Vec<crate::splits::SplitSpec>> = HashMap::new();
+    let mut updated = 0usize;
+    for (rowid, t, account) in &rows {
+        let spec = specs
+            .entry(account.clone())
+            .or_insert_with(|| crate::splits::compile(&splits, account));
+        let (home, also) = classify_thread(t, spec);
+        let also_json = serde_json::to_string(&also).unwrap();
+        if t.split != home || serde_json::to_string(&t.also_in).unwrap() != also_json {
+            conn.execute(
+                "UPDATE threads SET split_id = ?2, split_also = ?3 WHERE rowid = ?1",
+                params![rowid, home, also_json],
+            )
+            .map_err(|e| e.to_string())?;
+            updated += 1;
+        }
+    }
+    Ok((updated, last_rowid, done))
+}
+
+/// Inbox conversation count per split for the tab row — SQL over the whole
+/// mailbox, not the 500-row display window. alsoShow forwards count too.
+pub fn split_counts(conn: &Connection, account_id: &str) -> Result<HashMap<String, i64>, String> {
+    let mut out: HashMap<String, i64> = HashMap::new();
+    let mut tally = |sql: &str| -> Result<(), String> {
+        let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+        let rows: Vec<(String, i64)> = stmt
+            .query_map(params![account_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect();
+        for (id, n) in rows {
+            *out.entry(id).or_insert(0) += n;
+        }
+        Ok(())
+    };
+    tally(
+        "SELECT COALESCE(split_id, ''), COUNT(*) FROM threads
+         WHERE account_id = ?1 AND in_inbox = 1 AND snoozed_until IS NULL AND hidden IS NULL
+         GROUP BY COALESCE(split_id, '')",
+    )?;
+    tally(
+        "SELECT j.value, COUNT(*) FROM threads, json_each(threads.split_also) j
+         WHERE account_id = ?1 AND in_inbox = 1 AND snoozed_until IS NULL AND hidden IS NULL
+         GROUP BY j.value",
+    )?;
+    Ok(out)
 }
 
 pub fn get_thread(conn: &Connection, id: &str) -> Option<Thread> {
@@ -718,22 +843,63 @@ pub type MsgRow = (
     Vec<(Attachment, Option<String>, Option<String>, Option<String>)>,
 );
 
+/// The splits config as classification needs it: raw settings JSON (no
+/// keychain lookups, unlike get_settings) with the legacy-rules migration
+/// applied. Falls back to the defaults on a fresh store.
+pub fn split_config(conn: &Connection) -> Vec<Split> {
+    let mut splits = get_json::<Settings>(conn, "settings")
+        .map(|s| s.splits)
+        .unwrap_or_else(|| default_settings().splits);
+    migrate_splits(&mut splits);
+    splits
+}
+
+/// v0.7 + v0.23 split migrations, shared by get_settings and split_config:
+/// drop the retired builtin Calendar split, convert legacy rules to a query.
+fn migrate_splits(splits: &mut Vec<Split>) {
+    splits.retain(|sp| !(sp.builtin && sp.id == "calendar"));
+    for sp in splits.iter_mut() {
+        if sp.query.trim().is_empty() && !sp.rules.is_empty() {
+            sp.query = crate::splits::query_from_rules(&sp.rules, &sp.op);
+        }
+        sp.rules.clear();
+    }
+}
+
+/// Classify one thread against the account's compiled splits.
+fn classify_thread(t: &Thread, specs: &[crate::splits::SplitSpec]) -> (String, Vec<String>) {
+    let facts = crate::splits::Facts {
+        senders: &t.participants,
+        recipients: &t.recipients,
+        subject: &t.subject,
+        labels: &t.labels,
+    };
+    crate::splits::classify(specs, &facts)
+}
+
 /// Upsert a thread and its messages (used by both mock seeding and Gmail sync).
+/// Split membership is (re)materialized here — every sync refetch reclassifies,
+/// so label/participant changes move threads between splits on their own.
 pub fn upsert_thread(
     conn: &Connection,
     account_id: &str,
     t: &Thread,
     msgs: &[MsgRow],
 ) -> Result<(), String> {
+    let specs = crate::splits::compile(&split_config(conn), account_id);
+    let (split_id, split_also) = classify_thread(t, &specs);
     conn.execute(
         "INSERT INTO threads (id, subject, snippet, participants, message_count, last_date,
-                              unread, starred, labels, in_inbox, snoozed_until, account_id)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+                              unread, starred, labels, in_inbox, snoozed_until, account_id,
+                              recipients, split_id, split_also)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
          ON CONFLICT(id) DO UPDATE SET
             subject=excluded.subject, snippet=excluded.snippet,
             participants=excluded.participants, message_count=excluded.message_count,
             last_date=excluded.last_date, unread=excluded.unread, starred=excluded.starred,
-            labels=excluded.labels, in_inbox=excluded.in_inbox, account_id=excluded.account_id",
+            labels=excluded.labels, in_inbox=excluded.in_inbox, account_id=excluded.account_id,
+            recipients=excluded.recipients, split_id=excluded.split_id,
+            split_also=excluded.split_also",
         params![
             t.id,
             t.subject,
@@ -747,6 +913,9 @@ pub fn upsert_thread(
             t.in_inbox as i64,
             t.snoozed_until,
             account_id,
+            serde_json::to_string(&t.recipients).unwrap(),
+            split_id,
+            serde_json::to_string(&split_also).unwrap(),
         ],
     )
     .map_err(|e| e.to_string())?;
@@ -2082,6 +2251,7 @@ mod tests {
             subject: subject.into(),
             snippet: body.chars().take(50).collect(),
             participants: vec![from.into()],
+            recipients: vec![],
             message_count: 1,
             last_date: date,
             unread: false,
@@ -2089,6 +2259,8 @@ mod tests {
             labels: vec![],
             in_inbox: true,
             snoozed_until: None,
+            split: String::new(),
+            also_in: vec![],
         };
         let m = Message {
             id: format!("{id}-m1"),
@@ -2106,6 +2278,106 @@ mod tests {
             attachments: vec![],
         };
         upsert_thread(conn, ACCT, &t, &[(m, None, None, None, vec![])]).unwrap();
+    }
+
+    fn travel_split() -> Split {
+        Split {
+            id: "travel".into(),
+            name: "Travel".into(),
+            builtin: false,
+            query: "from:thriftytraveler.com OR from:thepointsguy.com".into(),
+            account_id: None,
+            also_show: false,
+            hide_when_empty: false,
+            rules: vec![],
+            op: "or".into(),
+        }
+    }
+
+    #[test]
+    fn upsert_materializes_split_membership() {
+        let conn = open(std::path::Path::new(":memory:")).unwrap();
+        let mut s = default_settings();
+        s.splits.insert(0, travel_split());
+        set_json(&conn, "settings", &s).unwrap();
+
+        seed(&conn, "t-deal", "Flash sale", "40k to Europe", "Thrifty Traveler <deals@thriftytraveler.com>", 2_000);
+        seed(&conn, "t-plain", "Hello", "no split matches this", "Bob <bob@plain.io>", 1_000);
+        let rows = list_threads(&conn, "inbox", ACCT).unwrap();
+        let by_id = |id: &str| rows.iter().find(|t| t.id == id).unwrap();
+        assert_eq!(by_id("t-deal").split, "travel");
+        assert_eq!(by_id("t-plain").split, "other");
+
+        let counts = split_counts(&conn, ACCT).unwrap();
+        assert_eq!(counts.get("travel"), Some(&1));
+        assert_eq!(counts.get("other"), Some(&1));
+    }
+
+    #[test]
+    fn changing_splits_reclassifies_stored_threads() {
+        let conn = open(std::path::Path::new(":memory:")).unwrap();
+        // classified under the defaults first — lands in the catch-all
+        seed(&conn, "t-deal", "Flash sale", "body", "Thrifty Traveler <deals@thriftytraveler.com>", 2_000);
+        assert_eq!(list_threads(&conn, "inbox", ACCT).unwrap()[0].split, "other");
+
+        // owner creates the travel split → the background pass re-files it
+        let mut s = default_settings();
+        s.splits.insert(0, travel_split());
+        set_json(&conn, "settings", &s).unwrap();
+        let mut after = 0i64;
+        loop {
+            let (_, last, done) = reclassify_page(&conn, after, 100, false).unwrap();
+            after = last;
+            if done {
+                break;
+            }
+        }
+        assert_eq!(list_threads(&conn, "inbox", ACCT).unwrap()[0].split, "travel");
+    }
+
+    #[test]
+    fn also_show_counts_forward_to_the_catch_all() {
+        let conn = open(std::path::Path::new(":memory:")).unwrap();
+        let mut s = default_settings();
+        let mut sp = travel_split();
+        sp.also_show = true;
+        s.splits.insert(0, sp);
+        set_json(&conn, "settings", &s).unwrap();
+        seed(&conn, "t-deal", "Flash sale", "body", "Thrifty Traveler <deals@thriftytraveler.com>", 2_000);
+        let rows = list_threads(&conn, "inbox", ACCT).unwrap();
+        assert_eq!(rows[0].split, "travel");
+        assert_eq!(rows[0].also_in, vec!["other".to_string()]);
+        let counts = split_counts(&conn, ACCT).unwrap();
+        assert_eq!(counts.get("travel"), Some(&1));
+        assert_eq!(counts.get("other"), Some(&1)); // forwarded, not moved
+    }
+
+    #[test]
+    fn legacy_settings_blob_migrates_rules_to_query() {
+        let conn = open(std::path::Path::new(":memory:")).unwrap();
+        // a pre-v0.23 settings blob: splits carry rules/op and no query
+        let mut v = serde_json::to_value(default_settings()).unwrap();
+        v["splits"] = serde_json::json!([
+            { "id": "important", "name": "Important", "builtin": true,
+              "rules": [{ "field": "label", "contains": "IMPORTANT" }],
+              "op": "or", "hideWhenEmpty": false },
+            { "id": "custom-1", "name": "Deals", "builtin": false,
+              "rules": [{ "field": "from", "contains": "thriftytraveler.com" },
+                         { "field": "subject", "contains": "flash sale" }],
+              "op": "or", "hideWhenEmpty": true },
+            { "id": "other", "name": "Other", "builtin": true,
+              "rules": [], "op": "or", "hideWhenEmpty": false }
+        ]);
+        set_json(&conn, "settings", &v).unwrap();
+
+        let s = get_settings(&conn);
+        assert_eq!(s.splits[0].query, "label:IMPORTANT");
+        assert_eq!(s.splits[1].query, "from:thriftytraveler.com OR subject:\"flash sale\"");
+        assert!(s.splits[1].hide_when_empty);
+        assert_eq!(s.splits[2].query, "");
+        // classification sees the same migrated config
+        let cfg = split_config(&conn);
+        assert_eq!(cfg[1].query, "from:thriftytraveler.com OR subject:\"flash sale\"");
     }
 
     #[test]
@@ -2141,6 +2413,7 @@ mod tests {
             subject: "Disconnect me".into(),
             snippet: String::new(),
             participants: vec!["Bob".into()],
+            recipients: vec![],
             message_count: 1,
             last_date: 2_000,
             unread: false,
@@ -2148,6 +2421,8 @@ mod tests {
             labels: vec![],
             in_inbox: true,
             snoozed_until: None,
+            split: String::new(),
+            also_in: vec![],
         };
         let m = Message {
             id: "t-gone-m1".into(),
@@ -2192,6 +2467,7 @@ mod tests {
             subject: "Intro thread".into(),
             snippet: String::new(),
             participants: vec!["You".into()],
+            recipients: vec![],
             message_count: 1,
             last_date: 2_000,
             unread: false,
@@ -2199,6 +2475,8 @@ mod tests {
             labels: vec![],
             in_inbox: true,
             snoozed_until: None,
+            split: String::new(),
+            also_in: vec![],
         };
         let m = Message {
             id: "t-to-m1".into(),
@@ -2325,6 +2603,7 @@ mod tests {
             subject: "Intro".into(),
             snippet: String::new(),
             participants: vec!["You".into()],
+            recipients: vec![],
             message_count: 1,
             last_date: 2_000,
             unread: false,
@@ -2332,6 +2611,8 @@ mod tests {
             labels: vec![],
             in_inbox: true,
             snoozed_until: None,
+            split: String::new(),
+            also_in: vec![],
         };
         let m = Message {
             id: "t-to-m1".into(),

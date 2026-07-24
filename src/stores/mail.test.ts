@@ -9,6 +9,7 @@ const backend = vi.hoisted(() => ({
   listThreads: vi.fn(),
   getThread: vi.fn(),
   refetchMessageBody: vi.fn(),
+  splitCounts: vi.fn().mockResolvedValue({}),
 }));
 
 vi.mock("@/lib/ipc", () => ({ backend, isTauri: false }));
@@ -40,6 +41,7 @@ function thread(over: Partial<Thread>): Thread {
     subject: "Term sheet",
     snippet: "hello",
     participants: ["Maya Chen"],
+    recipients: [],
     messageCount: 1,
     lastDate: 1000,
     unread: false,
@@ -47,6 +49,8 @@ function thread(over: Partial<Thread>): Thread {
     inInbox: true,
     snoozedUntil: null,
     labels: [],
+    split: "",
+    alsoIn: [],
     ...over,
   } as Thread;
 }

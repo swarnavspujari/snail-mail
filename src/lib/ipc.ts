@@ -202,6 +202,12 @@ export interface Backend {
 
   getSettings(): Promise<Settings>;
   saveSettings(settings: Settings): Promise<void>;
+  /** Inbox conversation count per split id for the active account — SQL over
+   *  the whole mailbox, so tab counts aren't capped at the display window. */
+  splitCounts(): Promise<Record<string, number>>;
+  /** Live validation + match preview for the split editor. `error` doubles as
+   *  an informational note when ok (e.g. the empty catch-all query). */
+  previewSplit(query: string): Promise<{ ok: boolean; error: string | null; count: number }>;
   getKnowledgeBase(): Promise<KnowledgeBase>;
   saveKnowledgeBase(kb: KnowledgeBase): Promise<void>;
 
@@ -497,6 +503,14 @@ class TauriBackend implements Backend {
   }
   saveSettings(settings: Settings) {
     return invoke<void>("save_settings", { settings });
+  }
+  splitCounts() {
+    return invoke<Record<string, number>>("split_counts");
+  }
+  previewSplit(query: string) {
+    return invoke<{ ok: boolean; error: string | null; count: number }>("preview_split", {
+      query,
+    });
   }
   getKnowledgeBase() {
     return invoke<KnowledgeBase>("get_knowledge_base");

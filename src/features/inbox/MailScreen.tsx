@@ -76,11 +76,16 @@ function CalendarToggle({ overlay }: { overlay?: boolean }) {
 function SplitTabs({ overlay }: { overlay?: boolean }) {
   const inbox = useMail((s) => s.inbox);
   const activeSplitId = useMail((s) => s.activeSplitId);
+  const splitCounts = useMail((s) => s.splitCounts);
   const splits = useSettings((s) => s.settings.splits);
+  const activeAccount = useSettings((s) => s.accounts.active);
 
-  const shown = splits.filter(
-    (sp) => !sp.hideWhenEmpty || splitThreads(inbox, sp.id).length > 0
-  );
+  // Backend SQL counts cover the whole mailbox; the local list length is the
+  // fallback until the first refresh lands.
+  const countOf = (id: string) => splitCounts[id] ?? splitThreads(inbox, id).length;
+  const shown = splits
+    .filter((sp) => sp.accountId == null || sp.accountId === activeAccount)
+    .filter((sp) => !sp.hideWhenEmpty || countOf(sp.id) > 0);
 
   // Over the inbox-zero photo the tabs stay put but go translucent-white with
   // a soft shadow (the chrome sits ON the photo, per the inbox-zero pattern).
@@ -89,7 +94,7 @@ function SplitTabs({ overlay }: { overlay?: boolean }) {
   return (
     <div className="relative z-10 flex h-[52px] shrink-0 items-center gap-5 px-6">
       {shown.map((sp) => {
-        const count = splitThreads(inbox, sp.id).length;
+        const count = countOf(sp.id);
         const active = sp.id === activeSplitId;
         return (
           <button

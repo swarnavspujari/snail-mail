@@ -412,6 +412,7 @@ pub fn thread_from_json(id: &str, v: &Value, in_inbox: bool) -> (Thread, Vec<sto
     let raw_msgs = v["messages"].as_array().unwrap_or(&empty);
     let mut msgs: Vec<store::MsgRow> = vec![];
     let mut participants: Vec<String> = vec![];
+    let mut recipients: Vec<String> = vec![];
     let mut labels: HashSet<String> = HashSet::new();
     let mut unread = false;
     let mut last_date = 0i64;
@@ -435,6 +436,14 @@ pub fn thread_from_json(id: &str, v: &Value, in_inbox: bool) -> (Thread, Vec<sto
         if !participants.contains(&p) {
             participants.push(p);
         }
+        // Recipient union across the thread powers `to:` split queries.
+        // Capped so a huge CC blast can't bloat the row.
+        for addr in parsed.message.to.iter().chain(parsed.message.cc.iter()) {
+            let a = addr.trim().to_string();
+            if !a.is_empty() && !recipients.contains(&a) && recipients.len() < 40 {
+                recipients.push(a);
+            }
+        }
         let atts = parsed
             .attachments
             .into_iter()
@@ -449,16 +458,21 @@ pub fn thread_from_json(id: &str, v: &Value, in_inbox: bool) -> (Thread, Vec<sto
         subject: if subject.is_empty() { "(no subject)".into() } else { subject },
         snippet,
         participants,
+        recipients,
         message_count: msgs.len() as i64,
         last_date,
         unread,
         starred,
+        // CATEGORY_* stays (v0.23) so category-driven splits are expressible;
+        // the UI filters them from label chips.
         labels: labels
             .into_iter()
-            .filter(|l| l != "INBOX" && l != "UNREAD" && l != "STARRED" && !l.starts_with("CATEGORY_"))
+            .filter(|l| l != "INBOX" && l != "UNREAD" && l != "STARRED")
             .collect(),
         in_inbox,
         snoozed_until: None,
+        split: String::new(),   // materialized by upsert_thread
+        also_in: vec![],
     };
     (thread, msgs)
 }
@@ -840,6 +854,7 @@ mod tests {
             subject: subject.into(),
             snippet: body.chars().take(50).collect(),
             participants: vec!["Ann".into()],
+            recipients: vec![],
             message_count: 1,
             last_date: date,
             unread: false,
@@ -847,6 +862,8 @@ mod tests {
             labels: vec![],
             in_inbox: true,
             snoozed_until: None,
+            split: String::new(),
+            also_in: vec![],
         };
         let m = Message {
             id: format!("{id}-m1"),

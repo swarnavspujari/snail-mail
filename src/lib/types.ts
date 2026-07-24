@@ -33,6 +33,9 @@ export interface Thread {
   subject: string;
   snippet: string;
   participants: string[];
+  /** Recipient participants (`Name <email>` / bare address) — union of the
+   *  messages' To/Cc. Powers `to:` in split queries. */
+  recipients: string[];
   messageCount: number;
   lastDate: number; // unix ms
   unread: boolean;
@@ -40,22 +43,26 @@ export interface Thread {
   labels: string[];
   inInbox: boolean;
   snoozedUntil: number | null; // unix ms
-}
-
-export type SplitField = "from" | "to" | "subject" | "label";
-export type SplitOp = "and" | "or";
-
-export interface SplitRule {
-  field: SplitField;
-  contains: string;
+  /** Home split id, materialized by the backend classifier at sync time.
+   *  "" = not yet classified (boot backfill in flight) — files under the
+   *  catch-all until the pass lands. */
+  split: string;
+  /** Extra split tabs this thread also surfaces in (alsoShow forwarding). */
+  alsoIn: string[];
 }
 
 export interface Split {
   id: string;
   name: string;
   builtin: boolean;
-  rules: SplitRule[];
-  op: SplitOp;
+  /** Gmail-style boolean query (from:/to:/subject:/label:, quotes, AND/OR,
+   *  parens — see src/lib/split-query.ts). Empty = the catch-all. */
+  query: string;
+  /** null = the split applies to every account; else the account email. */
+  accountId: string | null;
+  /** Also surface matching threads where they would otherwise land
+   *  (Important or the catch-all — Superhuman's "also show" toggle). */
+  alsoShow: boolean;
   hideWhenEmpty: boolean;
 }
 

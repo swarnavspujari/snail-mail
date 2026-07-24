@@ -598,11 +598,20 @@ pub fn seed_if_empty(conn: &Connection) -> Result<(), String> {
             ));
         }
         let last_body = s.msgs.last().map(|m| m.body).unwrap_or("");
+        let mut recipients: Vec<String> = vec![];
+        for (m, _, _, _, _) in &msgs {
+            for addr in m.to.iter().chain(m.cc.iter()) {
+                if !addr.is_empty() && !recipients.contains(addr) {
+                    recipients.push(addr.clone());
+                }
+            }
+        }
         let thread = Thread {
             id: s.id.to_string(),
             subject: s.subject.to_string(),
             snippet: last_body.chars().take(120).collect::<String>().replace('\n', " "),
             participants,
+            recipients,
             message_count: n,
             last_date,
             unread,
@@ -610,6 +619,8 @@ pub fn seed_if_empty(conn: &Connection) -> Result<(), String> {
             labels: s.labels.iter().map(|l| l.to_string()).collect(),
             in_inbox: s.in_inbox,
             snoozed_until: None,
+            split: String::new(), // materialized by upsert_thread
+            also_in: vec![],
         };
         store::upsert_thread(conn, s.account, &thread, &msgs)?;
     }

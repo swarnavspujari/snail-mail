@@ -8,13 +8,12 @@ import { useProfiles, useSettings } from "@/stores/settings";
 import { useUi } from "@/stores/ui";
 import { Avatar } from "@/components/Avatar";
 import { SignatureEditor } from "./SignatureEditor";
+import { parseSplitQuery } from "@/lib/split-query";
 import type {
   AiProviderId,
   Capabilities,
   SendAsAlias,
   Split,
-  SplitField,
-  SplitOp,
 } from "@/lib/types";
 
 const TABS = [
@@ -700,162 +699,296 @@ function KnowledgeTab() {
 
 // ---------------------------------------------------------------- Splits
 
+/** Query input with instant client-side validation and a debounced backend
+ *  match-count preview. The same syntax the row list displays round-trips
+ *  here — from:domain.com, quoted phrases, AND/OR, parentheses. */
+function SplitQueryField({
+  value,
+  onChange,
+  placeholder,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  placeholder?: string;
+}) {
+  const [error, setError] = useState<string | null>(null);
+  const [count, setCount] = useState<number | null>(null);
+
+  useEffect(() => {
+    try {
+      parseSplitQuery(value);
+      setError(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setCount(null);
+      return;
+    }
+    if (!value.trim()) {
+      setCount(null);
+      return;
+    }
+    const t = setTimeout(() => {
+      void backend
+        .previewSplit(value)
+        .then((p) => setCount(p.ok ? p.count : null))
+        .catch(() => setCount(null));
+    }, 300);
+    return () => clearTimeout(t);
+  }, [value]);
+
+  return (
+    <div className="flex-1">
+      <input
+        className={inputCls}
+        placeholder={
+          placeholder ?? "from:alice@example.com OR from:news.example.com"
+        }
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        spellCheck={false}
+      />
+      {error ? (
+        <p className="mt-1 text-[11.5px] text-bad">{error}</p>
+      ) : count !== null ? (
+        <p className="mt-1 text-[11.5px] text-ink-3">
+          matches {count} recent inbox conversation{count === 1 ? "" : "s"}
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
+/** Inline editor shared by "edit split" and "new split". */
+function SplitEditor({
+  initial,
+  accounts,
+  submitLabel,
+  onSubmit,
+  onCancel,
+}: {
+  initial: { name: string; query: string; accountId: string | null; alsoShow: boolean };
+  accounts: { email: string }[];
+  submitLabel: string;
+  onSubmit: (v: typeof initial) => void;
+  onCancel?: () => void;
+}) {
+  const [name, setName] = useState(initial.name);
+  const [query, setQuery] = useState(initial.query);
+  const [accountId, setAccountId] = useState(initial.accountId);
+  const [alsoShow, setAlsoShow] = useState(initial.alsoShow);
+
+  const valid = (() => {
+    if (!name.trim() || !query.trim()) return false;
+    try {
+      parseSplitQuery(query);
+      return true;
+    } catch {
+      return false;
+    }
+  })();
+
+  return (
+    <div className="space-y-2">
+      <input
+        className={inputCls}
+        placeholder='Split name, e.g. "Travel Deals"'
+        value={name}
+        onChange={(e) => setName(e.target.value)}
+      />
+      <SplitQueryField value={query} onChange={setQuery} />
+      <div className="flex flex-wrap items-center gap-3">
+        <label className="flex items-center gap-2 text-[12.5px] text-ink-2">
+          applies to
+          <select
+            className="rounded-md border border-line-strong bg-raised px-2 py-1 text-[12.5px] text-ink"
+            value={accountId ?? ""}
+            onChange={(e) => setAccountId(e.target.value || null)}
+          >
+            <option value="">all accounts</option>
+            {accounts.map((a) => (
+              <option key={a.email} value={a.email}>
+                {a.email}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="flex items-center gap-1.5 text-[12.5px] text-ink-2">
+          <input
+            type="checkbox"
+            checked={alsoShow}
+            onChange={(e) => setAlsoShow(e.target.checked)}
+            className="accent-[#6d7ff2]"
+          />
+          also show matches in Important or Other
+        </label>
+        <div className="flex-1" />
+        {onCancel && (
+          <button className={btnGhost} onClick={onCancel}>
+            Cancel
+          </button>
+        )}
+        <button
+          className={btnCls}
+          disabled={!valid}
+          onClick={() => onSubmit({ name: name.trim(), query: query.trim(), accountId, alsoShow })}
+        >
+          {submitLabel}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function SplitsTab() {
   const settings = useSettings((s) => s.settings);
-  const [name, setName] = useState("");
-  const [op, setOp] = useState<SplitOp>("or");
-  const [rules, setRules] = useState<{ field: SplitField; contains: string }[]>([
-    { field: "from", contains: "" },
-  ]);
+  const accounts = useSettings((s) => s.accounts.accounts);
+  const [editingId, setEditingId] = useState<string | null>(null);
 
   const saveSplits = (splits: Split[]) =>
     void useSettings.getState().save({ splits });
 
-  const addSplit = () => {
-    const clean = rules.filter((r) => r.contains.trim());
-    if (!name.trim() || clean.length === 0) return;
+  const move = (id: string, dir: -1 | 1) => {
+    const splits = [...settings.splits];
+    const i = splits.findIndex((s) => s.id === id);
+    const j = i + dir;
+    if (i < 0 || j < 0 || j >= splits.length) return;
+    [splits[i], splits[j]] = [splits[j], splits[i]];
+    saveSplits(splits);
+  };
+
+  const addSplit = (v: {
+    name: string;
+    query: string;
+    accountId: string | null;
+    alsoShow: boolean;
+  }) => {
     const split: Split = {
       id: `custom-${Date.now()}`,
-      name: name.trim(),
       builtin: false,
-      rules: clean,
-      op,
       hideWhenEmpty: false,
+      ...v,
     };
-    // custom splits match before the catch-all "Other"
-    const otherIdx = settings.splits.findIndex((s) => s.rules.length === 0);
-    const splits = [...settings.splits];
-    splits.splice(otherIdx === -1 ? splits.length : otherIdx, 0, split);
-    saveSplits(splits);
-    setName("");
-    setRules([{ field: "from", contains: "" }]);
+    // Custom splits go on top so they win over Important — reorder any time.
+    saveSplits([split, ...settings.splits]);
   };
 
   return (
     <>
       <Section
         title="Split inboxes"
-        hint="Splits divide the inbox into focused tabs. Counts show total conversations (not just unread). Tab / Shift+Tab cycles between them."
+        hint="Splits divide the inbox into focused tabs, checked top to bottom — the first match wins, and the whole mailbox is organized as mail syncs. Counts show total conversations. Tab / Shift+Tab cycles between them."
       >
         <div className="space-y-2">
-          {settings.splits.map((s) => (
+          {settings.splits.map((s, i) => (
             <div
               key={s.id}
-              className="flex items-center gap-3 rounded-md border border-line bg-surface px-3 py-2"
+              className="rounded-md border border-line bg-surface px-3 py-2"
             >
-              <span className="text-[13px] font-medium text-ink">{s.name}</span>
-              <span className="text-[11.5px] text-ink-3">
-                {s.rules.length === 0
-                  ? "catch-all"
-                  : s.rules
-                      .map((r) => `${r.field}:"${r.contains}"`)
-                      .join(s.op === "and" ? " AND " : " OR ")}
-              </span>
-              <div className="flex-1" />
-              <label className="flex items-center gap-1.5 text-[11.5px] text-ink-3">
-                <input
-                  type="checkbox"
-                  checked={s.hideWhenEmpty}
-                  onChange={(e) =>
-                    saveSplits(
-                      settings.splits.map((x) =>
-                        x.id === s.id
-                          ? { ...x, hideWhenEmpty: e.target.checked }
-                          : x
+              <div className="flex items-center gap-3">
+                <div className="flex flex-col">
+                  <button
+                    className="text-[10px] leading-3 text-ink-3 hover:text-ink disabled:opacity-30"
+                    disabled={i === 0}
+                    onClick={() => move(s.id, -1)}
+                    title="Move up (matches earlier)"
+                  >
+                    ▲
+                  </button>
+                  <button
+                    className="text-[10px] leading-3 text-ink-3 hover:text-ink disabled:opacity-30"
+                    disabled={i === settings.splits.length - 1}
+                    onClick={() => move(s.id, 1)}
+                    title="Move down (matches later)"
+                  >
+                    ▼
+                  </button>
+                </div>
+                <span className="text-[13px] font-medium text-ink">{s.name}</span>
+                <span className="max-w-[260px] truncate font-mono text-[11px] text-ink-3">
+                  {s.query.trim() === "" ? "catch-all" : s.query}
+                </span>
+                {s.accountId && (
+                  <span className="rounded bg-raised px-1.5 py-0.5 text-[10.5px] text-ink-3">
+                    {s.accountId}
+                  </span>
+                )}
+                {s.alsoShow && (
+                  <span className="text-[10.5px] text-ink-3">+ Important/Other</span>
+                )}
+                <div className="flex-1" />
+                <label className="flex items-center gap-1.5 text-[11.5px] text-ink-3">
+                  <input
+                    type="checkbox"
+                    checked={s.hideWhenEmpty}
+                    onChange={(e) =>
+                      saveSplits(
+                        settings.splits.map((x) =>
+                          x.id === s.id
+                            ? { ...x, hideWhenEmpty: e.target.checked }
+                            : x
+                        )
                       )
-                    )
-                  }
-                  className="accent-[#6d7ff2]"
-                />
-                hide when empty
-              </label>
-              {!s.builtin && (
-                <button
-                  className="text-[12px] text-ink-3 hover:text-bad"
-                  onClick={() =>
-                    saveSplits(settings.splits.filter((x) => x.id !== s.id))
-                  }
-                >
-                  remove
-                </button>
+                    }
+                    className="accent-[#6d7ff2]"
+                  />
+                  hide when empty
+                </label>
+                {s.query.trim() !== "" && (
+                  <button
+                    className="text-[12px] text-ink-3 hover:text-ink"
+                    onClick={() => setEditingId(editingId === s.id ? null : s.id)}
+                  >
+                    edit
+                  </button>
+                )}
+                {!s.builtin && (
+                  <button
+                    className="text-[12px] text-ink-3 hover:text-bad"
+                    onClick={() =>
+                      saveSplits(settings.splits.filter((x) => x.id !== s.id))
+                    }
+                  >
+                    remove
+                  </button>
+                )}
+              </div>
+              {editingId === s.id && (
+                <div className="mt-3 border-t border-line pt-3">
+                  <SplitEditor
+                    initial={{
+                      name: s.name,
+                      query: s.query,
+                      accountId: s.accountId,
+                      alsoShow: s.alsoShow,
+                    }}
+                    accounts={accounts}
+                    submitLabel="Save"
+                    onCancel={() => setEditingId(null)}
+                    onSubmit={(v) => {
+                      saveSplits(
+                        settings.splits.map((x) => (x.id === s.id ? { ...x, ...v } : x))
+                      );
+                      setEditingId(null);
+                    }}
+                  />
+                </div>
               )}
             </div>
           ))}
         </div>
       </Section>
 
-      <Section title="New custom split">
-        <div className="space-y-2">
-          <input
-            className={inputCls}
-            placeholder='Split name, e.g. "Portfolio"'
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-          />
-          {rules.map((r, i) => (
-            <div key={i} className="flex gap-2">
-              <select
-                className="rounded-md border border-line-strong bg-raised px-2 py-2 text-[13px] text-ink"
-                value={r.field}
-                onChange={(e) =>
-                  setRules(
-                    rules.map((x, j) =>
-                      j === i ? { ...x, field: e.target.value as SplitField } : x
-                    )
-                  )
-                }
-              >
-                <option value="from">from</option>
-                <option value="to">to</option>
-                <option value="subject">subject</option>
-                <option value="label">label</option>
-              </select>
-              <input
-                className={inputCls}
-                placeholder="contains…"
-                value={r.contains}
-                onChange={(e) =>
-                  setRules(
-                    rules.map((x, j) =>
-                      j === i ? { ...x, contains: e.target.value } : x
-                    )
-                  )
-                }
-              />
-              {rules.length > 1 && (
-                <button
-                  className={btnGhost}
-                  onClick={() => setRules(rules.filter((_, j) => j !== i))}
-                >
-                  ✕
-                </button>
-              )}
-            </div>
-          ))}
-          <div className="flex items-center gap-3">
-            <button
-              className={btnGhost}
-              onClick={() => setRules([...rules, { field: "from", contains: "" }])}
-            >
-              + rule
-            </button>
-            <label className="flex items-center gap-2 text-[12.5px] text-ink-2">
-              combine with
-              <select
-                className="rounded-md border border-line-strong bg-raised px-2 py-1 text-[12.5px] text-ink"
-                value={op}
-                onChange={(e) => setOp(e.target.value as SplitOp)}
-              >
-                <option value="or">OR</option>
-                <option value="and">AND</option>
-              </select>
-            </label>
-            <div className="flex-1" />
-            <button className={btnCls} onClick={addSplit}>
-              Create split
-            </button>
-          </div>
-        </div>
+      <Section
+        title="New custom split"
+        hint='Write the definition as a search query: from:alice@example.com OR to:feedback@example.com · subject:"survey results" · from:thriftytraveler.com matches the whole domain.'
+      >
+        <SplitEditor
+          key={settings.splits.length /* reset the form after a create */}
+          initial={{ name: "", query: "", accountId: null, alsoShow: false }}
+          accounts={accounts}
+          submitLabel="Create split"
+          onSubmit={addSplit}
+        />
       </Section>
     </>
   );

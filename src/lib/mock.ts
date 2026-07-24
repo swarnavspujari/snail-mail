@@ -31,6 +31,7 @@ import type {
   SearchResult,
   SendAsAlias,
   Settings,
+  Split,
   Streaks,
   SyncProgress,
   Thread,
@@ -43,6 +44,15 @@ import {
   defaultKnowledgeBase,
   defaultSettings,
 } from "./defaults";
+import {
+  classifySplits,
+  compileSplits,
+  matchesSplitQuery,
+  parseSplitQuery,
+  queryFromRules,
+  threadFacts,
+  threadInSplit,
+} from "./split-query";
 
 const LS_KEY = "fission-mock-state-v1";
 
@@ -139,6 +149,26 @@ function loadPersisted(): PersistedState {
       merged.settings.splits = merged.settings.splits.filter(
         (sp) => !(sp.builtin && sp.id === "calendar")
       );
+      // v0.23: splits gained the query language — legacy rules/op saved
+      // copies migrate to a query string (mirrors store::migrate_splits)
+      merged.settings.splits = merged.settings.splits.map((sp) => {
+        const legacy = sp as Split & {
+          rules?: { field: string; contains: string }[];
+          op?: string;
+        };
+        const query =
+          legacy.query ??
+          (legacy.rules?.length ? queryFromRules(legacy.rules, legacy.op ?? "or") : "");
+        return {
+          id: legacy.id,
+          name: legacy.name,
+          builtin: legacy.builtin,
+          query,
+          accountId: legacy.accountId ?? null,
+          alsoShow: legacy.alsoShow ?? false,
+          hideWhenEmpty: legacy.hideWhenEmpty ?? false,
+        };
+      });
       // v0.9: Delete/Backspace joined "#" as trash defaults
       if (merged.settings.shortcuts["thread.trash"] === "#") {
         merged.settings.shortcuts["thread.trash"] = "#|delete|backspace";
@@ -236,6 +266,8 @@ export class MockBackend implements Backend {
       Object.assign(t, this.state.threadPatches[t.id]);
     }
     this.threads = this.threads.filter((t) => !this.state.trashed.includes(t.id));
+    // Materialize split membership (mirrors the Rust upsert/classify path).
+    this.reclassifyAll();
     // Return snoozed threads whose timer already elapsed while app was closed.
     this.wakeDueSnoozes();
     this.flushOutbox(); // sends that came due while the tab was closed
@@ -243,6 +275,24 @@ export class MockBackend implements Backend {
       this.wakeDueSnoozes();
       this.flushOutbox();
     }, 5_000);
+  }
+
+  /** Re-run the classifier over every thread — the mock's equivalent of the
+   *  Rust sync-time materialization + background reclassify pass. */
+  private reclassifyAll() {
+    const splits = this.state.settings.splits;
+    const specs = new Map<string, ReturnType<typeof compileSplits>>();
+    for (const t of this.threads) {
+      const account = this.accountOf.get(t.id) ?? DEMO_ACCOUNT;
+      let spec = specs.get(account);
+      if (!spec) {
+        spec = compileSplits(splits, account);
+        specs.set(account, spec);
+      }
+      const { split, alsoIn } = classifySplits(spec, threadFacts(t));
+      t.split = split;
+      t.alsoIn = alsoIn;
+    }
   }
 
   private inActiveAccount(t: Thread): boolean {
@@ -583,6 +633,7 @@ export class MockBackend implements Backend {
         subject: mail.subject,
         snippet: msg.snippet,
         participants: ["You"],
+        recipients: [...new Set([...mail.to, ...mail.cc])],
         messageCount: 1,
         lastDate: nowMs,
         unread: false,
@@ -590,8 +641,11 @@ export class MockBackend implements Backend {
         labels: [],
         inInbox: false, // sent mail doesn't land in your own inbox
         snoozedUntil: null,
+        split: "",
+        alsoIn: [],
       });
     }
+    this.reclassifyAll();
     this.notify();
   }
 
@@ -791,6 +845,7 @@ export class MockBackend implements Backend {
   async bulkArchive(opts: BulkArchiveOpts): Promise<number> {
     const cutoff = Date.now() - opts.olderThanDays * 24 * 3600_000;
     const splits = this.state.settings.splits;
+    const account = this.state.activeAccount;
     let n = 0;
     for (const t of this.threads) {
       if (!this.inActiveAccount(t)) continue;
@@ -798,12 +853,52 @@ export class MockBackend implements Backend {
       if (opts.olderThanDays > 0 && t.lastDate > cutoff) continue;
       if (opts.preserveUnread && t.unread) continue;
       if (opts.preserveStarred && t.starred) continue;
-      if (opts.splitId && assignSplit(t, splits) !== opts.splitId) continue;
+      if (opts.splitId && !threadInSplit(t, opts.splitId, splits, account)) continue;
       this.patch(t.id, { inInbox: false });
       n++;
     }
     if (n) this.notify();
     return n;
+  }
+
+  async splitCounts(): Promise<Record<string, number>> {
+    const splits = this.state.settings.splits;
+    const account = this.state.activeAccount;
+    const counts: Record<string, number> = {};
+    for (const t of this.threads) {
+      if (!this.inActiveAccount(t) || this.hiddenOf(t.id) !== null) continue;
+      if (!t.inInbox || t.snoozedUntil !== null) continue;
+      for (const sp of splits) {
+        if (sp.accountId != null && sp.accountId !== account) continue;
+        if (threadInSplit(t, sp.id, splits, account)) {
+          counts[sp.id] = (counts[sp.id] ?? 0) + 1;
+        }
+      }
+    }
+    return counts;
+  }
+
+  async previewSplit(query: string): Promise<{ ok: boolean; error: string | null; count: number }> {
+    let node;
+    try {
+      node = parseSplitQuery(query);
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e), count: 0 };
+    }
+    if (!node) {
+      return {
+        ok: true,
+        error: "empty query — this split would catch everything unmatched",
+        count: 0,
+      };
+    }
+    let count = 0;
+    for (const t of this.threads) {
+      if (!this.inActiveAccount(t) || this.hiddenOf(t.id) !== null) continue;
+      if (!t.inInbox || t.snoozedUntil !== null) continue;
+      if (matchesSplitQuery(node, threadFacts(t))) count++;
+    }
+    return { ok: true, error: null, count };
   }
 
   /** Fixture Drive corpus — enough variety to demo recents, search, link
@@ -1346,8 +1441,23 @@ export class MockBackend implements Backend {
     return this.state.settings;
   }
   async saveSettings(settings: Settings) {
+    for (const sp of settings.splits) {
+      try {
+        parseSplitQuery(sp.query);
+      } catch (e) {
+        throw new Error(`split "${sp.name}": ${e instanceof Error ? e.message : e}`);
+      }
+    }
+    const splitsChanged =
+      JSON.stringify(this.state.settings.splits) !== JSON.stringify(settings.splits);
     this.state.settings = settings;
     this.persist();
+    // A changed definition re-files the mailbox (mirrors the Rust background
+    // reclassify pass + its mail:updated).
+    if (splitsChanged) {
+      this.reclassifyAll();
+      this.notify();
+    }
   }
   async getKnowledgeBase() {
     return this.state.kb;
@@ -1623,30 +1733,7 @@ export class MockBackend implements Backend {
   }
 }
 
-/** First split (in settings order) whose rules match; empty-rule splits are
- *  the catch-all and only claim threads nothing else matched. */
-export function assignSplit(t: Thread, splits: Settings["splits"]): string {
-  let catchAll: string | null = null;
-  for (const s of splits) {
-    if (s.rules.length === 0) {
-      catchAll = catchAll ?? s.id;
-      continue;
-    }
-    const results = s.rules.map((r) => {
-      const needle = r.contains.toLowerCase();
-      if (!needle) return false;
-      switch (r.field) {
-        case "label":
-          return t.labels.some((l) => l.toLowerCase().includes(needle));
-        case "subject":
-          return t.subject.toLowerCase().includes(needle);
-        case "from":
-        case "to":
-          return t.participants.some((p) => p.toLowerCase().includes(needle));
-      }
-    });
-    const matched = s.op === "and" ? results.every(Boolean) : results.some(Boolean);
-    if (matched) return s.id;
-  }
-  return catchAll ?? "other";
-}
+// assignSplit is gone (v0.23): split membership is materialized on Thread
+// (`split` / `alsoIn`) by the backend — Rust at sync time, this mock via
+// reclassifyAll(). UI-side membership checks use threadInSplit() from
+// src/lib/split-query.ts.

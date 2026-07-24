@@ -1,0 +1,92 @@
+{
+  "comment": "Shared conformance cases for the split-query language. Consumed by BOTH src-tauri/src/splits.rs (cargo test) and src/lib/split-query.test.ts (vitest) so the Rust and mock-TS matchers cannot drift. Each case either parses+evaluates against every thread below (matches = ids, order-insensitive) or must fail to parse (error: true).",
+  "threads": [
+    {
+      "id": "t1",
+      "subject": "Delta flash sale: 40k to Europe",
+      "participants": ["Thrifty Traveler <deals@thriftytraveler.com>"],
+      "recipients": ["Swarnav <ssp@pujariventurepartners.com>"],
+      "labels": []
+    },
+    {
+      "id": "t2",
+      "subject": "Weekly points digest",
+      "participants": ["The Points Guy <newsletter@e.thepointsguy.com>"],
+      "recipients": ["ssp@pujariventurepartners.com"],
+      "labels": []
+    },
+    {
+      "id": "t3",
+      "subject": "Board deck review",
+      "participants": ["Maya Chen <maya@acme.com>"],
+      "recipients": ["Swarnav <ssp@pujariventurepartners.com>", "Ben <ben@acme.com>"],
+      "labels": ["IMPORTANT"]
+    },
+    {
+      "id": "t4",
+      "subject": "You won a prize",
+      "participants": ["Miles Deals <promo@monkeymiles.com.evil.io>"],
+      "recipients": ["ssp@pujariventurepartners.com"],
+      "labels": []
+    },
+    {
+      "id": "t5",
+      "subject": "Unrelated digest",
+      "participants": ["thepointsguy.com Digest <digest@mailer.example.net>"],
+      "recipients": ["ssp@pujariventurepartners.com"],
+      "labels": []
+    },
+    {
+      "id": "t6",
+      "subject": "Your receipt from Anthropic",
+      "participants": ["Anthropic Billing <invoice+statements@mail.anthropic.com>"],
+      "recipients": ["ssp@pujariventurepartners.com"],
+      "labels": []
+    },
+    {
+      "id": "t7",
+      "subject": "Feedback follow-up",
+      "participants": ["Alice <alice@x.com>"],
+      "recipients": ["Feedback <feedback@example.com>"],
+      "labels": []
+    },
+    {
+      "id": "t8",
+      "subject": "50% off everything",
+      "participants": ["Shop <noreply@shop.io>"],
+      "recipients": ["ssp@pujariventurepartners.com"],
+      "labels": ["CATEGORY_PROMOTIONS"]
+    }
+  ],
+  "cases": [
+    {
+      "name": "acceptance: the Superhuman travel-deals query",
+      "query": "from:thriftytraveler.com OR from:thepointsguy.com OR from:monkeymiles.com OR from:maxmilespoints.com",
+      "matches": ["t1", "t2"]
+    },
+    { "name": "subdomain matches the bare domain", "query": "from:e.thepointsguy.com", "matches": ["t2"] },
+    { "name": "domain-suffix spoof does not match", "query": "from:monkeymiles.com", "matches": [] },
+    { "name": "display name never satisfies a domain needle", "query": "from:thepointsguy.com", "matches": ["t2"] },
+    { "name": "bare word matches sender name or address", "query": "from:maya", "matches": ["t3"] },
+    { "name": "quoted person name", "query": "from:\"maya chen\"", "matches": ["t3"] },
+    { "name": "exact address", "query": "from:invoice+statements@mail.anthropic.com", "matches": ["t6"] },
+    { "name": "sender domain with subdomain needle", "query": "from:mail.anthropic.com", "matches": ["t6"] },
+    { "name": "quoted subject phrase", "query": "subject:\"board deck\"", "matches": ["t3"] },
+    { "name": "label match", "query": "label:IMPORTANT", "matches": ["t3"] },
+    { "name": "label substring reaches CATEGORY_*", "query": "label:promotions", "matches": ["t8"] },
+    { "name": "recipient exact address", "query": "to:feedback@example.com", "matches": ["t7"] },
+    { "name": "recipient domain", "query": "to:example.com", "matches": ["t7"] },
+    { "name": "parens + AND", "query": "(from:alice@x.com AND to:feedback@example.com)", "matches": ["t7"] },
+    { "name": "adjacency is AND", "query": "from:acme.com subject:board", "matches": ["t3"] },
+    { "name": "AND with no hit stays empty", "query": "from:thepointsguy.com AND subject:sale", "matches": [] },
+    { "name": "lowercase or is still the operator", "query": "from:thriftytraveler.com or from:e.thepointsguy.com", "matches": ["t1", "t2"] },
+    { "name": "bare term searches subject and people", "query": "receipt", "matches": ["t6"] },
+    { "name": "nested groups", "query": "(subject:digest AND (from:e.thepointsguy.com OR from:mailer.example.net))", "matches": ["t2", "t5"] },
+    { "name": "empty value is an error", "query": "from:", "error": true },
+    { "name": "unbalanced paren is an error", "query": "(from:acme.com OR", "error": true },
+    { "name": "stray closing paren is an error", "query": "from:acme.com)", "error": true },
+    { "name": "unknown operator is an error", "query": "has:attachment", "error": true },
+    { "name": "trailing operator is an error", "query": "from:acme.com OR", "error": true },
+    { "name": "empty parens are an error", "query": "()", "error": true }
+  ]
+}

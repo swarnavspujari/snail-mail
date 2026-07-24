@@ -6,6 +6,7 @@ mod harper;
 mod mail;
 mod search;
 mod secrets;
+mod splits;
 mod store;
 mod types;
 mod unsplash;
@@ -2923,10 +2924,10 @@ async fn bulk_archive(
     state: State<'_, AppState>,
     opts: BulkArchiveOpts,
 ) -> Result<i64, String> {
-    let (targets, settings, active) = {
+    let (targets, active) = {
         let conn = state.db.lock().unwrap();
         let active = store::get_accounts(&conn).active;
-        (store::inbox_threads_for_sweep(&conn, &active)?, store::get_settings(&conn), active)
+        (store::inbox_threads_for_sweep(&conn, &active)?, active)
     };
     let cutoff = now_ms() - opts.older_than_days * 24 * 3_600_000;
     let mut ids: Vec<String> = vec![];
@@ -2941,7 +2942,9 @@ async fn bulk_archive(
             continue;
         }
         if let Some(split_id) = &opts.split_id {
-            if assign_split(&t, &settings.splits) != *split_id {
+            // Membership is the materialized split_id column — the same value
+            // the UI renders, so the sweep can never disagree with the tabs.
+            if t.split != *split_id && !t.also_in.contains(split_id) {
                 continue;
             }
         }
@@ -2974,32 +2977,39 @@ async fn bulk_archive(
     Ok(n)
 }
 
-/// Port of assignSplit in src/lib/mock.ts — first matching split wins,
-/// empty-rule splits are the catch-all.
-fn assign_split(t: &Thread, splits: &[Split]) -> String {
-    let mut catch_all: Option<&str> = None;
-    for s in splits {
-        if s.rules.is_empty() {
-            catch_all.get_or_insert(&s.id);
-            continue;
-        }
-        let mut results = s.rules.iter().map(|r| {
-            let needle = r.contains.to_lowercase();
-            if needle.is_empty() {
-                return false;
+/// Reclassify stored threads in the background — chunked so each DB lock hold
+/// stays short (the crawl-beat pattern). Runs after a split definition changes
+/// (`only_missing = false`) and as the boot backfill for pre-v0.23 rows
+/// (`only_missing = true`). Emits mail:updated once anything moved.
+fn spawn_reclassify(app: AppHandle, only_missing: bool) {
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<AppState>();
+        let mut after = 0i64;
+        let mut moved = 0usize;
+        loop {
+            let step = {
+                let conn = state.db.lock().unwrap();
+                store::reclassify_page(&conn, after, 500, only_missing)
+            };
+            match step {
+                Ok((updated, last, done)) => {
+                    moved += updated;
+                    after = last;
+                    if done {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[splits] reclassify failed: {e}");
+                    break;
+                }
             }
-            match r.field.as_str() {
-                "label" => t.labels.iter().any(|l| l.to_lowercase().contains(&needle)),
-                "subject" => t.subject.to_lowercase().contains(&needle),
-                _ => t.participants.iter().any(|p| p.to_lowercase().contains(&needle)),
-            }
-        });
-        let matched = if s.op == "and" { results.all(|x| x) } else { results.any(|x| x) };
-        if matched {
-            return s.id.clone();
+            tokio::task::yield_now().await;
         }
-    }
-    catch_all.unwrap_or("other").to_string()
+        if moved > 0 {
+            let _ = app.emit("mail:updated", ());
+        }
+    });
 }
 
 // ---------------------------------------------------------------- send
@@ -3097,6 +3107,7 @@ async fn deliver_mail(app: &AppHandle, account_email: &str, mail: &OutgoingMail)
             subject: if subject.is_empty() { "(no subject)".into() } else { subject },
             snippet: msg.snippet.clone(),
             participants: vec![format!("You <{account_email}>")],
+            recipients: mail.to.iter().chain(mail.cc.iter()).cloned().collect(),
             message_count: 1,
             last_date: now,
             unread: false,
@@ -3104,6 +3115,8 @@ async fn deliver_mail(app: &AppHandle, account_email: &str, mail: &OutgoingMail)
             labels: vec![],
             in_inbox: false,
             snoozed_until: None,
+            split: String::new(), // materialized by upsert_thread
+            also_in: vec![],
         },
     };
     store::upsert_thread(&conn, account_email, &thread, &[(msg, None, None, None, vec![])])?;
@@ -3194,13 +3207,88 @@ fn save_settings(app: AppHandle, state: State<'_, AppState>, settings: Settings)
     if settings.splits.len() > 24 {
         return Err("too many splits".into());
     }
+    for sp in &settings.splits {
+        if sp.query.len() > 500 {
+            return Err(format!("split \"{}\": query is too long", sp.name));
+        }
+        if let Err(e) = splits::parse(&sp.query) {
+            return Err(format!("split \"{}\": {e}", sp.name));
+        }
+    }
     if let Some(dir) = &settings.celebration_dir {
         let path = std::path::Path::new(dir);
         if path.is_dir() {
             let _ = app.asset_protocol_scope().allow_directory(path, false);
         }
     }
-    store::set_json(&state.db.lock().unwrap(), "settings", &settings)
+    let splits_changed = {
+        let conn = state.db.lock().unwrap();
+        let before = serde_json::to_value(store::split_config(&conn)).unwrap_or_default();
+        store::set_json(&conn, "settings", &settings)?;
+        before != serde_json::to_value(&settings.splits).unwrap_or_default()
+    };
+    // A changed definition re-files the whole mailbox in the background; the
+    // tabs repaint on the mail:updated it emits when done.
+    if splits_changed {
+        spawn_reclassify(app, false);
+    }
+    Ok(())
+}
+
+/// Inbox conversation count per split (active account) — SQL over the whole
+/// mailbox, so tab counts don't stop at the 500-row display window.
+#[tauri::command]
+fn split_counts(state: State<'_, AppState>) -> Result<std::collections::HashMap<String, i64>, String> {
+    let conn = state.db.lock().unwrap();
+    let active = store::get_accounts(&conn).active;
+    store::split_counts(&conn, &active)
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SplitPreview {
+    ok: bool,
+    error: Option<String>,
+    /// Matching conversations among the active account's recent inbox.
+    count: i64,
+}
+
+/// Live validation + match preview for the split editor. Counts over the
+/// recent inbox window (500) — a hint, not the classifier.
+#[tauri::command]
+fn preview_split(state: State<'_, AppState>, query: String) -> Result<SplitPreview, String> {
+    if query.len() > 500 {
+        return Ok(SplitPreview { ok: false, error: Some("query is too long".into()), count: 0 });
+    }
+    let node = match splits::parse(&query) {
+        Err(e) => return Ok(SplitPreview { ok: false, error: Some(e), count: 0 }),
+        Ok(None) => {
+            return Ok(SplitPreview {
+                ok: true,
+                error: Some("empty query — this split would catch everything unmatched".into()),
+                count: 0,
+            })
+        }
+        Ok(Some(n)) => n,
+    };
+    let conn = state.db.lock().unwrap();
+    let active = store::get_accounts(&conn).active;
+    let threads = store::list_threads(&conn, "inbox", &active)?;
+    let count = threads
+        .iter()
+        .filter(|t| {
+            splits::matches(
+                &node,
+                &splits::Facts {
+                    senders: &t.participants,
+                    recipients: &t.recipients,
+                    subject: &t.subject,
+                    labels: &t.labels,
+                },
+            )
+        })
+        .count() as i64;
+    Ok(SplitPreview { ok: true, error: None, count })
 }
 
 #[tauri::command]
@@ -3510,6 +3598,18 @@ pub fn run() {
 
             // Drain any mail left behind by a disconnect that never finished.
             spawn_orphan_mail_sweep(app.handle().clone());
+
+            // v0.23 backfill: rows from before split materialization classify
+            // in the background; the UI files them under the catch-all until
+            // the pass lands (it emits mail:updated when threads moved).
+            let needs_backfill = {
+                let state = app.state::<AppState>();
+                let conn = state.db.lock().unwrap();
+                store::has_unclassified_threads(&conn)
+            };
+            if needs_backfill {
+                spawn_reclassify(app.handle().clone(), true);
+            }
 
             // Dev-only: SNAIL_AI_SMOKE=1 (legacy FISSION_AI_SMOKE) streams one
             // real draft at startup and logs the result — end-to-end proof of
@@ -3823,6 +3923,8 @@ pub fn run() {
             load_older,
             get_settings,
             save_settings,
+            split_counts,
+            preview_split,
             get_knowledge_base,
             save_knowledge_base,
             set_ai_key,

@@ -1,5 +1,5 @@
 import { backend } from "@/lib/ipc";
-import { assignSplit } from "@/lib/mock";
+import { threadInSplit } from "@/lib/split-query";
 import { pushUndo } from "@/lib/undo";
 import { useMail } from "@/stores/mail";
 import { useSettings } from "@/stores/settings";
@@ -12,10 +12,10 @@ export function ZeroSweep() {
   const run =
     (olderThanDays: number, preserveUnread: boolean, preserveStarred: boolean) =>
     async () => {
-      // Predict the swept set with the same rules the backend applies, so a
-      // single undo entry can bring all of it back.
+      // Predict the swept set with the same materialized membership the
+      // backend applies, so a single undo entry can bring all of it back.
       const m = useMail.getState();
-      const splits = useSettings.getState().settings.splits;
+      const st = useSettings.getState();
       const cutoff = Date.now() - olderThanDays * 86_400_000;
       const swept = m.inbox
         .filter(
@@ -24,7 +24,8 @@ export function ZeroSweep() {
             (olderThanDays === 0 || t.lastDate <= cutoff) &&
             !(preserveUnread && t.unread) &&
             !(preserveStarred && t.starred) &&
-            (m.listView !== "inbox" || assignSplit(t, splits) === m.activeSplitId)
+            (m.listView !== "inbox" ||
+              threadInSplit(t, m.activeSplitId, st.settings.splits, st.accounts.active))
         )
         .map((t) => t.id);
 
