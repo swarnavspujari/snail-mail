@@ -99,6 +99,40 @@ impl DbRegistry {
         self.legacy.lock().unwrap().clone()
     }
 
+    /// Close this account's connection and delete its file (+ -wal/-shm).
+    /// In-flight commands may briefly hold transient Arc clones, so the
+    /// delete retries for a few seconds; a still-busy file is reported and
+    /// left for the boot sweep. Idempotent — a missing file is Ok.
+    pub fn close_and_delete(&self, email: &str) -> Result<(), String> {
+        self.accounts.lock().unwrap().remove(email);
+        let path = self.account_db_path(email);
+        if !path.exists() {
+            return Ok(());
+        }
+        let mut last_err: Option<std::io::Error> = None;
+        for _ in 0..40 {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    for side in ["-wal", "-shm"] {
+                        let mut p = path.clone().into_os_string();
+                        p.push(side);
+                        let _ = std::fs::remove_file(std::path::PathBuf::from(p));
+                    }
+                    return Ok(());
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+            }
+        }
+        Err(format!(
+            "could not delete {}: {}",
+            path.display(),
+            last_err.map(|e| e.to_string()).unwrap_or_default()
+        ))
+    }
+
     pub fn legacy_db_path(&self) -> PathBuf {
         self.data_dir.join("fission.db")
     }
@@ -172,6 +206,7 @@ mod tests {
                     email: "u@x.test".into(),
                     provider: "gmail".into(),
                     connected: true,
+                    removing: false,
                 }],
                 active: "u@x.test".into(),
             };
@@ -193,6 +228,26 @@ mod tests {
             own.lock().unwrap().query_row("SELECT COUNT(*) FROM threads", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 0);
         assert!(reg.account_db_path("u@x.test").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn close_and_delete_is_instant_and_idempotent() {
+        let dir = tmp_dir("del");
+        let reg = DbRegistry::open(&dir).unwrap();
+        {
+            let db = reg.account("gone@x.test").unwrap();
+            crate::store::tests::seed(&db.lock().unwrap(), "t-1", "Bye", "body", "Ann", 1_000);
+        }
+        let path = reg.account_db_path("gone@x.test");
+        assert!(path.exists());
+        reg.close_and_delete("gone@x.test").unwrap();
+        assert!(!path.exists(), "db file must be gone");
+        let mut wal = path.clone().into_os_string();
+        wal.push("-wal");
+        assert!(!std::path::PathBuf::from(wal).exists(), "sidecars must be gone");
+        // double-click safe: a second delete of a missing file is Ok
+        reg.close_and_delete("gone@x.test").unwrap();
         std::fs::remove_dir_all(&dir).ok();
     }
 

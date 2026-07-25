@@ -422,6 +422,10 @@ pub struct AccountInfo {
     pub email: String,
     pub provider: String, // gmail | outlook | mock
     pub connected: bool,
+    /// True while the account's data is being torn down in the background —
+    /// the UI shows "Removing…" and no command may act on it.
+    #[serde(default)]
+    pub removing: bool,
 }
 
 /// All connected accounts, in slot order (index 0 = Ctrl+1), plus the active one.

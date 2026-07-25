@@ -592,6 +592,7 @@ mod tests {
                     email: (*e).into(),
                     provider: "gmail".into(),
                     connected: true,
+                    removing: false,
                 })
                 .collect(),
             active: accounts[0].into(),
@@ -761,6 +762,56 @@ mod tests {
             );
         });
         assert!(reg.is_migrated("a@x.test"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Phase-2 acceptance measurement: account removal before (chunked
+    /// thread purge, the v0.22 shipped path) vs after (close + delete file).
+    /// Run with: cargo test --release -- --ignored perf_disconnect --nocapture
+    #[test]
+    #[ignore]
+    fn perf_disconnect_old_vs_new() {
+        let dir = tmp_dir("perfdisc");
+        let n: usize = std::env::var("SNAIL_PERF_THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5_000);
+        build_legacy(&dir, &["a@x.test"], n);
+        let reg = DbRegistry::open(&dir).unwrap();
+        assert!(migrate_all(&reg, &MigrateOpts::default(), &mut |_| {}).unwrap());
+        // duplicate the migrated file so both paths tear down identical data
+        let orig = reg.account_db_path("a@x.test");
+        {
+            // checkpoint so the copy is self-contained
+            let db = reg.account("a@x.test").unwrap();
+            let _ = db.lock().unwrap().execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+        }
+        let victim = dir.join("victim.db");
+        std::fs::copy(&orig, &victim).unwrap();
+
+        // OLD PATH: the shipped chunked purge (200-thread pages; six deletes
+        // per batch incl. the by-thread_id FTS delete that full-scans).
+        let conn = crate::store::open(&victim).unwrap();
+        let t0 = std::time::Instant::now();
+        loop {
+            let ids = crate::store::thread_ids_page(&conn, "a@x.test", 200).unwrap();
+            if ids.is_empty() {
+                break;
+            }
+            crate::store::delete_threads(&conn, &ids).unwrap();
+        }
+        let old_time = t0.elapsed();
+        drop(conn);
+
+        // NEW PATH: close the connection, delete the file.
+        let t1 = std::time::Instant::now();
+        reg.close_and_delete("a@x.test").unwrap();
+        let new_time = t1.elapsed();
+        println!(
+            "disconnect teardown for {n} threads: old chunked purge {old_time:?} vs new close+delete {new_time:?} ({}x faster)",
+            (old_time.as_secs_f64() / new_time.as_secs_f64()).round()
+        );
+        assert!(!orig.exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 

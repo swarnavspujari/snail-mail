@@ -314,8 +314,18 @@ pub fn get_accounts(conn: &Connection) -> AccountsState {
     }
     AccountsState {
         accounts: vec![
-            AccountInfo { email: DEMO_ACCOUNT.into(), provider: "mock".into(), connected: true },
-            AccountInfo { email: DEMO_ACCOUNT_2.into(), provider: "mock".into(), connected: true },
+            AccountInfo {
+                email: DEMO_ACCOUNT.into(),
+                provider: "mock".into(),
+                connected: true,
+                removing: false,
+            },
+            AccountInfo {
+                email: DEMO_ACCOUNT_2.into(),
+                provider: "mock".into(),
+                connected: true,
+                removing: false,
+            },
         ],
         active: DEMO_ACCOUNT.into(),
     }

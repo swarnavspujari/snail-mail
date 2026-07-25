@@ -169,8 +169,11 @@ async fn switch_account(state: State<'_, AppState>, email: String) -> Result<Acc
     let db = state.global();
     let conn = db.lock().unwrap();
     let mut accounts = store::get_accounts(&conn);
-    if !accounts.accounts.iter().any(|a| a.email == email) {
+    let Some(a) = accounts.accounts.iter().find(|a| a.email == email) else {
         return Err("unknown account".into());
+    };
+    if a.removing {
+        return Err("that account is being removed".into());
     }
     accounts.active = email;
     store::save_accounts(&conn, &accounts)?;
@@ -277,14 +280,22 @@ async fn start_oauth(
             }
         }
         if let Some(existing) = accounts.accounts.iter_mut().find(|a| a.email == email) {
+            if existing.removing {
+                return Err(
+                    "that account is still being removed — try again in a moment".into()
+                );
+            }
             // Re-consent for an account that was marked disconnected (dead
             // grant) — flip it back; the fresh token below replaces the old.
+            // Its mail, sync cursors, and history are untouched: a scope
+            // top-up must never cost the local mailbox.
             existing.connected = true;
         } else {
             accounts.accounts.push(AccountInfo {
                 email: email.clone(),
                 provider: "gmail".into(),
                 connected: true,
+                removing: false,
             });
         }
         accounts.active = email.clone();
@@ -363,126 +374,179 @@ async fn get_capabilities(state: State<'_, AppState>, email: String) -> Result<C
     })
 }
 
+/// Instant, honest removal: flag the account `removing` in the registry and
+/// return in milliseconds; finish_removal tears everything down in the
+/// background (revoke, close + delete the db file, cache/keychain/signature
+/// sweep). Idempotent — a double-click or a call for an unknown account just
+/// returns the current state.
 #[tauri::command]
 async fn disconnect_account(
     app: AppHandle,
     state: State<'_, AppState>,
     email: String,
 ) -> Result<AccountsState, String> {
-    // Revoke server-side BEFORE deleting the local token, so the next Connect
-    // starts from a clean grant and reliably re-issues the full scope set
-    // (incl. calendar.readonly). Best-effort — a failed revoke still disconnects.
-    if let Some(rt) = secrets::get(&secrets::gmail_refresh_entry(&email))
-        .or_else(|| secrets::get(secrets::GMAIL_REFRESH_TOKEN_LEGACY))
-    {
-        let _ = state
-            .http
-            .post("https://oauth2.googleapis.com/revoke")
-            .form(&[("token", rt.as_str())])
-            .send()
-            .await;
-    }
-    state.gmail.lock().await.remove(&email);
-    // The account leaves the list FIRST (fast, transactional) so the UI
-    // updates instantly; the bulky mail purge runs chunked below. If the app
-    // dies mid-purge, the boot sweep finishes the job.
-    {
-        // Drop the recorded grant + synced Google data: the account is gone
-        // (or about to reconnect fresh), so stale state must not linger.
-        let db = state.account_db(&email)?;
-        let conn = db.lock().unwrap();
-        for key in [
-            "granted_scopes",
-            "scope_notice_shown",
-            "people_synced",
-            "sendas",
-            "drive_folder",
-            "cal_synced_at",
-            "cal_range",
-        ] {
-            conn.execute("DELETE FROM kv WHERE key = ?1", [format!("{key}:{email}")]).ok();
+    let (accounts, started) = {
+        let gdb = state.global();
+        let conn = gdb.lock().unwrap();
+        let mut accounts = store::get_accounts(&conn);
+        let Some(idx) = accounts.accounts.iter().position(|a| a.email == email) else {
+            return Ok(accounts);
+        };
+        if accounts.accounts[idx].removing {
+            (accounts, false)
+        } else {
+            accounts.accounts[idx].removing = true;
+            if accounts.active == email {
+                if let Some(next) =
+                    accounts.accounts.iter().find(|a| a.email != email && !a.removing)
+                {
+                    accounts.active = next.email.clone();
+                }
+            }
+            store::save_accounts(&conn, &accounts)?;
+            (accounts, true)
         }
-        conn.execute("DELETE FROM people_contacts WHERE account_id = ?1", [email.as_str()]).ok();
-        // calendar cache + per-calendar syncTokens: a reconnect must start
-        // from a clean initial fetch, not a stale token from the old grant
-        conn.execute("DELETE FROM events WHERE account_id = ?1", [email.as_str()]).ok();
-        conn.execute("DELETE FROM kv WHERE key LIKE ?1", [format!("cal_sync:{email}:%")]).ok();
-        conn.execute("DELETE FROM kv WHERE key LIKE ?1", [format!("cal_anchor:{email}:%")]).ok();
+    };
+    if started {
+        let _ = app.emit("accounts:updated", &accounts);
+        let _ = app.emit("mail:updated", ());
+        let app2 = app.clone();
+        let email2 = email.clone();
+        tauri::async_runtime::spawn(async move {
+            finish_removal(app2, email2).await;
+        });
     }
+    Ok(accounts)
+}
+
+/// Background tail of disconnect_account; also re-run at boot for any account
+/// still flagged `removing` (a removal the previous session never finished).
+/// Every step is idempotent.
+async fn finish_removal(app: AppHandle, email: String) {
+    let state = app.state::<AppState>();
+    // 1. Best-effort server-side revoke with a short timeout — a dead network
+    //    must never wedge a removal. Only the per-account token: the shared
+    //    legacy entry may be the credential another legacy account boots from.
+    if let Some(rt) = secrets::get(&secrets::gmail_refresh_entry(&email)) {
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            state
+                .http
+                .post("https://oauth2.googleapis.com/revoke")
+                .form(&[("token", rt.as_str())])
+                .send(),
+        )
+        .await;
+    }
+    // 2. Drop the live session so no sync beat re-touches the account.
+    state.gmail.lock().await.remove(&email);
+    // 3. Collect this account's attachment-cache filenames BEFORE the db
+    //    goes away (the shared cache dir is swept below; names another
+    //    account still references are kept).
+    let cache_names = attachment_cache_names(&state, &email);
+    // 4. Drop the account from the registry + prune its signature; the demo
+    //    pair comes back when the last real account leaves. From here on no
+    //    command can resolve a connection to it.
     let accounts = {
-        let db = state.global();
-        let conn = db.lock().unwrap();
+        let gdb = state.global();
+        let conn = gdb.lock().unwrap();
         let mut accounts = store::get_accounts(&conn);
         accounts.accounts.retain(|a| a.email != email);
+        let mut settings = store::get_settings(&conn);
+        if settings.signatures.remove(&email).is_some() {
+            let _ = store::set_json(&conn, "settings", &settings);
+        }
+        conn.execute("DELETE FROM kv WHERE key = ?1", [format!("migrated:{email}")]).ok();
         if accounts.accounts.is_empty() {
-            // back to demo mode
-            store::set_json(&conn, "accounts", &serde_json::Value::Null).ok();
             conn.execute("DELETE FROM kv WHERE key = 'accounts'", []).ok();
-            store::get_accounts(&conn)
+            store::get_accounts(&conn) // demo-pair fallback
         } else {
             if accounts.active == email {
                 accounts.active = accounts.accounts[0].email.clone();
             }
-            store::save_accounts(&conn, &accounts)?;
+            let _ = store::save_accounts(&conn, &accounts);
             accounts
         }
     };
-    // Back in demo mode → each demo account's fixtures seed into its own file
-    // (no-ops per account when rows already exist).
-    if accounts.accounts.iter().all(|a| a.provider == "mock") {
-        for a in &accounts.accounts {
-            let db = state.account_db(&a.email)?;
-            let conn = db.lock().unwrap();
-            mail::mock::seed_account_if_empty(&conn, &a.email)?;
+    // 5. Close the connection and delete the db file (+ sidecars). O(1) —
+    //    this replaces the minutes-long chunked row purge.
+    if let Err(e) = state.dbs.close_and_delete(&email) {
+        eprintln!("[remove:{email}] {e} — the boot sweep will finish the job");
+        let _ = app.emit(
+            "app:notice",
+            format!("Couldn't finish removing {email} — it completes on the next launch."),
+        );
+    }
+    // 6. Swept cache files + keychain. The shared legacy gmail:refresh_token
+    //    is only deleted when NO gmail account remains — deleting it eagerly
+    //    could strip the one credential a legacy-provisioned account still
+    //    boots from.
+    if let Ok(dir) = app.path().app_cache_dir() {
+        let dir = dir.join("attachments");
+        for name in cache_names {
+            let _ = std::fs::remove_file(dir.join(name));
         }
     }
-    // Token deletion (secrets::delete sweeps the legacy service names too —
-    // a surviving legacy copy would be resurrected by chain_get on the next
-    // boot as a permanently-failing revoked token).
     secrets::delete(&secrets::gmail_refresh_entry(&email));
-    secrets::delete(secrets::GMAIL_REFRESH_TOKEN_LEGACY);
-    let _ = app.emit("mail:updated", ());
-    // Purge the account's mail in lock-released chunks: the account is
-    // already gone from the list (its rows are invisible), so the app stays
-    // fully usable while gigabytes of threads/FTS/vector rows drain.
-    clear_account_mail_chunked(&state, &email).await?;
-    {
-        // Disconnected the last real account while its rows still existed →
-        // the demo fallback above couldn't seed (threads weren't empty yet).
-        let acc = store::get_accounts(&state.global().lock().unwrap());
-        if acc.accounts.iter().all(|a| a.provider == "mock") {
-            for a in &acc.accounts {
-                if let Ok(db) = state.account_db(&a.email) {
-                    let conn = db.lock().unwrap();
-                    let _ = mail::mock::seed_account_if_empty(&conn, &a.email);
-                }
+    if accounts.accounts.iter().all(|a| a.provider != "gmail") {
+        secrets::delete(secrets::GMAIL_REFRESH_TOKEN_LEGACY);
+    }
+    // 7. Demo fallback: seed each demo account's fixtures into its own file.
+    if accounts.accounts.iter().all(|a| a.provider == "mock") {
+        for a in &accounts.accounts {
+            if let Ok(db) = state.account_db(&a.email) {
+                let conn = db.lock().unwrap();
+                let _ = mail::mock::seed_account_if_empty(&conn, &a.email);
+                let _ = mail::mock::ensure_demo_vectors(&conn);
             }
         }
     }
+    let _ = app.emit("accounts:updated", &accounts);
     let _ = app.emit("mail:updated", ());
-    Ok(accounts)
 }
 
-/// Delete an account's mail a batch at a time, releasing the db lock between
-/// transactions so every other command interleaves — the app never freezes
-/// behind a disconnect, however large the account.
-async fn clear_account_mail_chunked(state: &AppState, account_id: &str) -> Result<(), String> {
-    let db = state.account_db(account_id)?;
-    loop {
-        // ~200 threads per batch: bounded lock holds, and (post-split) the
-        // scans only ever touch this one account's file.
-        let ids = {
-            let conn = db.lock().unwrap();
-            store::thread_ids_page(&conn, account_id, 200)?
-        };
-        if ids.is_empty() {
-            return Ok(());
+/// The removed account's attachment-cache filenames, minus any name another
+/// account's attachments still map to (the cache dir is shared and names
+/// collide by design).
+fn attachment_cache_names(state: &AppState, email: &str) -> Vec<String> {
+    let names_for = |target: &str| -> Vec<String> {
+        let Ok(db) = state.dbs.account(target) else { return vec![] };
+        let conn = db.lock().unwrap();
+        conn.prepare(
+            "SELECT DISTINCT a.filename FROM attachments a
+             JOIN messages m ON m.id = a.message_id
+             JOIN threads t ON t.id = m.thread_id
+             WHERE t.account_id = ?1",
+        )
+        .and_then(|mut st| {
+            st.query_map([target], |r| r.get::<_, String>(0))
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default()
+    };
+    let mine: Vec<String> = names_for(email).iter().map(|f| safe_attachment_name(f)).collect();
+    let mut kept = std::collections::HashSet::new();
+    for other in state.dbs.registered_emails() {
+        if other == email {
+            continue;
         }
-        {
-            let conn = db.lock().unwrap();
-            store::delete_threads(&conn, &ids)?;
+        for f in names_for(&other) {
+            kept.insert(safe_attachment_name(&f));
         }
-        tokio::task::yield_now().await;
+    }
+    mine.into_iter().filter(|n| !kept.contains(n)).collect()
+}
+
+/// Same sanitization open_attachment applies when writing the cache file.
+fn safe_attachment_name(filename: &str) -> String {
+    let safe: String = filename
+        .chars()
+        .map(|c| if c.is_alphanumeric() || ".-_ ".contains(c) { c } else { '_' })
+        .collect();
+    if safe.trim().is_empty() {
+        "attachment".into()
+    } else {
+        safe
     }
 }
 
@@ -2242,13 +2306,7 @@ async fn open_attachment(
         .map_err(|e| e.to_string())?
         .join("attachments");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let safe_name: String = row
-        .filename
-        .chars()
-        .map(|c| if c.is_alphanumeric() || ".-_ ".contains(c) { c } else { '_' })
-        .collect();
-    let safe_name = if safe_name.trim().is_empty() { "attachment".into() } else { safe_name };
-    let path = dir.join(safe_name);
+    let path = dir.join(safe_attachment_name(&row.filename));
     std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
     tauri_plugin_opener::open_path(&path, None::<String>)
         .map_err(|_| "could not open the attachment".to_string())
@@ -3932,6 +3990,21 @@ pub fn run() {
             let boot = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let state = boot.state::<AppState>();
+                // Removals the previous session never finished complete FIRST,
+                // so the migration below never copies an account that's being
+                // torn down.
+                let unfinished: Vec<String> = {
+                    store::get_accounts(&state.global().lock().unwrap())
+                        .accounts
+                        .iter()
+                        .filter(|a| a.removing)
+                        .map(|a| a.email.clone())
+                        .collect()
+                };
+                for email in unfinished {
+                    eprintln!("[remove:{email}] finishing removal from the previous session");
+                    finish_removal(boot.clone(), email).await;
+                }
                 let needs = {
                     let g = state.dbs.global();
                     let needs = {
