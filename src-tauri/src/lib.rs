@@ -4040,6 +4040,44 @@ pub fn run() {
             // account reads until the backgrounded split migration verifies.
             let dbs = store::registry::DbRegistry::open(&data_dir).map_err(std::io::Error::other)?;
 
+            // One-shot: strip demo data that pre-cut builds seeded into this
+            // user's real databases. Must run BEFORE the registry is read, so
+            // the rest of boot never sees the demo pair. Flag-guarded, because
+            // a real account that happens to look like a fixture must not be
+            // re-examined on every launch.
+            {
+                let gdb = dbs.global();
+                let purge_needed = {
+                    let conn = gdb.lock().unwrap();
+                    !store::demo_purge::already_purged(&conn)
+                };
+                if purge_needed {
+                    // Narrow lock scopes: close_and_delete takes the registry's
+                    // own lock, so the global guard must be released first.
+                    let removed = {
+                        let conn = gdb.lock().unwrap();
+                        let _ = store::demo_purge::sweep_demo_kv(&conn);
+                        store::demo_purge::purge_registry(&conn).unwrap_or_default()
+                    };
+                    for email in &removed {
+                        if let Err(e) = dbs.close_and_delete(email) {
+                            eprintln!("[demo-purge] {email}: {e}");
+                        }
+                    }
+                    // Pre-split installs kept every account's mail in one file.
+                    if let Some(legacy) = dbs.legacy() {
+                        let conn = legacy.lock().unwrap();
+                        match store::demo_purge::sweep_demo_rows(&conn) {
+                            Ok(n) if n > 0 => eprintln!("[demo-purge] legacy db: {n} threads"),
+                            Err(e) => eprintln!("[demo-purge] legacy db: {e}"),
+                            _ => {}
+                        }
+                    }
+                    let conn = gdb.lock().unwrap();
+                    let _ = store::demo_purge::mark_purged(&conn);
+                }
+            }
+
             let accounts = { store::get_accounts(&dbs.global().lock().unwrap()) };
             let mut sessions = HashMap::new();
             let mut lost_accounts = vec![];

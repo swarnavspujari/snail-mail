@@ -1,6 +1,7 @@
 //! SQLite persistence: threads/messages/attachments, JSON settings blobs,
 //! an FTS5 index for instant full-text search, and a sqlite-vec table for
 //! semantic (vector) search.
+pub mod demo_purge;
 pub mod migrate;
 pub mod registry;
 pub mod vec;
