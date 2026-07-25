@@ -43,7 +43,9 @@ pub fn insert(
 }
 
 /// Bookkeeping-only row for a message deliberately not embedded (demo text
-/// with no concept words) so `missing` stops offering it.
+/// with no concept words) so `missing` stops offering it. Only the fixture
+/// embedder ever skips, so this is demo-only.
+#[cfg(feature = "demo-fixtures")]
 pub fn mark_skipped(
     conn: &Connection,
     message_id: &str,
@@ -102,6 +104,9 @@ pub fn count_missing(conn: &Connection, account_id: &str) -> Result<i64, String>
     .map_err(|e| e.to_string())
 }
 
+/// Test-only assertion helper — no production caller since the demo embedder
+/// moved behind the feature, but sync/store tests both read it.
+#[allow(dead_code)]
 pub fn count_embedded(conn: &Connection, account_id: &str) -> Result<i64, String> {
     conn.query_row(
         "SELECT COUNT(*) FROM vec_meta WHERE account_id = ?1",

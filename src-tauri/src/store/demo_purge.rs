@@ -15,6 +15,7 @@
 
 use rusqlite::{params, Connection};
 
+use crate::store::{DEMO_ACCOUNT, DEMO_ACCOUNT_2};
 use crate::types::AccountsState;
 
 /// Set once the purge has run. Also the reason the purge can only ever run
@@ -22,8 +23,11 @@ use crate::types::AccountsState;
 /// risk on every subsequent boot.
 pub const PURGED_FLAG: &str = "demo_purged_v1";
 
+/// The two seeded accounts by name, plus anything else on the fixture domain
+/// (older builds also used `you@fission.local`). Naming the constants keeps
+/// this migration tied to the canonical values rather than re-spelling them.
 fn is_demo_email(email: &str) -> bool {
-    email.ends_with("@fission.local")
+    email == DEMO_ACCOUNT || email == DEMO_ACCOUNT_2 || email.ends_with("@fission.local")
 }
 
 /// True if this thread id has the fixture shape. Deliberately the same rule as
