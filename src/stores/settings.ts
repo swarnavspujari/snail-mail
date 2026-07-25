@@ -31,6 +31,8 @@ interface SettingsState {
   reorderAccounts: (emails: string[]) => Promise<void>;
 }
 
+let accountsPushSubscribed = false;
+
 async function loadCapabilities(
   accounts: AccountsState
 ): Promise<Record<string, Capabilities>> {
@@ -55,6 +57,16 @@ export const useSettings = create<SettingsState>((set, get) => ({
   streaks: { daily: 0, weekly: 0, lastZeroDay: null },
 
   load: async () => {
+    // The core pushes accounts:updated when the list changes underneath the
+    // UI (a background removal finished, a grant died). Subscribed here, not
+    // at module scope, so tests with partial backend mocks stay unaffected.
+    if (!accountsPushSubscribed) {
+      accountsPushSubscribed = true;
+      backend.onAccountsUpdated((accounts) => {
+        set({ accounts });
+        void loadCapabilities(accounts).then((capabilities) => set({ capabilities }));
+      });
+    }
     const [settings, kb, streaks, accounts] = await Promise.all([
       backend.getSettings(),
       backend.getKnowledgeBase(),

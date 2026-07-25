@@ -248,6 +248,10 @@ export class MockBackend implements Backend {
   private listeners = new Set<() => void>();
   private calendarListeners = new Set<(error: string | null) => void>();
   private syncListeners = new Set<(p: SyncProgress) => void>();
+  private accountsListeners = new Set<(a: AccountsState) => void>();
+  /** Accounts mid-removal (transient — mirrors the desktop's background
+   *  teardown so the removing → gone flow is exercisable in the demo). */
+  private removingAccounts = new Set<string>();
   private cancelFlags = new Map<number, boolean>();
   private aiSeq = 1;
   /** Simulated history-download state (mirrors the desktop's background crawl
@@ -391,9 +395,15 @@ export class MockBackend implements Backend {
         email,
         provider: "mock" as const,
         connected: true,
+        removing: this.removingAccounts.has(email) || undefined,
       })),
       active: this.state.activeAccount,
     };
+  }
+
+  private emitAccounts() {
+    const snapshot = this.accountsState();
+    for (const cb of this.accountsListeners) cb(snapshot);
   }
 
   async getAccounts(): Promise<AccountsState> {
@@ -432,8 +442,37 @@ export class MockBackend implements Backend {
       "OAuth needs the desktop app (Rust core). The browser build runs in demo mode."
     );
   }
-  async disconnect(): Promise<AccountsState> {
-    return this.accountsState();
+  /** Mirrors the desktop flow: mark removing + return instantly; a short
+   *  background beat then drops the account, its threads, and emits
+   *  accounts:updated. Idempotent — a second call is a no-op. */
+  async disconnect(email: string): Promise<AccountsState> {
+    if (
+      !this.state.accountOrder.includes(email) ||
+      this.removingAccounts.has(email) ||
+      this.state.accountOrder.length <= 1
+    ) {
+      return this.accountsState();
+    }
+    this.removingAccounts.add(email);
+    if (this.state.activeAccount === email) {
+      const next = this.state.accountOrder.find(
+        (e) => e !== email && !this.removingAccounts.has(e)
+      );
+      if (next) this.state.activeAccount = next;
+    }
+    const snapshot = this.accountsState();
+    setTimeout(() => {
+      this.removingAccounts.delete(email);
+      this.state.accountOrder = this.state.accountOrder.filter((e) => e !== email);
+      this.threads = this.threads.filter(
+        (t) => (this.accountOf.get(t.id) ?? DEMO_ACCOUNT) !== email
+      );
+      this.persist();
+      this.emitAccounts();
+      this.notify();
+    }, 400);
+    this.emitAccounts();
+    return snapshot;
   }
   async syncNow() {
     this.wakeDueSnoozes();
@@ -1734,6 +1773,10 @@ export class MockBackend implements Backend {
   // The storage split is a desktop-only, one-time event; the demo never migrates.
   onMigrationProgress(): () => void {
     return () => {};
+  }
+  onAccountsUpdated(cb: (a: AccountsState) => void): () => void {
+    this.accountsListeners.add(cb);
+    return () => this.accountsListeners.delete(cb);
   }
 }
 

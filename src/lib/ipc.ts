@@ -238,6 +238,9 @@ export interface Backend {
   /** Fires while the one-time per-account storage split runs (desktop only).
    *  A payload with table === "done" means the split finished. */
   onMigrationProgress(cb: (p: MigrationProgress) => void): () => void;
+  /** Backend pushes when the accounts list changes out from under the UI —
+   *  a background removal finished, or a grant died (connected flipped). */
+  onAccountsUpdated(cb: (a: AccountsState) => void): () => void;
 }
 
 export const isTauri =
@@ -599,6 +602,12 @@ class TauriBackend implements Backend {
   }
   onMigrationProgress(cb: (p: MigrationProgress) => void): () => void {
     const un = listen<MigrationProgress>("migration:progress", (e) => cb(e.payload));
+    return () => {
+      void un.then((f) => f());
+    };
+  }
+  onAccountsUpdated(cb: (a: AccountsState) => void): () => void {
+    const un = listen<AccountsState>("accounts:updated", (e) => cb(e.payload));
     return () => {
       void un.then((f) => f());
     };

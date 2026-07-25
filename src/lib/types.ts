@@ -92,6 +92,9 @@ export interface AccountInfo {
   email: string;
   provider: "gmail" | "outlook" | "mock";
   connected: boolean;
+  /** True while the account's data is being torn down in the background —
+   *  the row shows "Removing…" and every action on it is disabled. */
+  removing?: boolean;
 }
 
 /** All connected accounts in slot order (index 0 = Ctrl+1) + the active one. */

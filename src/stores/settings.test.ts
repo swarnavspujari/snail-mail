@@ -9,6 +9,7 @@ const backend = vi.hoisted(() => ({
   getStreaks: vi.fn(),
   getAccounts: vi.fn(),
   getCapabilities: vi.fn(),
+  onAccountsUpdated: vi.fn(() => () => {}),
 }));
 
 vi.mock("@/lib/ipc", () => ({ backend, isTauri: false }));

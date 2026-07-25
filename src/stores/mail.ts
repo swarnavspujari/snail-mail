@@ -26,7 +26,10 @@ function cacheThread(id: ThreadId, msgs: Message[]) {
   }
 }
 
-/** Test hook: drop the session caches (label lists + thread messages). */
+/** Drop the session caches (label lists + thread messages). Production
+ *  callers: account switch and disconnect — without this, the removed (or
+ *  backgrounded) account's mail keeps painting from memory. Also the test
+ *  reset hook. */
 export function clearMailCaches() {
   labelCache.clear();
   threadCache.clear();
