@@ -271,6 +271,9 @@ export class MockBackend implements Backend {
   /** Cancels the running simulated pass so a second syncNow() can't interleave
    *  two counts into one pill. */
   private activityTimer: ReturnType<typeof setInterval> | null = null;
+  /** Resolver of the in-flight pass, so a superseding pass can settle it —
+   *  clearing the interval alone would strand the old caller's .then chain. */
+  private activityResolve: (() => void) | null = null;
 
   constructor() {
     const seed = buildSeedData();
@@ -372,12 +375,16 @@ export class MockBackend implements Backend {
     everyMs = 60
   ): Promise<void> {
     if (this.activityTimer) clearInterval(this.activityTimer);
+    this.activityTimer = null;
+    this.activityResolve?.();
+    this.activityResolve = null;
     const account = this.state.activeAccount;
     if (total <= 0) {
       this.emitActivity({ account, stage, done: 0, total: 0 });
       return Promise.resolve();
     }
     return new Promise((resolve) => {
+      this.activityResolve = resolve;
       let done = 0;
       this.activityTimer = setInterval(() => {
         done += 1;
@@ -385,6 +392,7 @@ export class MockBackend implements Backend {
         if (done >= total) {
           if (this.activityTimer) clearInterval(this.activityTimer);
           this.activityTimer = null;
+          this.activityResolve = null;
           resolve();
         }
       }, everyMs);

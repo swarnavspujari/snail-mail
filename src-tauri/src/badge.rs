@@ -35,11 +35,13 @@
 //! a future emit site picks the badge up for free.
 //!
 //! Known platform limit: the Linux count goes through the Unity launcher
-//! protocol, which GNOME ignores unless something like Dash-to-Dock is
-//! installed. KDE Plasma and Unity show it; the call is harmless where nothing
-//! listens.
+//! protocol via libunity, and tao only forwards it when libunity is present
+//! AND reports the Unity shell running — so in practice only Unity desktops
+//! (and setups emulating it) render a count; GNOME and KDE silently ignore
+//! it. The call is harmless where nothing listens.
 
 use crate::{store, AppState};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tauri::{AppHandle, Manager};
 
 /// The split the badge counts. `goto.inbox` lands here (`lib/commands.ts`) and
@@ -187,9 +189,16 @@ fn count_unread_primary(app: &AppHandle) -> i64 {
 /// Hopping to the blocking pool means the funnel can never deadlock a caller
 /// against its own database lock.
 pub fn refresh(app: &AppHandle) {
+    // Newest-wins sequencing: concurrent refreshes recount in parallel, but a
+    // stale result is dropped instead of painting over a newer one.
+    static GEN: AtomicU64 = AtomicU64::new(0);
+    let gen = GEN.fetch_add(1, Ordering::SeqCst) + 1;
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        apply(&app, count_unread_primary(&app));
+        let count = count_unread_primary(&app);
+        if GEN.load(Ordering::SeqCst) == gen {
+            apply(&app, count);
+        }
     });
 }
 

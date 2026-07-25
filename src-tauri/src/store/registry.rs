@@ -53,6 +53,14 @@ impl DbRegistry {
         self.global.clone()
     }
 
+    /// Split definitions for classification, read from `global.db` — the only
+    /// place `save_settings` writes them. Account files never hold a settings
+    /// row, so classifiers must take these, never read defs off their own conn.
+    pub fn split_defs(&self) -> Vec<crate::types::Split> {
+        let g = self.global.lock().unwrap();
+        super::split_config(&g)
+    }
+
     /// The connection serving this account right now: its own file once the
     /// account is migrated (or there is no legacy db), else the legacy db.
     pub fn account(&self, email: &str) -> Result<Arc<Mutex<Connection>>, String> {
@@ -279,6 +287,73 @@ mod tests {
         let g = g.lock().unwrap();
         let s: serde_json::Value = crate::store::get_json(&g, "streaks").unwrap();
         assert_eq!(s["daily"], 9, "idempotent copy must not clobber newer global values");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The v0.23 desktop blocker: settings live only in global.db, so any
+    /// classifier that reads split defs off the account conn silently gets the
+    /// defaults and custom splits never fill. split_defs() is the fix — pin
+    /// both directions.
+    #[test]
+    fn split_defs_read_global_settings_and_classify_account_threads() {
+        let dir = tmp_dir("splitdefs");
+        let reg = DbRegistry::open(&dir).unwrap();
+        {
+            let g = reg.global();
+            let g = g.lock().unwrap();
+            let mut settings = crate::store::default_settings();
+            settings.splits.insert(
+                0,
+                crate::types::Split {
+                    id: "travel".into(),
+                    name: "Travel".into(),
+                    builtin: false,
+                    query: "from:thriftytraveler.com OR from:thepointsguy.com".into(),
+                    account_id: None,
+                    also_show: false,
+                    hide_when_empty: false,
+                    rules: vec![],
+                    op: "or".into(),
+                },
+            );
+            crate::store::set_json(&g, "settings", &settings).unwrap();
+        }
+        let defs = reg.split_defs();
+        assert!(defs.iter().any(|s| s.id == "travel"), "split_defs must read global.db");
+
+        let a = reg.account("u@x.test").unwrap();
+        let conn = a.lock().unwrap();
+        let t = crate::types::Thread {
+            id: "t-tt".into(),
+            subject: "Fare drop".into(),
+            snippet: String::new(),
+            participants: vec!["Thrifty Traveler <deals@thriftytraveler.com>".into()],
+            recipients: vec![],
+            message_count: 1,
+            last_date: 1_000,
+            unread: true,
+            starred: false,
+            labels: vec![],
+            in_inbox: true,
+            snoozed_until: None,
+            split: String::new(),
+            also_in: vec![],
+        };
+        crate::store::upsert_thread(&conn, "u@x.test", &t, &[], &defs).unwrap();
+        let split: String = conn
+            .query_row("SELECT split_id FROM threads WHERE id = 't-tt'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(split, "travel", "account-file upsert must classify with global defs");
+
+        // The account file itself holds no settings row — defs read off it are
+        // the defaults. If this ever starts passing a 'travel' split, the
+        // global/account settings separation changed and split_defs can go.
+        let off_account_conn = crate::store::split_config(&conn);
+        assert!(
+            !off_account_conn.iter().any(|s| s.id == "travel"),
+            "account conns must not see custom splits (settings live in global.db)"
+        );
+        drop(conn);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

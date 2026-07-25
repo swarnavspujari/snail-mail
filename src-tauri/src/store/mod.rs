@@ -777,6 +777,7 @@ pub fn reclassify_page(
     after_rowid: i64,
     page: usize,
     only_missing: bool,
+    splits: &[Split],
 ) -> Result<(usize, i64, bool), String> {
     let filter = if only_missing { "AND split_id IS NULL" } else { "" };
     let sql = format!(
@@ -813,14 +814,13 @@ pub fn reclassify_page(
 
     let done = rows.len() < page;
     let last_rowid = rows.last().map(|(r, _, _)| *r).unwrap_or(after_rowid);
-    let splits = split_config(conn);
     // compile once per account seen in this page
     let mut specs: HashMap<String, Vec<crate::splits::SplitSpec>> = HashMap::new();
     let mut updated = 0usize;
     for (rowid, t, account) in &rows {
         let spec = specs
             .entry(account.clone())
-            .or_insert_with(|| crate::splits::compile(&splits, account));
+            .or_insert_with(|| crate::splits::compile(splits, account));
         let (home, also) = classify_thread(t, spec);
         let also_json = serde_json::to_string(&also).unwrap();
         if t.split != home || serde_json::to_string(&t.also_in).unwrap() != also_json {
@@ -992,13 +992,17 @@ fn classify_thread(t: &Thread, specs: &[crate::splits::SplitSpec]) -> (String, V
 /// Upsert a thread and its messages (used by both mock seeding and Gmail sync).
 /// Split membership is (re)materialized here — every sync refetch reclassifies,
 /// so label/participant changes move threads between splits on their own.
+/// `splits` must come from the settings' home db (DbRegistry::split_defs reads
+/// global.db) — account files never hold a settings row, so reading the
+/// definitions off `conn` would silently classify with the defaults.
 pub fn upsert_thread(
     conn: &Connection,
     account_id: &str,
     t: &Thread,
     msgs: &[MsgRow],
+    splits: &[Split],
 ) -> Result<(), String> {
-    let specs = crate::splits::compile(&split_config(conn), account_id);
+    let specs = crate::splits::compile(splits, account_id);
     let (split_id, split_also) = classify_thread(t, &specs);
     conn.execute(
         "INSERT INTO threads (id, subject, snippet, participants, message_count, last_date,
@@ -2402,7 +2406,7 @@ mod tests {
             unread: false,
             attachments: vec![],
         };
-        upsert_thread(conn, ACCT, &t, &[(m, None, None, None, vec![])]).unwrap();
+        upsert_thread(conn, ACCT, &t, &[(m, None, None, None, vec![])], &split_config(conn)).unwrap();
     }
 
     /// Zero accounts must stay zero accounts. This is the whole point of
@@ -2546,7 +2550,7 @@ mod tests {
         set_json(&conn, "settings", &s).unwrap();
         let mut after = 0i64;
         loop {
-            let (_, last, done) = reclassify_page(&conn, after, 100, false).unwrap();
+            let (_, last, done) = reclassify_page(&conn, after, 100, false, &split_config(&conn)).unwrap();
             after = last;
             if done {
                 break;
@@ -2578,7 +2582,7 @@ mod tests {
                 split: String::new(),
                 also_in: vec![],
             };
-            upsert_thread(&conn, ACCT, &t, &[]).unwrap();
+            upsert_thread(&conn, ACCT, &t, &[], &split_config(&conn)).unwrap();
         };
         let badge = || count_unread_in_split(&conn, ACCT, "important");
 
@@ -2600,6 +2604,50 @@ mod tests {
 
         // A second unread thread moves the number.
         seed_thread("t-hit2", true, &["IMPORTANT"], true, None);
+        assert_eq!(badge(), 2);
+    }
+
+    /// spawn_remote repaints the badge right after each triage command's local
+    /// column write — pin that every setter those commands use moves the count
+    /// immediately (mark_read, snooze, trash/spam, archive, and their undos).
+    #[test]
+    fn badge_count_tracks_triage_setter_writes() {
+        let conn = open(std::path::Path::new(":memory:")).unwrap();
+        for id in ["t-a", "t-b", "t-c", "t-d"] {
+            let t = Thread {
+                id: id.into(),
+                subject: "Subject".into(),
+                snippet: String::new(),
+                participants: vec!["Ann <ann@x.test>".into()],
+                recipients: vec![],
+                message_count: 1,
+                last_date: 1_000,
+                unread: true,
+                starred: false,
+                labels: vec!["IMPORTANT".into()],
+                in_inbox: true,
+                snoozed_until: None,
+                split: String::new(),
+                also_in: vec![],
+            };
+            upsert_thread(&conn, ACCT, &t, &[], &split_config(&conn)).unwrap();
+        }
+        let badge = || count_unread_in_split(&conn, ACCT, "important");
+        assert_eq!(badge(), 4);
+
+        set_unread(&conn, "t-a", false).unwrap(); // mark_read
+        assert_eq!(badge(), 3);
+        set_snoozed(&conn, "t-b", 9_999).unwrap(); // snooze_thread
+        assert_eq!(badge(), 2);
+        set_hidden(&conn, "t-c", Some("trash")).unwrap(); // hide_thread
+        assert_eq!(badge(), 1);
+        set_in_inbox(&conn, "t-d", false).unwrap(); // archive_thread
+        assert_eq!(badge(), 0);
+
+        // and the undo paths come back
+        set_hidden(&conn, "t-c", None).unwrap(); // restore_thread
+        assert_eq!(badge(), 1);
+        set_unread(&conn, "t-a", true).unwrap(); // mark_unread
         assert_eq!(badge(), 2);
     }
 
@@ -2630,7 +2678,7 @@ mod tests {
             split: String::new(),
             also_in: vec![],
         };
-        upsert_thread(&conn, ACCT, &t, &[]).unwrap();
+        upsert_thread(&conn, ACCT, &t, &[], &split_config(&conn)).unwrap();
 
         let rows = list_threads(&conn, "inbox", ACCT).unwrap();
         assert_eq!(rows[0].split, "travel");
@@ -2743,7 +2791,7 @@ mod tests {
             unread: false,
             attachments: vec![],
         };
-        upsert_thread(&conn, "other@x.test", &t, &[(m, None, None, None, vec![])]).unwrap();
+        upsert_thread(&conn, "other@x.test", &t, &[(m, None, None, None, vec![])], &split_config(&conn)).unwrap();
 
         clear_account_mail(&conn, "other@x.test").unwrap();
 
@@ -2810,7 +2858,7 @@ mod tests {
             unread: false,
             attachments: vec![],
         };
-        upsert_thread(&conn, ACCT, &t, &[(m, None, None, None, vec![])]).unwrap();
+        upsert_thread(&conn, ACCT, &t, &[(m, None, None, None, vec![])], &split_config(&conn)).unwrap();
 
         let plan = crate::search::SearchPlan { people: vec!["maya".into()], ..Default::default() };
         let hits = search_planned(&conn, &plan, ACCT, None).unwrap();
@@ -2946,7 +2994,7 @@ mod tests {
             unread: false,
             attachments: vec![],
         };
-        upsert_thread(&conn, ACCT, &t, &[(m, None, None, None, vec![])]).unwrap();
+        upsert_thread(&conn, ACCT, &t, &[(m, None, None, None, vec![])], &split_config(&conn)).unwrap();
 
         // recency desc; the body-only mention (t-body) is excluded.
         let hits = threads_with_contact(&conn, "maya@x.test", ACCT, 10).unwrap();

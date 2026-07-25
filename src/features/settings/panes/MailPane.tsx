@@ -6,6 +6,7 @@ import { Switch } from "@/components/Switch";
 import { assignCalendarHues, calendarHue, hueVar } from "@/lib/calendar-view";
 import { backend } from "@/lib/ipc";
 import { parseSplitQuery } from "@/lib/split-query";
+import { useMail } from "@/stores/mail";
 import { useSettings } from "@/stores/settings";
 import { Pref } from "../Pref";
 import { useReceipt } from "../receipt";
@@ -183,10 +184,17 @@ function SplitsSection() {
 
   const saveSplits = (next: Split[], label: string) => {
     const before = splits;
-    void useSettings.getState().save({ splits: next });
-    useReceipt
-      .getState()
-      .note(label, () => useSettings.getState().save({ splits: before }));
+    // refresh() after each save so the mail store's activeSplitId
+    // reconciliation runs NOW — on desktop a deleted split whose reclassify
+    // moves no threads emits no mail:updated, and the dangling tab faked
+    // inbox-zero until the next sync tick.
+    const saveAndReconcile = (value: Split[]) =>
+      useSettings
+        .getState()
+        .save({ splits: value })
+        .then(() => useMail.getState().refresh());
+    void saveAndReconcile(next);
+    useReceipt.getState().note(label, () => saveAndReconcile(before));
   };
 
   const move = (id: string, dir: -1 | 1) => {
@@ -195,7 +203,7 @@ function SplitsSection() {
     const j = i + dir;
     if (i < 0 || j < 0 || j >= next.length) return;
     [next[i], next[j]] = [next[j], next[i]];
-    saveSplits(next, `${next[j].name} moved ${dir === -1 ? "down" : "up"} the order`);
+    saveSplits(next, `${next[j].name} moved ${dir === -1 ? "up" : "down"} the order`);
   };
 
   return (

@@ -183,7 +183,14 @@ mod tests {
             unread: false,
             attachments: vec![],
         };
-        crate::store::upsert_thread(conn, account, &t, &[(m, None, None, None, vec![])]).unwrap();
+        crate::store::upsert_thread(
+            conn,
+            account,
+            &t,
+            &[(m, None, None, None, vec![])],
+            &crate::store::split_config(conn),
+        )
+        .unwrap();
     }
 
     fn thread_ids(conn: &Connection) -> Vec<String> {

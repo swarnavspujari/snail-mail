@@ -118,8 +118,11 @@ pub fn data_targets(data: &Path, include_global: bool) -> Vec<PathBuf> {
     let mut out = vec![];
     // Pre-split single-file mailbox, still present until the split migration
     // verifies. Sidecars are separate files; a stale -wal would resurrect rows.
+    // `.bak` is the renamed full mailbox the split migration parks until every
+    // account verifies — it holds every body and attachment, so a purge that
+    // misses it erases nothing.
     for base in ["fission.db", "zenbox.db"] {
-        for suffix in ["", "-wal", "-shm"] {
+        for suffix in ["", "-wal", "-shm", ".bak", ".bak-wal", ".bak-shm"] {
             out.push(data.join(format!("{base}{suffix}")));
         }
     }
@@ -469,9 +472,26 @@ pub fn maybe_run_cli() -> bool {
     if !args.iter().any(|a| a == "--purge-data") {
         return false;
     }
-    let value_after = |flag: &str| -> Option<PathBuf> {
-        let i = args.iter().position(|a| a == flag)?;
-        args.get(i + 1).map(PathBuf::from)
+    // A present flag with a missing or flag-shaped value must ABORT, not fall
+    // back: `--app-data --dry-run` silently retargeting the purge at the real
+    // profile is how a scratch test deletes someone's mailbox.
+    let value_after = |flag: &str| -> Result<Option<PathBuf>, String> {
+        let Some(i) = args.iter().position(|a| a == flag) else {
+            return Ok(None);
+        };
+        match args.get(i + 1) {
+            Some(v) if !v.starts_with('-') => Ok(Some(PathBuf::from(v))),
+            _ => Err(format!("{flag} needs a directory argument — nothing was deleted")),
+        }
+    };
+    let (data_root, cache_root) = match (value_after("--app-data"), value_after("--app-cache")) {
+        (Ok(d), Ok(c)) => (d, c),
+        (Err(e), _) | (_, Err(e)) => {
+            #[cfg(target_os = "windows")]
+            attach_parent_console();
+            eprintln!("[purge] {e}");
+            return true; // handled: exit without touching anything
+        }
     };
     let opts = Options {
         scope: if args.iter().any(|a| a == "--all") {
@@ -480,8 +500,8 @@ pub fn maybe_run_cli() -> bool {
             Scope::CredentialsAndLegacy
         },
         dry_run: args.iter().any(|a| a == "--dry-run"),
-        data_root: value_after("--app-data"),
-        cache_root: value_after("--app-cache"),
+        data_root,
+        cache_root,
         revoke: !args.iter().any(|a| a == "--no-revoke"),
         credentials: !args.iter().any(|a| a == "--no-credentials"),
     };
@@ -567,9 +587,22 @@ mod tests {
         let d = Path::new("/x");
         let all: Vec<String> =
             data_targets(d, true).iter().map(|p| p.display().to_string()).collect();
-        for want in ["global.db", "global.db-wal", "global.db-shm", "fission.db-wal"] {
+        for want in [
+            "global.db",
+            "global.db-wal",
+            "global.db-shm",
+            "fission.db-wal",
+            // the split migration's parked full mailbox — missing this made
+            // "Erase all local data" leave every body/attachment on disk
+            "fission.db.bak",
+            "zenbox.db.bak",
+        ] {
             assert!(all.iter().any(|p| p.ends_with(want)), "missing {want} in {all:?}");
         }
+        // the in-app erase (include_global=false) must also take the .bak
+        let live_bak: Vec<String> =
+            data_targets(d, false).iter().map(|p| p.display().to_string()).collect();
+        assert!(live_bak.iter().any(|p| p.ends_with("fission.db.bak")));
         assert!(all.iter().any(|p| p.ends_with("accounts")));
         assert!(all.iter().any(|p| p.ends_with("models")));
         // the in-app variant must leave the open connection's file alone

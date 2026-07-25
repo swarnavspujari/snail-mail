@@ -80,6 +80,9 @@ describe("settings catalog", () => {
       "showShortcutBar",
       "driveShareMode",
       "hiddenCalendars",
+      // the taskbar/dock badge toggle shipped as a palette command only —
+      // the settings redesign was meant to give it a row and didn't
+      "showBadge",
     ]) {
       expect(PREF_ROWS.some((r) => r.key === key)).toBe(true);
     }

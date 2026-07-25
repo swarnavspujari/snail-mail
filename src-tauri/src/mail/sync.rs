@@ -105,6 +105,7 @@ pub async fn full_sync(
     force_reconcile: bool,
     pass: SyncPass,
     on_progress: ProgressFn<'_>,
+    splits: &[Split],
 ) -> Result<bool, String> {
     let key = history_key(account_id);
     let start: Option<String> = if force_reconcile {
@@ -114,18 +115,21 @@ pub async fn full_sync(
         store::get_json(&conn, &key)
     };
     let mut changed = match start {
-        Some(hid) => match incremental(http, session, db, account_id, &hid, &key, on_progress).await
-        {
-            Ok(c) => c,
-            // An expired historyId (Gmail keeps ~a week) returns 404; an invalid
-            // one returns 400. Either way reconcile from scratch instead of
-            // pinning a dead baseline and re-failing the same window forever.
-            Err(e) if e.contains("(404") || e.contains("(400") => {
-                reconcile(http, session, db, account_id, &key, pass, on_progress).await?
+        Some(hid) => {
+            match incremental(http, session, db, account_id, &hid, &key, on_progress, splits).await
+            {
+                Ok(c) => c,
+                // An expired historyId (Gmail keeps ~a week) returns 404; an invalid
+                // one returns 400. Either way reconcile from scratch instead of
+                // pinning a dead baseline and re-failing the same window forever.
+                Err(e) if e.contains("(404") || e.contains("(400") => {
+                    reconcile(http, session, db, account_id, &key, pass, on_progress, splits)
+                        .await?
+                }
+                Err(e) => return Err(e),
             }
-            Err(e) => return Err(e),
-        },
-        None => reconcile(http, session, db, account_id, &key, pass, on_progress).await?,
+        }
+        None => reconcile(http, session, db, account_id, &key, pass, on_progress, splits).await?,
     };
 
     // Muted threads never sit in the inbox: any that resurfaced (new reply)
@@ -152,6 +156,7 @@ async fn incremental(
     start_history_id: &str,
     key: &str,
     on_progress: ProgressFn<'_>,
+    splits: &[Split],
 ) -> Result<bool, String> {
     let mut affected: HashSet<String> = HashSet::new();
     let mut latest = start_history_id.to_string();
@@ -184,7 +189,7 @@ async fn incremental(
     // 30s tick, which reported nothing at all before.
     let total = affected.len();
     for (i, tid) in affected.iter().enumerate() {
-        match refetch_thread(http, session, db, account_id, tid).await {
+        match refetch_thread(http, session, db, account_id, tid, splits).await {
             Ok(c) => changed |= c,
             // One thread failing (rate-limit, transient network, an unexpected
             // body) must NOT abort the loop — otherwise the advanced historyId
@@ -225,6 +230,7 @@ async fn reconcile(
     key: &str,
     pass: SyncPass,
     on_progress: ProgressFn<'_>,
+    splits: &[Split],
 ) -> Result<bool, String> {
     // Captured BEFORE the listings so a thread the user trashes mid-reconcile
     // isn't mistaken for a server-side restore and resurrected below.
@@ -312,6 +318,7 @@ async fn reconcile(
         &inbox_to_fetch,
         pass.stage(SyncStage::ReconcileInbox),
         on_progress,
+        splits,
     )
     .await;
 
@@ -344,6 +351,7 @@ async fn reconcile(
         &rest_to_fetch,
         pass.stage(SyncStage::ReconcileRest),
         on_progress,
+        splits,
     )
     .await;
 
@@ -414,11 +422,12 @@ async fn fetch_streaming(
     ids: &[String],
     stage: SyncStage,
     on_progress: ProgressFn<'_>,
+    splits: &[Split],
 ) -> bool {
     let mut changed = false;
     let total = ids.len();
     for (i, id) in ids.iter().enumerate() {
-        match refetch_thread(http, session, db, account_id, id).await {
+        match refetch_thread(http, session, db, account_id, id, splits).await {
             Ok(_) => changed = true,
             Err(e) => eprintln!("[sync:{account_id}] reconcile refetch {id} failed: {e}"),
         }
@@ -441,6 +450,7 @@ pub async fn refetch_thread(
     db: &std::sync::Mutex<Connection>,
     account_id: &str,
     id: &str,
+    splits: &[Split],
 ) -> Result<bool, String> {
     let mut v = match session.get_thread_full(http, id).await {
         Ok(v) => v,
@@ -501,7 +511,7 @@ pub async fn refetch_thread(
             .as_ref()
             .map(|t| t.message_count < thread.message_count)
             .unwrap_or(false);
-        store::upsert_thread(&conn, account_id, &thread, &msgs)?;
+        store::upsert_thread(&conn, account_id, &thread, &msgs, splits)?;
         if was_muted {
             let _ = store::toggle_label(&conn, id, "Muted");
         }
@@ -677,6 +687,7 @@ pub async fn crawl_step(
     db: &std::sync::Mutex<Connection>,
     account_id: &str,
     on_progress: ProgressFn<'_>,
+    splits: &[Split],
 ) -> Result<CrawlBeat, String> {
     let key = crawl_key(account_id);
     let mut cur: CrawlCursor = {
@@ -746,7 +757,7 @@ pub async fn crawl_step(
                 let Some(session) = sessions.get_mut(account_id) else {
                     return Err("account disconnected mid-beat".into());
                 };
-                refetch_thread(http, session, db, account_id, id).await
+                refetch_thread(http, session, db, account_id, id, splits).await
             };
             match fetched {
                 Ok(_) => beat.fetched += 1,
@@ -1018,7 +1029,8 @@ mod tests {
             unread: false,
             attachments: vec![],
         };
-        store::upsert_thread(conn, ACCT, &t, &[(m, None, None, None, vec![])]).unwrap();
+        store::upsert_thread(conn, ACCT, &t, &[(m, None, None, None, vec![])], &store::split_config(conn))
+            .unwrap();
     }
 
     #[test]

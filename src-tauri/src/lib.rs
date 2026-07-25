@@ -580,9 +580,19 @@ async fn erase_all_local_data(
 
     // 1. Every address this machine has ever held a token for — the live
     //    registry plus anything still recorded in the db files, so an account
-    //    dropped by a half-finished removal does not keep its token.
+    //    dropped by a half-finished removal does not keep its token. The
+    //    legacy-brand trees (com.fission.mail / com.zenbox.mail) are scanned
+    //    too — an account that never migrated still has a token under its name
+    //    — and removed in step 4, matching the headless purge::run.
+    let legacy_data: Vec<std::path::PathBuf> = state
+        .data_dir
+        .parent()
+        .map(|p| purge::LEGACY_IDENTIFIERS.iter().map(|id| p.join(id)).collect())
+        .unwrap_or_default();
+    let mut search_dirs = vec![state.data_dir.clone()];
+    search_dirs.extend(legacy_data.iter().cloned());
     let mut emails = state.dbs.registered_emails();
-    for e in purge::known_emails(&[state.data_dir.clone()]) {
+    for e in purge::known_emails(&search_dirs) {
         if !emails.contains(&e) {
             emails.push(e);
         }
@@ -612,11 +622,22 @@ async fn erase_all_local_data(
     for p in purge::data_targets(&state.data_dir, false) {
         purge::remove(&p, false, &mut report);
     }
+    // Legacy-brand trees, data side. Nothing else ever removes these — the
+    // installer only knows the current identifier.
+    for root in &legacy_data {
+        purge::remove(root, false, &mut report);
+    }
     if let Ok(cache) = app.path().app_cache_dir() {
         // The WebView2 profile is left alone: it is in use by the window this
         // very command is answering, and it holds no mail.
         for p in purge::cache_targets(&cache, false) {
             purge::remove(&p, false, &mut report);
+        }
+        // Legacy-brand trees, cache side.
+        if let Some(parent) = cache.parent() {
+            for id in purge::LEGACY_IDENTIFIERS {
+                purge::remove(&parent.join(id), false, &mut report);
+            }
         }
     }
 
@@ -1963,6 +1984,30 @@ fn progress_callback(app: AppHandle) -> impl Fn(mail::sync::SyncTick) + Send + S
     }
 }
 
+/// A pass died mid-flight (sync error, crawl abort): fabricate its terminal
+/// tick so the pill fades instead of freezing at "17 of 30…" and
+/// `get_sync_activity` stops telling late mounters a dead pass is running.
+/// Only clears the erroring account's pass — another account's live download
+/// keeps its counter.
+fn clear_sync_activity(app: &AppHandle, account: &str) {
+    let tick = {
+        let state = app.state::<AppState>();
+        let mut slot = state.activity.lock().unwrap();
+        match slot.take() {
+            Some(t) if t.account == account => {
+                Some(mail::sync::SyncTick { done: t.total, ..t })
+            }
+            other => {
+                *slot = other;
+                None
+            }
+        }
+    };
+    if let Some(t) = tick {
+        let _ = app.emit("sync:activity", t);
+    }
+}
+
 /// Pull the in-flight download pass, if any. Lets a UI that mounts mid-pass
 /// (onboarding's first sync, a reopened window) show the counter immediately
 /// instead of waiting for the next beat — or missing the pass entirely.
@@ -2057,11 +2102,17 @@ fn mark_auth_lost(app: &AppHandle, email: &str) {
 fn sync_in_background(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         let state = app.state::<AppState>();
+        // The split migration assumes a quiesced legacy db; a sync racing it
+        // aborts the copy at verification. The boot reconcile re-runs after.
+        if state.migrating.load(Ordering::SeqCst) {
+            return;
+        }
         // The inbox streams in live as reconcile fetches it (and the download
         // bar climbs) rather than appearing all-at-once when sync finishes.
         let on_progress = progress_callback(app.clone());
         let mut changed = false;
         let mut lost: Vec<String> = vec![];
+        let splits = state.dbs.split_defs();
         let mut sessions = state.gmail.lock().await;
         for (email, session) in sessions.iter_mut() {
             let Ok(db) = state.account_db(email) else { continue };
@@ -2073,12 +2124,14 @@ fn sync_in_background(app: AppHandle) {
                 false,
                 mail::sync::SyncPass::Normal,
                 &on_progress,
+                &splits,
             )
             .await
             {
                 Ok(c) => changed |= c,
                 Err(e) => {
                     eprintln!("[sync:{email}] {e}");
+                    clear_sync_activity(&app, email);
                     if is_grant_dead(&state.http, session, &e).await {
                         lost.push(email.clone());
                     }
@@ -2178,7 +2231,9 @@ fn spawn_history_crawl(app: AppHandle) {
                     }
                 }
             };
-            match mail::sync::crawl_step(&state.http, &state.gmail, &db, &email, &on_progress).await
+            let splits = state.dbs.split_defs();
+            match mail::sync::crawl_step(&state.http, &state.gmail, &db, &email, &on_progress, &splits)
+                .await
             {
                 // steady state after the walk finishes: nothing to report
                 Ok(b) if b.done && b.fetched == 0 && b.skipped == 0 && b.failed == 0 => {}
@@ -2192,6 +2247,7 @@ fn spawn_history_crawl(app: AppHandle) {
                 ),
                 Err(e) => {
                     eprintln!("[crawl:{email}] {e}");
+                    clear_sync_activity(&app, &email);
                     classify_sync_error(&app, &email, &e).await;
                 }
             }
@@ -2241,6 +2297,13 @@ fn spawn_history_crawl(app: AppHandle) {
 
 #[tauri::command]
 async fn sync_now(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    if state.migrating.load(Ordering::SeqCst) {
+        return Err(
+            "Mail is still being reorganized on disk — syncing resumes automatically when \
+             that finishes."
+                .into(),
+        );
+    }
     for email in state.dbs.registered_emails() {
         if let Ok(db) = state.account_db(&email) {
             let conn = db.lock().unwrap();
@@ -2252,6 +2315,7 @@ async fn sync_now(app: AppHandle, state: State<'_, AppState>) -> Result<(), Stri
     // every account after it; dead grants classify instead of just erroring.
     let mut first_err: Option<String> = None;
     let mut lost: Vec<String> = vec![];
+    let splits = state.dbs.split_defs();
     let mut sessions = state.gmail.lock().await;
     for (email, session) in sessions.iter_mut() {
         let db = state.account_db(email)?;
@@ -2263,10 +2327,12 @@ async fn sync_now(app: AppHandle, state: State<'_, AppState>) -> Result<(), Stri
             false,
             mail::sync::SyncPass::Normal,
             &on_progress,
+            &splits,
         )
         .await
         {
             eprintln!("[sync-now:{email}] {e}");
+            clear_sync_activity(&app, email);
             if is_grant_dead(&state.http, session, &e).await {
                 lost.push(email.clone());
             }
@@ -2294,6 +2360,13 @@ async fn sync_now(app: AppHandle, state: State<'_, AppState>) -> Result<(), Stri
 /// Local-only state (snoozes, read/hidden flags) is preserved.
 #[tauri::command]
 async fn resync_account(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    if state.migrating.load(Ordering::SeqCst) {
+        return Err(
+            "Mail is still being reorganized on disk — run Repair Mail again once that \
+             finishes."
+                .into(),
+        );
+    }
     let emails: Vec<String> = state.gmail.lock().await.keys().cloned().collect();
     if emails.is_empty() {
         return Ok(()); // demo mode: nothing to resync
@@ -2312,6 +2385,7 @@ async fn resync_account(app: AppHandle, state: State<'_, AppState>) -> Result<()
     let on_progress = progress_callback(app.clone());
     let mut first_err: Option<String> = None;
     let mut lost: Vec<String> = vec![];
+    let splits = state.dbs.split_defs();
     let mut sessions = state.gmail.lock().await;
     for (email, session) in sessions.iter_mut() {
         // force a full reconcile — every thread re-parsed, bodies healed
@@ -2324,10 +2398,12 @@ async fn resync_account(app: AppHandle, state: State<'_, AppState>) -> Result<()
             true,
             mail::sync::SyncPass::Resync,
             &on_progress,
+            &splits,
         )
         .await
         {
             eprintln!("[resync:{email}] {e}");
+            clear_sync_activity(&app, email);
             if is_grant_dead(&state.http, session, &e).await {
                 lost.push(email.clone());
             }
@@ -2507,9 +2583,12 @@ async fn refetch_message_body(
         .unwrap_or(false)
     };
     if has_empty && !is_mock_id(&thread_id) {
+        let splits = state.dbs.split_defs();
         let mut sessions = state.gmail.lock().await;
         if let Some(sess) = sessions.get_mut(&account) {
-            let _ = mail::sync::refetch_thread(&state.http, sess, &db, &account, &thread_id).await;
+            let _ =
+                mail::sync::refetch_thread(&state.http, sess, &db, &account, &thread_id, &splits)
+                    .await;
         }
     }
     let mut msgs = {
@@ -3062,6 +3141,7 @@ async fn search_all(
         local.iter().map(|r| r.thread_id.clone()).collect();
     let mut results = local;
     {
+        let splits = state.dbs.split_defs();
         let mut sessions = state.gmail.lock().await;
         if let Some(session) = sessions.get_mut(&active) {
             for id in remote_ids {
@@ -3071,8 +3151,15 @@ async fn search_all(
                 // fetch+index the thread if we don't have it, then fold it in
                 let have = { store::get_thread(&db.lock().unwrap(), &id).is_some() };
                 if !have {
-                    let _ = mail::sync::refetch_thread(&state.http, session, &db, &active, &id)
-                        .await;
+                    let _ = mail::sync::refetch_thread(
+                        &state.http,
+                        session,
+                        &db,
+                        &active,
+                        &id,
+                        &splits,
+                    )
+                    .await;
                 }
                 if let Some(r) = store::get_search_result(&db.lock().unwrap(), &id) {
                     seen.insert(id);
@@ -3095,6 +3182,9 @@ async fn load_older(
     state: State<'_, AppState>,
     view: String,
 ) -> Result<i64, String> {
+    if state.migrating.load(Ordering::SeqCst) {
+        return Ok(0); // quiesced during the split migration; scroll is a no-op
+    }
     let base = match view.as_str() {
         "done" => "-in:inbox -in:spam -in:trash -in:draft",
         "starred" => "is:starred",
@@ -3131,6 +3221,7 @@ async fn load_older(
     };
     let mut added = 0i64;
     {
+        let splits = state.dbs.split_defs();
         let mut sessions = state.gmail.lock().await;
         if let Some(session) = sessions.get_mut(&active) {
             // Paging older mail is a user-initiated download of a known size —
@@ -3140,7 +3231,7 @@ async fn load_older(
             for (i, id) in ids.iter().enumerate() {
                 let have = { store::get_thread(&db.lock().unwrap(), id).is_some() };
                 if !have
-                    && mail::sync::refetch_thread(&state.http, session, &db, &active, id)
+                    && mail::sync::refetch_thread(&state.http, session, &db, &active, id, &splits)
                         .await
                         .is_ok()
                 {
@@ -3213,6 +3304,10 @@ fn ensure_remote_capable(state: &State<'_, AppState>, thread_id: &str, account: 
 /// reconcile the affected thread so the optimistic local change is corrected
 /// rather than diverging. (BUG 2 #2 / BUG 3)
 fn spawn_remote(app: AppHandle, thread_id: String, op: RemoteTriage) {
+    // Every single-thread triage command (read/unread, archive, snooze, hide,
+    // restore, mute, star, label) funnels through here right after its local
+    // column write — repaint the taskbar badge now, not at the next sync tick.
+    badge::refresh(&app);
     if is_mock_id(&thread_id) {
         return;
     }
@@ -3255,9 +3350,12 @@ fn spawn_remote(app: AppHandle, thread_id: String, op: RemoteTriage) {
             eprintln!("[triage:{account}] remote update failed: {e}");
             let _ = app.emit("triage:error", format!("Couldn't sync to Gmail: {e}"));
             // reconcile the thread so local state matches the server
+            let splits = state.dbs.split_defs();
             let mut sessions = state.gmail.lock().await;
             if let Some(sess) = sessions.get_mut(&account) {
-                let _ = mail::sync::refetch_thread(&state.http, sess, &db, &account, &thread_id).await;
+                let _ =
+                    mail::sync::refetch_thread(&state.http, sess, &db, &account, &thread_id, &splits)
+                        .await;
             }
             drop(sessions);
             emit_mail_updated(&app);
@@ -3547,6 +3645,10 @@ fn spawn_reclassify(app: AppHandle, only_missing: bool) {
     tauri::async_runtime::spawn(async move {
         let state = app.state::<AppState>();
         let mut moved = 0usize;
+        // definitions come from global.db — the account files being walked
+        // below never hold a settings row (that was the v0.23 blocker where
+        // custom splits classified nothing on desktop)
+        let splits = state.dbs.split_defs();
         // one pass per account file — the rowid walk is per-db now
         for email in state.dbs.registered_emails() {
             let Ok(db) = state.account_db(&email) else { continue };
@@ -3554,7 +3656,7 @@ fn spawn_reclassify(app: AppHandle, only_missing: bool) {
             loop {
                 let step = {
                     let conn = db.lock().unwrap();
-                    store::reclassify_page(&conn, after, 500, only_missing)
+                    store::reclassify_page(&conn, after, 500, only_missing, &splits)
                 };
                 match step {
                     Ok((updated, last, done)) => {
@@ -3638,6 +3740,8 @@ async fn deliver_mail(app: &AppHandle, account_email: &str, mail: &OutgoingMail)
     }
 
     // mock mode: append locally so the flow is fully demoable
+    // (split defs read before taking the account lock — never hold two db mutexes)
+    let splits = state.dbs.split_defs();
     let conn = db.lock().unwrap();
     let now = now_ms();
     let (tid, subject) = match &mail.thread_id {
@@ -3685,7 +3789,13 @@ async fn deliver_mail(app: &AppHandle, account_email: &str, mail: &OutgoingMail)
             also_in: vec![],
         },
     };
-    store::upsert_thread(&conn, account_email, &thread, &[(msg, None, None, None, vec![])])?;
+    store::upsert_thread(
+        &conn,
+        account_email,
+        &thread,
+        &[(msg, None, None, None, vec![])],
+        &splits,
+    )?;
     Ok(())
 }
 
@@ -4145,16 +4255,25 @@ pub fn run() {
                         }
                     }
                     // Pre-split installs kept every account's mail in one file.
+                    let mut swept = true;
                     if let Some(legacy) = dbs.legacy() {
                         let conn = legacy.lock().unwrap();
                         match store::demo_purge::sweep_demo_rows(&conn) {
                             Ok(n) if n > 0 => eprintln!("[demo-purge] legacy db: {n} threads"),
-                            Err(e) => eprintln!("[demo-purge] legacy db: {e}"),
+                            Err(e) => {
+                                // A transient failure (briefly locked db) must
+                                // not permanently forfeit the sweep — leave the
+                                // flag unset so the next boot retries.
+                                swept = false;
+                                eprintln!("[demo-purge] legacy db: {e} — retrying next boot");
+                            }
                             _ => {}
                         }
                     }
-                    let conn = gdb.lock().unwrap();
-                    let _ = store::demo_purge::mark_purged(&conn);
+                    if swept {
+                        let conn = gdb.lock().unwrap();
+                        let _ = store::demo_purge::mark_purged(&conn);
+                    }
                 }
             }
 
@@ -4478,10 +4597,22 @@ pub fn run() {
                     match res {
                         Ok(Ok(true)) => eprintln!("[migrate] legacy db split complete"),
                         Ok(Ok(false)) => eprintln!("[migrate] incomplete — resumes next boot"),
-                        Ok(Err(e)) => eprintln!("[migrate] {e} — will retry next boot"),
+                        // A failed run used to clear the strip and say nothing —
+                        // completely invisible unless stderr was open.
+                        Ok(Err(e)) => {
+                            eprintln!("[migrate] {e} — will retry next boot");
+                            let _ = boot.emit(
+                                "app:notice",
+                                "Reorganizing mail storage hit a snag — it will retry on the \
+                                 next launch. Your mail is intact."
+                                    .to_string(),
+                            );
+                        }
                         Err(e) => eprintln!("[migrate] task: {e}"),
                     }
                     state.migrating.store(false, Ordering::SeqCst);
+                    // Terminal tick always fires — the strip clears rather than
+                    // freezing at the last count; failures surfaced above.
                     let _ = boot.emit(
                         "migration:progress",
                         store::migrate::MigrateProgress {
@@ -4514,6 +4645,7 @@ pub fn run() {
                 let mut changed = false;
                 let mut lost: Vec<String> = vec![];
                 {
+                    let splits = state.dbs.split_defs();
                     let mut sessions = state.gmail.lock().await;
                     for (email, session) in sessions.iter_mut() {
                         let Ok(db) = state.account_db(email) else { continue };
@@ -4525,6 +4657,7 @@ pub fn run() {
                             true,
                             mail::sync::SyncPass::Normal,
                             &on_progress,
+                            &splits,
                         )
                         .await
                         {
@@ -4533,6 +4666,7 @@ pub fn run() {
                             // grant was invisible until the first 30s tick.
                             Err(e) => {
                                 eprintln!("[boot-sync:{email}] {e}");
+                                clear_sync_activity(&boot, email);
                                 if is_grant_dead(&state.http, session, &e).await {
                                     lost.push(email.clone());
                                 }
@@ -4602,6 +4736,7 @@ pub fn run() {
                         // The plain incremental tick now reports too: it's the
                         // common case, and it was completely silent before.
                         let on_progress = progress_callback(handle.clone());
+                        let splits = state.dbs.split_defs();
                         for (email, session) in sessions.iter_mut() {
                             let Ok(db) = state.account_db(email) else { continue };
                             match mail::sync::full_sync(
@@ -4612,6 +4747,7 @@ pub fn run() {
                                 force,
                                 mail::sync::SyncPass::Normal,
                                 &on_progress,
+                                &splits,
                             )
                             .await
                             {
@@ -4621,6 +4757,7 @@ pub fn run() {
                                 // no log line and no UI signal.
                                 Err(e) => {
                                     eprintln!("[sync:{email}] {e}");
+                                    clear_sync_activity(&handle, email);
                                     if is_grant_dead(&state.http, session, &e).await {
                                         lost.push(email.clone());
                                     }

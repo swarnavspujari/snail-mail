@@ -20,12 +20,22 @@ jobs:
           workspaces: src-tauri
       - run: npm ci
       - run: npx tsc --noEmit
+      - run: npm test
       - run: npm run build
+      - name: desktop bundle must exclude the demo mock
+        shell: bash
+        run: |
+          npm run build:desktop
+          if grep -rl "foundryaccel" dist/assets; then
+            echo "demo fixture strings leaked into the desktop bundle" >&2
+            exit 1
+          fi
       - name: cargo check
         working-directory: src-tauri
         run: cargo check --locked
 
-  # keeps the Fedora/Linux port honest — full smoke run comes with v0.3
+  # keeps the Fedora/Linux port honest — and runs the Rust test suite (with
+  # the demo fixtures compiled) on the fastest runner, since no other job does
   linux:
     runs-on: ubuntu-latest
     steps:
@@ -38,14 +48,14 @@ jobs:
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
-      - name: cargo check
+      - name: cargo test
         working-directory: src-tauri
-        run: cargo check --locked
+        run: cargo test --locked --features demo-fixtures
 
   # Same job for macOS: WebKit and Security.framework ship with the OS, so
-  # unlike Linux there are no deps to install. This is the only place the
-  # macOS-gated code compiles at all — today that means badge.rs's dock-tile
-  # path, which no Windows or Linux build ever sees.
+  # unlike Linux there are no deps to install. This is the only CI leg that
+  # compiles the macOS cfg arms (badge.rs's set_badge_count path, purge.rs's
+  # macOS app roots) — check-only to keep the expensive runner cheap.
   macos:
     runs-on: macos-latest
     steps:

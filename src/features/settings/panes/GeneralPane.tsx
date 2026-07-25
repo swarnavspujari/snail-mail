@@ -29,6 +29,7 @@ export function GeneralPane() {
 
       <RowGroup title="Notifications">
         <Pref id="notifications" />
+        <Pref id="showBadge" />
       </RowGroup>
 
       <RowGroup title="Onboarding">

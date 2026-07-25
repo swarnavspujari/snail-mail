@@ -552,6 +552,9 @@ fn seed_filtered(conn: &Connection, only: Option<&str>) -> Result<(), String> {
         },
     ];
 
+    // demo-only path: at seed time the conn's settings (or the defaults) are
+    // the right defs — the desktop registry path never runs this
+    let splits = store::split_config(conn);
     for s in seeds {
         if only.is_some_and(|o| o != s.account) {
             continue;
@@ -643,7 +646,7 @@ fn seed_filtered(conn: &Connection, only: Option<&str>) -> Result<(), String> {
             split: String::new(), // materialized by upsert_thread
             also_in: vec![],
         };
-        store::upsert_thread(conn, s.account, &thread, &msgs)?;
+        store::upsert_thread(conn, s.account, &thread, &msgs, &splits)?;
     }
     Ok(())
 }

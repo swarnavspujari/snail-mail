@@ -253,6 +253,11 @@ pub fn migrate_account(
         drop(legacy_conn);
     }
     reg.mark_migrated(email)?;
+    // Bookkeeping cleanup only AFTER the migrated flag is durable — see the
+    // note in flip_small_tables. Best-effort: a leftover cursor key is inert.
+    for spec in &BULK {
+        let _ = target.execute("DELETE FROM kv WHERE key = ?1", params![cursor_key(spec.name)]);
+    }
     Ok(true)
 }
 
@@ -316,11 +321,13 @@ fn flip_small_tables(target: &Connection, email: &str) -> Result<(), String> {
         [],
     )
     .map_err(|e| e.to_string())?;
-    // migration bookkeeping is not application state — clean it out
-    for spec in &BULK {
-        tx.execute("DELETE FROM main.kv WHERE key = ?1", params![cursor_key(spec.name)])
-            .map_err(|e| e.to_string())?;
-    }
+    // NOTE: the migrate_cursor:* keys are deliberately NOT deleted here. A
+    // kill between this commit and mark_migrated resumes migrate_account from
+    // the top; with the cursors intact every bulk loop sees no new rowids and
+    // falls through, and this flip re-runs idempotently (all 7 flip tables
+    // have PKs). Deleting the cursors inside this tx re-ran the bulk copy
+    // from rowid 0 on resume — mail_fts/mail_vec reject duplicate rowids, so
+    // the migration wedged permanently. Cleanup happens after mark_migrated.
     tx.commit().map_err(|e| e.to_string())
 }
 
@@ -530,7 +537,14 @@ mod tests {
                 unread: false,
                 attachments: vec![],
             };
-            crate::store::upsert_thread(conn, acct, &t, &[(m, None, None, None, vec![])]).unwrap();
+            crate::store::upsert_thread(
+                conn,
+                acct,
+                &t,
+                &[(m, None, None, None, vec![])],
+                &crate::store::split_config(conn),
+            )
+            .unwrap();
             conn.execute(
                 "INSERT INTO attachments(id, message_id, filename, mime_type, size_bytes)
                  VALUES (?1, ?2, 'f.pdf', 'application/pdf', 10)",
@@ -711,6 +725,68 @@ mod tests {
                 c.query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0)).unwrap();
             assert_eq!(n, expect, "{t} after resume");
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The other kill window: after the flip transaction commits but before
+    /// `migrated:<email>` lands in global.db. On-disk that state is: all rows
+    /// copied + flipped, migrate_cursor:* keys still present (cleanup runs
+    /// after the mark), flag absent. Resume must complete cleanly — with the
+    /// old in-tx cursor deletion it re-copied from rowid 0 and wedged on
+    /// mail_fts/mail_vec duplicate rowids forever.
+    #[test]
+    fn kill_between_flip_and_mark_migrated_resumes_clean() {
+        let dir = tmp_dir("flipwindow");
+        build_legacy(&dir, &["u@x.test"], 11);
+        let email = "u@x.test";
+        {
+            let reg = DbRegistry::open(&dir).unwrap();
+            assert!(migrate_account(&reg, email, &MigrateOpts::default(), &mut |_| {}).unwrap());
+            // reconstruct the kill-window state: the flag write never landed…
+            let g = reg.global();
+            g.lock()
+                .unwrap()
+                .execute("DELETE FROM kv WHERE key = ?1", params![format!("migrated:{email}")])
+                .unwrap();
+            // …and neither did the post-mark cursor cleanup: restore each
+            // cursor to its end-of-copy position (max copied rowid).
+            let t = crate::store::open(&reg.account_db_path(email)).unwrap();
+            for spec in &BULK {
+                let (table, col) = match spec.name {
+                    "vec" => ("vec_meta", "vec_rowid"),
+                    other => (other, "rowid"),
+                };
+                let hi: i64 = t
+                    .query_row(&format!("SELECT COALESCE(MAX({col}), 0) FROM {table}"), [], |r| {
+                        r.get(0)
+                    })
+                    .unwrap();
+                crate::store::set_json(&t, &cursor_key(spec.name), &hi).unwrap();
+            }
+        }
+        // next boot: resume must finish the bookkeeping, not wedge
+        let reg = DbRegistry::open(&dir).unwrap();
+        assert!(reg.legacy().is_some(), "legacy still routes until the flag lands");
+        assert!(!reg.is_migrated(email));
+        assert!(
+            migrate_account(&reg, email, &MigrateOpts::default(), &mut |_| {}).unwrap(),
+            "resume from the flip window must complete"
+        );
+        assert!(reg.is_migrated(email));
+        let conn = reg.account(email).unwrap();
+        let c = conn.lock().unwrap();
+        for (t, expect) in [
+            ("threads", 11i64),
+            ("messages", 11),
+            ("attachments", 11),
+            ("mail_fts", 11),
+            ("mail_vec", 11),
+        ] {
+            let n: i64 =
+                c.query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0)).unwrap();
+            assert_eq!(n, expect, "{t} must not duplicate on flip-window resume");
+        }
+        drop(c);
         std::fs::remove_dir_all(&dir).ok();
     }
 

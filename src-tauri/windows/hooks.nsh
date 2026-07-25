@@ -79,6 +79,20 @@
   Delete "$INSTDIR\dev-secrets.exe"
 
   ${If} $UpdateMode <> 1
+    ; SECOND guard — upgrade-driven uninstalls. $UpdateMode only covers the
+    ; auto-updater (which, per PageLeaveReinstall, never runs this uninstaller
+    ; at all). A MANUAL installer-over-installer upgrade is different: the
+    ; installer's reinstall page defaults to "Uninstall before installing" and
+    ; ExecWaits this uninstaller WITHOUT /UPDATE — but every one of those
+    ; invocations appends `_?=<instdir>` (see reinst_uninstall in the
+    ; template), which a terminal uninstall from Add/Remove Programs never
+    ; carries. Without this check a routine manual upgrade would revoke and
+    ; delete every Google token mid-upgrade.
+    ClearErrors
+    ${GetOptions} $CMDLINE "_?=" $R9
+    ${IfNot} ${Errors}
+      Goto snail_skip_data_purge
+    ${EndIf}
     SetShellVarContext current
 
     ; 1. Windows Credential Manager + the legacy identifier trees. Revokes each
@@ -109,5 +123,7 @@
     DeleteRegKey HKCU "Software\zenbox"
     DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Fission Mail"
     DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ZenBox Mail"
+
+    snail_skip_data_purge:
   ${EndIf}
 !macroend

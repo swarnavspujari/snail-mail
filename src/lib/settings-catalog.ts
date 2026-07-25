@@ -139,6 +139,16 @@ export const PREF_ROWS: PrefRow[] = [
     keywords: "notify desktop toast",
   },
   {
+    id: "showBadge",
+    label: "Unread badge on the app icon",
+    help: "Unread conversations in Important, on the taskbar (Windows), dock (macOS) or launcher (Linux). Desktop only.",
+    pane: "general",
+    section: "Notifications",
+    control: "switch",
+    key: "showBadge",
+    keywords: "badge taskbar dock launcher unread count icon overlay",
+  },
+  {
     id: "tour",
     label: "Welcome tour",
     help: "Connect, AI, theme, shortcuts — four steps, two minutes.",
