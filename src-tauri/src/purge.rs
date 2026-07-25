@@ -740,7 +740,13 @@ mod tests {
         assert!(!data.exists(), "emptied data root should go too");
         assert!(!cache.join("attachments").exists());
         assert!(!cache.join("EBWebView").exists());
-        assert!(report.paths.iter().any(|p| p.ends_with("global.db-wal")), "{:?}", report.paths);
+        // The sidecar is gone — but do NOT assert it appears in the report.
+        // known_emails opens each db (open_ro falls back to read-write), and
+        // on close SQLite checkpoints and unlinks a stray -wal itself, so on
+        // Linux the purge finds it already absent and stays silent. That the
+        // sidecars are *enumerated* is pinned by data_targets_cover_every_db_
+        // sidecar; what matters here is the end state.
+        assert!(!data.join("global.db-wal").exists());
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         std::fs::remove_dir_all(&root).ok();
     }
