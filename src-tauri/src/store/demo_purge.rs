@@ -376,6 +376,41 @@ mod tests {
         assert_eq!(count(fixtures), 0, "every fixture thread must be gone");
     }
 
+    /// Read-only dump of a real global.db, for confirming what a booted app
+    /// actually sees. Mutates nothing.
+    ///
+    ///   SNAIL_INSPECT_DB=/path/to/global.db \
+    ///     cargo test inspect_real_db -- --ignored --nocapture
+    #[test]
+    #[ignore = "needs SNAIL_INSPECT_DB"]
+    fn inspect_real_db() {
+        let path = std::env::var("SNAIL_INSPECT_DB").expect("set SNAIL_INSPECT_DB");
+        let conn = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let mut stmt = conn.prepare("SELECT key, substr(value,1,300) FROM kv ORDER BY key").unwrap();
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .unwrap();
+        for r in rows {
+            let (k, v) = r.unwrap();
+            println!("KV {k} = {v}");
+        }
+        let onboarded: Option<String> = conn
+            .query_row(
+                "SELECT json_extract(value,'$.onboarded') FROM kv WHERE key='settings'",
+                [],
+                |r| r.get(0),
+            )
+            .ok();
+        let accounts: Option<String> = conn
+            .query_row("SELECT value FROM kv WHERE key='accounts'", [], |r| r.get(0))
+            .ok();
+        println!("GATE onboarded={onboarded:?} accounts={accounts:?}");
+    }
+
     #[test]
     fn sweeps_the_rsvp_overlay() {
         let conn = global_db();

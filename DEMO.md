@@ -12,7 +12,20 @@ npm install
 npm run app:dev
 ```
 
-✅ *DoD: builds and launches on Windows 11.* The app opens dark, in **demo mode** with two seeded accounts — steps 1–8 need no credentials.
+✅ *DoD: builds and launches on Windows 11.* The app opens dark, on the connect
+screen — desktop builds ship no demo data.
+
+> **Credential-free steps.** Steps 0.5–8 below were written against the demo
+> accounts the desktop app used to seed. Those are gone from desktop builds. Run
+> those steps in the browser demo instead — `npm run dev` →
+> http://localhost:1420, which serves the same UI against the same fixtures:
+>
+> ```powershell
+> npm run dev
+> ```
+>
+> Steps that need a real mailbox (sync, OAuth, Drive, live calendar) still
+> require `npm run app:dev` and a connected Gmail account.
 
 ## 0.5 The v0.3 triage loop (90s, no credentials)
 
