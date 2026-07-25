@@ -3,9 +3,14 @@
 //! FISSION_SECRET_VALUE still accepted) — never from argv, never printed — so
 //! secrets stay out of shell history and logs.
 //!
-//!   SNAIL_SECRET_VALUE=... cargo run --bin dev-secrets -- set ai:nim
-//!   cargo run --bin dev-secrets -- check ai:nim
-//!   cargo run --bin dev-secrets -- delete ai:nim
+//! Gated behind the `dev-secrets` cargo feature so a release build never
+//! produces the exe — Cargo auto-discovery plus tauri-cli's external-binary
+//! bundling used to ship this keychain writer inside the installed app dir.
+//! See the `[[bin]]` block in Cargo.toml.
+//!
+//!   SNAIL_SECRET_VALUE=... cargo run --features dev-secrets --bin dev-secrets -- set ai:nim
+//!   cargo run --features dev-secrets --bin dev-secrets -- check ai:nim
+//!   cargo run --features dev-secrets --bin dev-secrets -- delete ai:nim
 
 const SERVICE: &str = "SnailMail";
 

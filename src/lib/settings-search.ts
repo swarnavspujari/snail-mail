@@ -168,6 +168,17 @@ function bespokeEntries(settings: Settings): SearchEntry[] {
     },
     {
       kind: "Settings",
+      label: "Erase all local data",
+      path: at("privacy", "On this machine"),
+      pane: "privacy",
+      glyph: "▸",
+      // "uninstall" and "credential manager" are how someone actually looks for
+      // this: they are handing the laptop back, not browsing preferences.
+      keywords:
+        "erase delete wipe reset everything uninstall remove credential manager keychain token password revoke factory",
+    },
+    {
+      kind: "Settings",
       label: "Your streak",
       path: at("zero", "Your streak"),
       pane: "zero",

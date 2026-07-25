@@ -11,6 +11,26 @@ default-run = "snail-mail"
 name = "snail_mail_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[[bin]]
+name = "snail-mail"
+path = "src/main.rs"
+
+# dev-secrets is a keychain-WRITING developer utility. Cargo auto-discovers
+# anything in src/bin/, and tauri-cli bundles every discovered bin as an
+# "external binary" — which is how dev-secrets.exe ended up shipping inside the
+# installed app directory next to the real app (verified in the generated
+# installer.nsi: `File /a "/oname=dev-secrets.exe" …`).
+#
+# Declaring it explicitly with required-features takes it out of every default
+# build, so `cargo build --release` (what `tauri build` runs) never produces the
+# exe and the bundler has nothing to pick up. To use it locally:
+#
+#     SNAIL_SECRET_VALUE=... cargo run --features dev-secrets --bin dev-secrets -- set ai:nim
+[[bin]]
+name = "dev-secrets"
+path = "src/bin/dev-secrets.rs"
+required-features = ["dev-secrets"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -51,6 +71,10 @@ harper-core = { version = "2.5.0", features = ["concurrent"] }
 #     cargo test --features demo-fixtures
 [features]
 demo-fixtures = []
+
+# Opt-in gate for the dev-secrets bin target above. Default OFF so the utility
+# is never built, and therefore never bundled, by a release build.
+dev-secrets = []
 
 [profile.release]
 strip = true
