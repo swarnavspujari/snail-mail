@@ -41,3 +41,19 @@ jobs:
       - name: cargo check
         working-directory: src-tauri
         run: cargo check --locked
+
+  # Same job for macOS: WebKit and Security.framework ship with the OS, so
+  # unlike Linux there are no deps to install. This is the only place the
+  # macOS-gated code compiles at all — today that means badge.rs's dock-tile
+  # path, which no Windows or Linux build ever sees.
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - name: cargo check
+        working-directory: src-tauri
+        run: cargo check --locked
