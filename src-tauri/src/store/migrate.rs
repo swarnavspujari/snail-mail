@@ -239,8 +239,13 @@ pub fn migrate_account(
         }
     }
 
+    // The FTS and vector scans are the expensive half of verification and
+    // their sources are stable here (bulk cursors done, sync quiesced), so
+    // they run BEFORE the flip guard — holding the app's legacy lock across
+    // them showed up as a multi-second UI stall in the perf test.
+    verify_bulk_indexes(&target, email)?;
     // Flip: hold the app's legacy connection lock so no user write can land
-    // between the final copy, the verification, and the routing flip.
+    // between the final copy, the remaining verification, and the routing flip.
     {
         let legacy_conn = legacy_arc.lock().unwrap();
         flip_small_tables(&target, email)?;
@@ -249,6 +254,35 @@ pub fn migrate_account(
     }
     reg.mark_migrated(email)?;
     Ok(true)
+}
+
+/// The pre-guard half of verification: mail_fts and mail_vec row parity
+/// (full scans of the two biggest indexes). Runs BEFORE the flip, so the
+/// main side can't join main.threads yet — but the target file only ever
+/// receives this one account's rows, so plain counts are exact.
+fn verify_bulk_indexes(target: &Connection, email: &str) -> Result<(), String> {
+    let plain = |sql: &str| -> Result<i64, String> {
+        target.query_row(sql, [], |r| r.get(0)).map_err(|e| e.to_string())
+    };
+    let fts_spec = BULK.iter().find(|s| s.name == "mail_fts").expect("fts spec");
+    let l = count_scoped(target, fts_spec.count, "legacy.", email)?;
+    let m = plain("SELECT COUNT(*) FROM main.mail_fts")?;
+    if l != m {
+        return Err(format!("verify mail_fts: legacy {l} rows vs migrated {m}"));
+    }
+    let l: i64 = target
+        .query_row(
+            "SELECT COUNT(*) FROM legacy.mail_vec v
+             JOIN legacy.vec_meta vm ON vm.vec_rowid = v.rowid WHERE vm.account_id = ?1",
+            params![email],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    let m = plain("SELECT COUNT(*) FROM main.mail_vec")?;
+    if l != m {
+        return Err(format!("verify mail_vec: legacy {l} vs migrated {m}"));
+    }
+    Ok(())
 }
 
 fn flip_small_tables(target: &Connection, email: &str) -> Result<(), String> {
@@ -290,30 +324,19 @@ fn flip_small_tables(target: &Connection, email: &str) -> Result<(), String> {
     tx.commit().map_err(|e| e.to_string())
 }
 
+/// The under-guard half of verification: cheap row counts (messages,
+/// attachments, vec_meta, every flip table) + spot checks. mail_fts/mail_vec
+/// parity ran pre-guard in verify_bulk_indexes.
 fn verify_account(target: &Connection, email: &str) -> Result<(), String> {
-    // row counts, every copied table
     for spec in &BULK {
+        if spec.name == "mail_fts" {
+            continue; // verified pre-guard
+        }
         let l = count_scoped(target, spec.count, "legacy.", email)?;
         let m = count_scoped(target, spec.count, "main.", email)?;
         if l != m {
             return Err(format!("verify {}: legacy {l} rows vs migrated {m}", spec.name));
         }
-    }
-    let mail_vec: [i64; 2] = ["legacy.", "main."]
-        .map(|db| {
-            target
-                .query_row(
-                    &format!(
-                        "SELECT COUNT(*) FROM {db}mail_vec v
-                         JOIN {db}vec_meta vm ON vm.vec_rowid = v.rowid WHERE vm.account_id = ?1"
-                    ),
-                    params![email],
-                    |r| r.get(0),
-                )
-                .unwrap_or(-1)
-        });
-    if mail_vec[0] != mail_vec[1] {
-        return Err(format!("verify mail_vec: legacy {} vs migrated {}", mail_vec[0], mail_vec[1]));
     }
     for t in FLIP_TABLES {
         let q = |db: &str| -> Result<i64, String> {
@@ -559,6 +582,9 @@ mod tests {
 
     fn build_legacy(dir: &std::path::Path, accounts: &[&str], threads_each: usize) {
         let legacy = crate::store::open(&dir.join("fission.db")).unwrap();
+        // one transaction for the whole seed — per-row autocommit means six
+        // fsyncs per thread, which makes the perf variant take minutes
+        legacy.execute_batch("BEGIN").unwrap();
         let state = AccountsState {
             accounts: accounts
                 .iter()
@@ -576,6 +602,7 @@ mod tests {
         for a in accounts {
             seed_mail(&legacy, a, threads_each);
         }
+        legacy.execute_batch("COMMIT").unwrap();
     }
 
     fn table_count(conn: &Connection, sql: &str, acct: &str) -> i64 {
