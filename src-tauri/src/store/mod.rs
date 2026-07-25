@@ -440,6 +440,7 @@ pub fn default_settings() -> Settings {
         // Accelerate a pending send (skip the Undo Send window).
         ("send.accelerate", "mod+shift+z"),
         ("theme.toggle", ""),
+        ("badge.toggle", ""),
         // Superhuman calendar keys: 0 = day panel, 2 = week view; -/= move
         // days while the calendar owns focus (←/→ still work).
         ("calendar.toggle", "0"),
@@ -535,6 +536,7 @@ pub fn default_settings() -> Settings {
         signatures: HashMap::new(),
         theme: "dark".into(),
         notifications: true,
+        show_badge: true,
         onboarded: false,
         calendar_open: false,
         hidden_calendars: Vec::new(),
@@ -858,6 +860,27 @@ pub fn split_counts(conn: &Connection, account_id: &str) -> Result<HashMap<Strin
          GROUP BY j.value",
     )?;
     Ok(out)
+}
+
+/// Unread conversations sitting in one split, for the taskbar badge.
+///
+/// Membership matches `split_counts` — the home split OR an alsoShow forward —
+/// so the badge and the split's own tab count can never disagree about which
+/// conversations are "in" Important. `EXISTS` rather than a second tally keeps
+/// a thread that is both from being counted twice. Snoozed threads are out for
+/// the same reason they're out of the tab: they aren't in the inbox today.
+/// Rides idx_threads_account_split.
+pub fn count_unread_in_split(conn: &Connection, account_id: &str, split_id: &str) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM threads
+         WHERE account_id = ?1 AND unread = 1 AND in_inbox = 1
+           AND hidden IS NULL AND snoozed_until IS NULL
+           AND (split_id = ?2
+                OR EXISTS (SELECT 1 FROM json_each(threads.split_also) WHERE value = ?2))",
+        params![account_id, split_id],
+        |r| r.get(0),
+    )
+    .unwrap_or(0)
 }
 
 pub fn get_thread(conn: &Connection, id: &str) -> Option<Thread> {
@@ -2528,6 +2551,90 @@ mod tests {
             }
         }
         assert_eq!(list_threads(&conn, "inbox", ACCT).unwrap()[0].split, "travel");
+    }
+
+    /// The taskbar badge's number. Every excluded case here is mail the owner
+    /// cannot see in the Important tab — a badge that counts any of them sends
+    /// you to an inbox with nothing new in it.
+    #[test]
+    fn badge_counts_only_visible_unread_in_the_split() {
+        let conn = open(std::path::Path::new(":memory:")).unwrap();
+        let seed_thread = |id: &str, unread: bool, labels: &[&str], in_inbox: bool, snoozed: Option<i64>| {
+            let t = Thread {
+                id: id.into(),
+                subject: "Subject".into(),
+                snippet: String::new(),
+                participants: vec!["Ann <ann@x.test>".into()],
+                recipients: vec![],
+                message_count: 1,
+                last_date: 1_000,
+                unread,
+                starred: false,
+                labels: labels.iter().map(|s| s.to_string()).collect(),
+                in_inbox,
+                snoozed_until: snoozed,
+                split: String::new(),
+                also_in: vec![],
+            };
+            upsert_thread(&conn, ACCT, &t, &[]).unwrap();
+        };
+        let badge = || count_unread_in_split(&conn, ACCT, "important");
+
+        seed_thread("t-hit", true, &["IMPORTANT"], true, None);
+        assert_eq!(badge(), 1);
+
+        // Read mail, mail the classifier filed under Other, snoozed mail and
+        // archived mail are all invisible in the Important tab today.
+        seed_thread("t-read", false, &["IMPORTANT"], true, None);
+        seed_thread("t-other", true, &[], true, None);
+        seed_thread("t-snoozed", true, &["IMPORTANT"], true, Some(9_999));
+        seed_thread("t-archived", true, &["IMPORTANT"], false, None);
+        assert_eq!(badge(), 1, "only the one visible unread thread counts");
+
+        // Trash and spam are hidden rather than deleted.
+        seed_thread("t-trashed", true, &["IMPORTANT"], true, None);
+        conn.execute("UPDATE threads SET hidden = 'trash' WHERE id = 't-trashed'", []).unwrap();
+        assert_eq!(badge(), 1);
+
+        // A second unread thread moves the number.
+        seed_thread("t-hit2", true, &["IMPORTANT"], true, None);
+        assert_eq!(badge(), 2);
+    }
+
+    /// An alsoShow thread appears in Important without living there, so the
+    /// badge has to count it — once — or it disagrees with the tab beside it.
+    #[test]
+    fn badge_counts_also_show_forwards_exactly_once() {
+        let conn = open(std::path::Path::new(":memory:")).unwrap();
+        let mut s = default_settings();
+        let mut sp = travel_split();
+        sp.also_show = true;
+        s.splits.insert(0, sp);
+        set_json(&conn, "settings", &s).unwrap();
+
+        let t = Thread {
+            id: "t-deal".into(),
+            subject: "Flash sale".into(),
+            snippet: String::new(),
+            participants: vec!["Thrifty Traveler <deals@thriftytraveler.com>".into()],
+            recipients: vec![],
+            message_count: 1,
+            last_date: 2_000,
+            unread: true,
+            starred: false,
+            labels: vec!["IMPORTANT".into()],
+            in_inbox: true,
+            snoozed_until: None,
+            split: String::new(),
+            also_in: vec![],
+        };
+        upsert_thread(&conn, ACCT, &t, &[]).unwrap();
+
+        let rows = list_threads(&conn, "inbox", ACCT).unwrap();
+        assert_eq!(rows[0].split, "travel");
+        assert_eq!(rows[0].also_in, vec!["important".to_string()]);
+        assert_eq!(count_unread_in_split(&conn, ACCT, "important"), 1);
+        assert_eq!(count_unread_in_split(&conn, ACCT, "travel"), 1);
     }
 
     #[test]

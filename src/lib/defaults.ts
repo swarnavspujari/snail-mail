@@ -99,6 +99,7 @@ export const DEFAULT_SHORTCUTS: Record<string, string> = {
   // Accelerate a pending send (skip the Undo Send window, send instantly).
   "send.accelerate": "mod+shift+z",
   "theme.toggle": "",
+  "badge.toggle": "",
   // Superhuman calendar keys: 0 opens the day view, 2 the week; -/= move
   // days while the calendar owns focus (our ←/→ still work).
   "calendar.toggle": "0",
@@ -166,6 +167,7 @@ export function defaultSettings(): Settings {
     signatures: {},
     theme: "dark",
     notifications: true,
+    showBadge: true,
     onboarded: false,
     calendarOpen: false,
     hiddenCalendars: [],
