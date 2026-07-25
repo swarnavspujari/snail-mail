@@ -113,15 +113,6 @@
   --palette-text-dim: oklch(0.80 0.012 210);
   --palette-text-faint: oklch(0.63 0.016 210);
 
-  /* Signature wash: a green whisper at the very bottom edge blending up into
-     cerulean, then fading out — present, never loud. */
-  --wash-bottom: linear-gradient(
-    to top,
-    oklch(0.82 0.14 158 / 0.05),
-    oklch(0.802 0.122 222 / 0.10) 34%,
-    transparent 62%
-  );
-
   color-scheme: dark;
 }
 
@@ -195,14 +186,6 @@ html[data-theme="light"] {
   --cal-teal: oklch(0.48 0.09 200);
   --cal-gray: oklch(0.55 0.02 210);
 
-  /* Cool, airy wash — cerulean with a faint green hint at the bottom edge. */
-  --wash-bottom: linear-gradient(
-    to top,
-    oklch(0.50 0.13 158 / 0.05),
-    oklch(0.522 0.142 222 / 0.06) 40%,
-    transparent 130px
-  );
-
   color-scheme: light;
 }
 
@@ -213,6 +196,41 @@ html[data-theme="light"] *::-webkit-scrollbar-thumb {
   background: rgba(20, 26, 40, 0.22);
   background-clip: content-box;
   border: 2px solid transparent;
+}
+
+/* Welcome card — the first-run card floats over a photograph and stays LIGHT
+   in BOTH themes (Superhuman's move). Onboarding runs before anyone has
+   chosen a theme, and a dark card on this photo reads as a hole punched in
+   it. Re-points the tokens locally rather than hand-picking hex, so every
+   utility inside the card resolves to the light theme's real values and the
+   card can never drift from the design system. */
+.welcome-card {
+  --bg-base: oklch(0.975 0.004 210);
+  --bg-surface: oklch(0.962 0.006 210);
+  --bg-raised: oklch(1 0 0);
+  --bg-overlay: oklch(1 0 0);
+  --bg-hover: oklch(0.945 0.008 210);
+  --bg-selected: oklch(0.912 0.046 224);
+
+  --text-primary: oklch(0.30 0.026 222);
+  --text-secondary: oklch(0.445 0.03 222);
+  --text-muted: oklch(0.515 0.028 222);
+
+  --accent: oklch(0.522 0.142 222);
+  --accent-strong: oklch(0.458 0.148 222);
+  --accent-dim: oklch(0.522 0.142 222 / 0.12);
+  --on-accent: oklch(0.99 0.005 222);
+
+  --success: oklch(0.50 0.13 158);
+  --warning: oklch(0.56 0.115 76);
+  --danger: oklch(0.52 0.19 27);
+
+  --border: oklch(0.30 0.03 222 / 0.12);
+  --border-strong: oklch(0.30 0.03 222 / 0.20);
+
+  --focus-ring: 0 0 0 2px oklch(0.522 0.142 222 / 0.6);
+
+  color-scheme: light;
 }
 
 /* `inline` so utilities reference the raw vars directly (bg-base →

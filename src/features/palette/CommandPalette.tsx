@@ -22,6 +22,10 @@ export function CommandPalette() {
   const [index, setIndex] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
   const shortcuts = useSettings((s) => s.settings.shortcuts);
+  // The per-command chord chip teaches that command's key, so it answers to
+  // showKeyHints like every other hint. The palette's OWN driving keys are a
+  // different thing and would stay — it has none rendered today.
+  const keyHints = useSettings((s) => s.settings.showKeyHints);
 
   useEffect(() => {
     inputRef.current?.focus();
@@ -116,7 +120,7 @@ export function CommandPalette() {
                   }`}
                 >
                   <span className="flex-1">{c.title}</span>
-                  {shortcuts[c.id] && (
+                  {keyHints && shortcuts[c.id] && (
                     <span className="rounded px-1.5 text-[11px] leading-4 text-[var(--palette-text-dim)] [background:rgba(255,255,255,0.08)]">
                       {formatKeyExpr(shortcuts[c.id])}
                     </span>

@@ -127,8 +127,16 @@ export interface Settings {
   hiddenCalendars: string[];
   /** Folder/label sidebar visible. */
   sidebarOpen: boolean;
-  /** Bottom shortcut-hint footer visible (default true). */
+  /** Bottom shortcut-hint footer visible (default true). Governs THAT STRIP
+   *  ONLY — every other visual key hint answers to showKeyHints. */
   showShortcutBar: boolean;
+  /** Visual keycap hints everywhere else (default true): hover-hint keycaps,
+   *  the inline key strips over the thread/calendar/pickers, the sidebar chord
+   *  chips. Off leaves plain tooltips and plain labels — shortcuts still work,
+   *  and title=/aria-label are untouched. Surfaces that are ABOUT shortcuts
+   *  (the shortcuts panel, Settings → Shortcuts, the palette, the onboarding
+   *  key tour) always show their keys. */
+  showKeyHints: boolean;
   /** Undo Send window in seconds: 0 = off (send immediately), else the delay
    *  before the message actually leaves. Default 10. */
   undoSendSeconds: number;

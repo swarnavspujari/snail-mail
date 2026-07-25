@@ -139,8 +139,15 @@ pub struct Settings {
     #[serde(default)]
     pub sidebar_open: bool,
     /// Bottom shortcut-hint footer visible (default true, incl. older state).
+    /// Governs that strip only — every other key hint answers to
+    /// `show_key_hints`.
     #[serde(default = "default_true")]
     pub show_shortcut_bar: bool,
+    /// Visual keycap hints everywhere else — hover hints, inline key strips,
+    /// sidebar chord chips (default true, incl. older state). Surfaces that
+    /// are ABOUT shortcuts keep their keys regardless.
+    #[serde(default = "default_true")]
+    pub show_key_hints: bool,
     /// Undo Send window in seconds (0 = off / send immediately). Default 10.
     #[serde(default = "default_undo_send")]
     pub undo_send_seconds: i64,

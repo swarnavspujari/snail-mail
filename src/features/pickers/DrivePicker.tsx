@@ -4,9 +4,10 @@
 // Drive grant — without it, the single row is a Reconnect CTA.
 import { useEffect, useRef, useState } from "react";
 import { backend } from "@/lib/ipc";
-import { activeCapabilities } from "@/stores/settings";
+import { activeCapabilities, useSettings } from "@/stores/settings";
 import { driveChipHtml, useUi } from "@/stores/ui";
 import type { DriveFile } from "@/lib/types";
+import { Kbd } from "@/components/Kbd";
 import { PickerShell, type PickerItem } from "./PickerShell";
 
 const SEARCH_DEBOUNCE_MS = 250;
@@ -92,6 +93,7 @@ export function DrivePicker() {
   const seq = useRef(0);
   const timer = useRef<ReturnType<typeof setTimeout>>();
   const hasDrive = activeCapabilities().drive;
+  const keyHints = useSettings((s) => s.settings.showKeyHints);
 
   const search = (query: string) => {
     const id = ++seq.current;
@@ -172,10 +174,13 @@ export function DrivePicker() {
       onQuery={onQuery}
       queryPlaceholder="Search Drive by name or content…"
       footer={
-        <>
-          <span className="kbd">↵</span> insert link ·{" "}
-          <span className="kbd">Ctrl+↵</span> attach copy (≤ 25 MB)
-        </>
+        // The whole strip is a key hint, so with hints off the footer goes
+        // rather than leaving an empty bordered band.
+        keyHints ? (
+          <>
+            <Kbd>↵</Kbd> insert link · <Kbd>Ctrl+↵</Kbd> attach copy (≤ 25 MB)
+          </>
+        ) : undefined
       }
     />
   );

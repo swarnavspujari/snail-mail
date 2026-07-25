@@ -1,11 +1,14 @@
 import { useEffect, useRef, useState } from "react";
 import { backend } from "@/lib/ipc";
 import { useMail } from "@/stores/mail";
+import { useSettings } from "@/stores/settings";
 import { useUi } from "@/stores/ui";
+import { Kbd } from "@/components/Kbd";
 
 /** "?" — ask a question about the open thread; answer streams in. */
 export function AskAi() {
   const threadId = useMail((s) => s.openThreadId);
+  const keyHints = useSettings((s) => s.settings.showKeyHints);
   const [question, setQuestion] = useState("");
   const [answer, setAnswer] = useState("");
   const [running, setRunning] = useState(false);
@@ -56,7 +59,7 @@ export function AskAi() {
             grounded in this thread + attachments
           </span>
           <div className="flex-1" />
-          <span className="kbd">Esc</span>
+          {keyHints && <Kbd>Esc</Kbd>}
         </div>
         <div className="p-4">
           <input

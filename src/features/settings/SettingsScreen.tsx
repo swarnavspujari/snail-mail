@@ -51,6 +51,7 @@ export function SettingsScreen() {
   const tab = useUi((s) => s.settingsTab);
   const accounts = useSettings((s) => s.accounts);
   const capabilities = useSettings((s) => s.capabilities);
+  const keyHints = useSettings((s) => s.settings.showKeyHints);
   const profiles = useProfiles((s) => s.profiles);
   const updateReady = useUpdater((s) => s.ready);
   const [searchOpen, setSearchOpen] = useState(false);
@@ -139,7 +140,7 @@ export function SettingsScreen() {
               <span className="flex-1 text-[12.5px] text-ink-3">
                 Search every setting
               </span>
-              <KeyHint expr="mod+f" size="sm" />
+              {keyHints && <KeyHint expr="mod+f" size="sm" />}
             </button>
           </div>
 
@@ -152,7 +153,7 @@ export function SettingsScreen() {
                   onClick={() => go(`account:${a.email}`)}
                   label={a.email}
                   dot={grantHealthy(capabilities[a.email], a.provider) ? "ok" : "warn"}
-                  slot={i < 9 ? `alt+${i + 1}` : undefined}
+                  slot={keyHints && i < 9 ? `alt+${i + 1}` : undefined}
                 />
               ))}
               <NavItem
@@ -188,7 +189,7 @@ export function SettingsScreen() {
           </div>
 
           <div className="flex items-center gap-2 border-t border-line px-3.5 py-2 text-[11.5px] text-ink-3">
-            <KeyHint expr="escape" size="sm" />
+            {keyHints && <KeyHint expr="escape" size="sm" />}
             <span>back to inbox</span>
           </div>
         </nav>
@@ -242,6 +243,8 @@ export function SettingsScreen() {
 function Footer({ keyboard }: { keyboard: boolean }) {
   const label = useReceipt((s) => s.label);
   const undo = useReceipt((s) => s.undo);
+  // The receipt half of this strip is not a hint and always stays.
+  const keyHints = useSettings((s) => s.settings.showKeyHints);
   return (
     <div className="flex h-[30px] shrink-0 items-center gap-3.5 border-t border-line bg-surface px-4 text-[11.5px] text-ink-3">
       <span className="inline-flex items-center gap-1.5 text-ink-2">
@@ -254,7 +257,9 @@ function Footer({ keyboard }: { keyboard: boolean }) {
         </Button>
       )}
       <div className="flex-1" />
-      {(keyboard
+      {(!keyHints
+        ? []
+        : keyboard
         ? [
             { expr: "enter", label: "remap" },
             { expr: "backspace", label: "clear" },

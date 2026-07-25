@@ -84,6 +84,30 @@ export const PREF_ROWS: PrefRow[] = [
     ],
     keywords: "dark light appearance colour color",
   },
+  // Both hint toggles live under Appearance for now — they are the same
+  // decision ("how much does the app teach me its keys?") split across two
+  // surfaces, and "On launch" was never true of them: either can be flipped
+  // mid-session and takes effect at once.
+  {
+    id: "showShortcutBar",
+    label: "Show the bottom hint bar",
+    help: "The strip of keycaps along the bottom of the inbox.",
+    pane: "general",
+    section: "Appearance",
+    control: "switch",
+    key: "showShortcutBar",
+    keywords: "hints keycaps footer strip",
+  },
+  {
+    id: "showKeyHints",
+    label: "Show keyboard hints everywhere else",
+    help: "Keycaps on hover, the inline key strips, and the sidebar chords. The shortcuts panel and Settings → Shortcuts always show their keys.",
+    pane: "general",
+    section: "Appearance",
+    control: "switch",
+    key: "showKeyHints",
+    keywords: "hints keycaps tooltip hover chords teach",
+  },
   {
     id: "sidebarOpen",
     label: "Open the folder sidebar",
@@ -103,16 +127,6 @@ export const PREF_ROWS: PrefRow[] = [
     control: "switch",
     key: "calendarOpen",
     keywords: "agenda day panel",
-  },
-  {
-    id: "showShortcutBar",
-    label: "Show the keyboard hint bar",
-    help: "The strip of keycaps along the bottom of the inbox.",
-    pane: "general",
-    section: "On launch",
-    control: "switch",
-    key: "showShortcutBar",
-    keywords: "hints keycaps footer",
   },
   {
     id: "notifications",

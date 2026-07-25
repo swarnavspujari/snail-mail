@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { HoverHint } from "@/components/HoverHint";
+import { Kbd } from "@/components/Kbd";
 import {
   assignCalendarHues,
   calendarHue,
@@ -269,6 +270,7 @@ export function CalendarPanel() {
   const error = useCalendar((s) => s.error);
   const hiddenCalendars = useSettings((s) => s.settings.hiddenCalendars);
   const focused = useUi((s) => s.focusRegion === "calendar");
+  const keyHints = useSettings((s) => s.settings.showKeyHints);
   const [nowTick, setNowTick] = useState(Date.now());
   const [drag, setDrag] = useState<{ from: number; to: number } | null>(null);
   const gridRef = useRef<HTMLDivElement>(null);
@@ -387,10 +389,10 @@ export function CalendarPanel() {
             </button>
           )}
         </span>
-        {focused && (
+        {focused && keyHints && (
           <span className="text-[10.5px] text-ink-3">
-            <span className="kbd">←</span>
-            <span className="kbd">→</span>
+            <Kbd>←</Kbd>
+            <Kbd>→</Kbd>
           </span>
         )}
         <HoverHint label="New event" command="calendar.newEvent" placement="bottom">

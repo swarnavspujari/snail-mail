@@ -11,7 +11,7 @@ This design system captures Snail Mail's real visual language so designers and a
 >
 > Explore the repo further to build higher-fidelity designs — the `src/features/` tree is the ground truth for every screen.
 
-**Similar, not the same.** Snail Mail deliberately reaches toward Superhuman-class *speed, layout, and feature parity* — but renders everything in its **own identity**: a cerulean accent (not Superhuman's palette), the rocket-snail brand mark (not their logo), "Shell Command" (not "Superhuman Command"), and a calm cerulean bottom-wash (not their peach). Build in Snail Mail's identity; never reproduce another product's brand marks or exact colors.
+**Similar, not the same.** Snail Mail deliberately reaches toward Superhuman-class *speed, layout, and feature parity* — but renders everything in its **own identity**: a cerulean accent (not Superhuman's palette), the rocket-snail brand mark (not their logo), and "Shell Command" (not "Superhuman Command"). Build in Snail Mail's identity; never reproduce another product's brand marks or exact colors.
 
 Targets **WCAG 2.2**: visible keyboard focus rings everywhere, AA contrast on **both** themes, no reliance on color alone (unread is weight + colored dot + text strength). Both **dark** (the codebase's native mode) and **light** (the airy, spacious default) are first-class — the system is designed to be equally correct in either.
 
@@ -65,7 +65,7 @@ Snail Mail's copy is **calm, direct, and second-person**. It talks *to you* and 
 
 ## Visual foundations
 
-**Overall vibe:** a focused, professional cockpit that ships in two moods. **Dark** is a Material Design 3 tonal dark — soft dark surfaces (not black) on an elevation ladder, a single cerulean accent, hairline separations, dense typography. **Light** is airy and spacious — near-white surfaces, generous line height, a faint cerulean bottom-wash. Both are first-class. Nothing decorative; every pixel serves triage speed. This is a tool, not a landing page.
+**Overall vibe:** a focused, professional cockpit that ships in two moods. **Dark** is a Material Design 3 tonal dark — soft dark surfaces (not black) on an elevation ladder, a single cerulean accent, hairline separations, dense typography. **Light** is airy and spacious — near-white surfaces, generous line height, nothing tinting the content. Both are first-class. Nothing decorative; every pixel serves triage speed. This is a tool, not a landing page.
 
 ### Dark theme, done right — the Material Design 3 tonal method
 
@@ -87,7 +87,7 @@ Snail Mail's dark theme is built the way **Material Design 3** builds dark surfa
 - **Auto-label palette.** Six theme-aware tag hues (`--tag-{violet,amber,green,blue,pink,gray}-{bg,fg}`) for categorical labels — soft tinted fill + legible same-hue text. Convention: pitch=violet, news=amber, CRM=green, marketing=blue.
 - **Sender dots.** Unread markers cycle through `--dot-{blue,pink,amber,violet}` so threads are distinguishable at a glance — not a single accent dot.
 - **Calendar palette.** Seven per-calendar hues (`--cal-{cerulean,green,violet,amber,rose,teal,gray}`, theme-aware) — one per calendar in the account list. An event renders in its calendar's hue as a **muted tinted block** (the color mixed into the surface, never a big saturated fill) plus a saturated left bar; the calendar's side-panel checkbox fills with the same color. Tuned to the tag/dot lightness band so the whole set reads as one cerulean-adjacent family.
-- **Signature wash.** `--wash-bottom` is a faint gradient anchored to the bottom edge of the app (cerulean in both themes, with a green whisper at the very bottom edge blending up into it) — Snail Mail's calm answer to Superhuman's peach glow. Present, never loud.
+- **No decorative wash.** There was once a `--wash-bottom` gradient tinting the bottom ~300px of every pane — Snail Mail's answer to Superhuman's peach glow. It's gone: it dimmed real content, and its light-theme gradient mixed `%` and `px` stops, which CSS reorders into a hard band (the bug fixed in `d0e7326`). The photography — inbox zero and the welcome screen — carries the warmth instead.
 
 ### Type
 - **Segoe UI Variable Text** (the Windows system UI font), fallback `Segoe UI` → `system-ui`. Mono is **Cascadia Code** / Consolas for keycaps, model names, values. See "Fonts" below — these are OS fonts, intentionally not shipped.

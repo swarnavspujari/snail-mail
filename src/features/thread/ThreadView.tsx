@@ -9,6 +9,7 @@ import { useUi } from "@/stores/ui";
 import { Avatar } from "@/components/Avatar";
 import { ContactPanel } from "@/components/ContactPanel";
 import { HoverHint } from "@/components/HoverHint";
+import { Kbd } from "@/components/Kbd";
 import { Label } from "@/components/Label";
 import { InviteBar } from "@/features/thread/InviteBar";
 import { ReplyDock } from "@/features/compose/ReplyDock";
@@ -394,6 +395,7 @@ function PendingCard({ p }: { p: PendingMessage }) {
 function InstantReplies() {
   const suggestions = useUi((s) => s.suggestions);
   const idx = useUi((s) => s.suggestionIndex);
+  const keyHints = useSettings((s) => s.settings.showKeyHints);
 
   if (suggestions.length === 0) return null;
   return (
@@ -405,8 +407,13 @@ function InstantReplies() {
           <span aria-hidden className="text-accent-strong">
             ✦
           </span>
-          Instant replies — <span className="kbd">Tab</span> preview ·{" "}
-          <span className="kbd">R</span> use
+          Instant replies
+          {keyHints && (
+            <>
+              {" — "}
+              <Kbd>Tab</Kbd> preview · <Kbd>R</Kbd> use
+            </>
+          )}
         </div>
         <div className="flex gap-2">
           {suggestions.map((s, i) => (
@@ -441,6 +448,7 @@ export function ThreadView() {
   const pendingAll = useMail((s) => s.pendingMessages);
   const blankHealDone = useMail((s) => s.blankHealDone);
   const myEmail = useSettings((s) => s.accounts.active);
+  const keyHints = useSettings((s) => s.settings.showKeyHints);
   const compose = useUi((s) => s.compose);
   // A reply/forward for THIS thread docks its composer inline at the bottom
   // (new-message compose stays the modal); Instant Replies hide while it's open.
@@ -622,10 +630,11 @@ export function ThreadView() {
             </button>
           </HoverHint>
           <div className="flex-1" />
-          <span className="text-[11px] text-ink-3">
-            <span className="kbd">E</span> done · <span className="kbd">R</span>{" "}
-            reply · <span className="kbd">H</span> snooze
-          </span>
+          {keyHints && (
+            <span className="text-[11px] text-ink-3">
+              <Kbd>E</Kbd> done · <Kbd>R</Kbd> reply · <Kbd>H</Kbd> snooze
+            </span>
+          )}
         </div>
         <div
           ref={scrollRef}
