@@ -11,6 +11,7 @@ import { useUi } from "@/stores/ui";
 import { Avatar } from "@/components/Avatar";
 import { IconButton } from "@/components/Button";
 import { HoverHint } from "@/components/HoverHint";
+import { Kbd } from "@/components/Kbd";
 import { NavRail } from "@/components/NavRail";
 import { RestState } from "@/components/RestState";
 import { UndoToast } from "@/components/UndoToast";
@@ -295,19 +296,6 @@ export default function App() {
           />
         </>
       )}
-      {/* Signature wash — the faint cerulean glow anchored to the bottom edge
-          (design token --wash-bottom). A ~300px bottom strip, not full height:
-          the light token's stops (transparent at 130px, cerulean at 40%) are
-          only consistent on a short layer — full-height renders a hard band.
-          Present, never loud; overlays sit higher in the stack. Skipped over
-          the inbox-zero photo. */}
-      {!zero && (
-        <div
-          aria-hidden
-          className="pointer-events-none absolute inset-x-0 bottom-0 z-10 h-[300px]"
-          style={{ background: "var(--wash-bottom)" }}
-        />
-      )}
       <NavRail
         view={screen === "calendar" ? "calendar" : "mail"}
         overlay={zero}
@@ -548,20 +536,20 @@ export default function App() {
           {hintsVisible && (
             <div className="flex min-w-0 flex-1 items-center justify-center gap-4 overflow-hidden">
               <span className="flex shrink-0 items-center gap-1.5 whitespace-nowrap">
-                Hit <span className="kbd">E</span> Mark Done
+                Hit <Kbd>E</Kbd> Mark Done
               </span>
               <span className="flex shrink-0 items-center gap-1.5 whitespace-nowrap">
-                Hit <span className="kbd">H</span> to set a reminder
+                Hit <Kbd>H</Kbd> to set a reminder
               </span>
               <span className="flex shrink-0 items-center gap-1.5 whitespace-nowrap">
-                Hit <span className="kbd">C</span> to compose
+                Hit <Kbd>C</Kbd> to compose
               </span>
               <span className="flex shrink-0 items-center gap-1.5 whitespace-nowrap">
-                Hit <span className="kbd">/</span> to search
+                Hit <Kbd>/</Kbd> to search
               </span>
               <span className="flex shrink-0 items-center gap-1.5 whitespace-nowrap">
-                Hit <span className="kbd">Ctrl</span>
-                <span className="kbd">K</span> for Shell Command
+                Hit <Kbd>Ctrl</Kbd>
+                <Kbd>K</Kbd> for Shell Command
               </span>
             </div>
           )}

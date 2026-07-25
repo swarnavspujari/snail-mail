@@ -6,6 +6,7 @@
 // for details/RSVP; click or drag an empty slot to create one.
 import { useEffect, useMemo, useRef, useState } from "react";
 import { HoverHint } from "@/components/HoverHint";
+import { Kbd } from "@/components/Kbd";
 import {
   assignCalendarHues,
   calendarHue,
@@ -92,6 +93,7 @@ export function CalendarWeek() {
   const calendars = useCalendar((s) => s.calendars);
   const error = useCalendar((s) => s.error);
   const hiddenCalendars = useSettings((s) => s.settings.hiddenCalendars);
+  const keyHints = useSettings((s) => s.settings.showKeyHints);
   const [nowTick, setNowTick] = useState(Date.now());
   const [drag, setDrag] = useState<{ day: number; from: number; to: number } | null>(
     null
@@ -243,10 +245,11 @@ export function CalendarWeek() {
           <span className="zb-spin inline-block h-3 w-3 rounded-full border-2 border-line-strong border-t-accent" />
         )}
         <div className="flex-1" />
-        <span className="text-[11px] text-ink-3">
-          <span className="kbd">←</span>/<span className="kbd">→</span> day ·{" "}
-          <span className="kbd">Esc</span> back to mail
-        </span>
+        {keyHints && (
+          <span className="text-[11px] text-ink-3">
+            <Kbd>←</Kbd>/<Kbd>→</Kbd> day · <Kbd>Esc</Kbd> back to mail
+          </span>
+        )}
       </div>
 
       {error ? (

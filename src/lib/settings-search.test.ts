@@ -117,10 +117,16 @@ describe("settings catalog", () => {
 
   it("lists a pane's rows in declaration order, filtered by section", () => {
     const launch = prefsFor("general", "On launch");
-    expect(launch.map((r) => r.key)).toEqual([
-      "sidebarOpen",
-      "calendarOpen",
+    expect(launch.map((r) => r.key)).toEqual(["sidebarOpen", "calendarOpen"]);
+  });
+
+  it("keeps both hint toggles together under Appearance", () => {
+    // They are one decision split across two surfaces — the footer strip and
+    // every other keycap — so they are read and changed side by side.
+    expect(prefsFor("general", "Appearance").map((r) => r.key)).toEqual([
+      "theme",
       "showShortcutBar",
+      "showKeyHints",
     ]);
   });
 

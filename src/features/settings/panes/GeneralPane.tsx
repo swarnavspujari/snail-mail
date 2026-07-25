@@ -9,18 +9,22 @@ export function GeneralPane() {
   const onboarded = useSettings((s) => s.settings.onboarded);
   return (
     <>
-      <RowGroup title="Appearance">
+      <RowGroup
+        title="Appearance"
+        hint="Two hint toggles, not one: the bar owns the bottom strip, the other owns every keycap elsewhere. Surfaces that are about shortcuts — the shortcuts panel, Settings → Shortcuts — always show their keys."
+      >
         <Pref id="theme" />
+        <Pref id="showShortcutBar" />
+        <Pref id="showKeyHints" />
       </RowGroup>
 
       <RowGroup
         title="On launch"
         isNew={<Pill tone="accent">new home</Pill>}
-        hint="All three were real settings with no interface — until now they could only be changed by editing the settings file by hand."
+        hint="Both were real settings with no interface — until now they could only be changed by editing the settings file by hand."
       >
         <Pref id="sidebarOpen" />
         <Pref id="calendarOpen" />
-        <Pref id="showShortcutBar" />
       </RowGroup>
 
       <RowGroup title="Notifications">

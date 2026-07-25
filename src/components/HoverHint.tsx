@@ -150,7 +150,11 @@ export function HoverHint({
   const bound = useSettings((s) =>
     command ? (s.settings.shortcuts[command] ?? "") : ""
   );
-  const resolved = expr ?? bound;
+  // The one choke point for all ~21 call sites: with hints off the card still
+  // appears — it is how a bare icon button says what it does — but it drops to
+  // the label alone, no keycaps. The shortcut itself keeps working.
+  const keyHints = useSettings((s) => s.settings.showKeyHints);
+  const resolved = keyHints ? (expr ?? bound) : "";
   const ref = useRef<HTMLSpanElement>(null);
   const timer = useRef<ReturnType<typeof setTimeout>>(undefined);
   const [open, setOpen] = useState(false);

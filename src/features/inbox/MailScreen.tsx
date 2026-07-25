@@ -8,6 +8,7 @@ import { FolderSidebar } from "@/components/FolderSidebar";
 import { useUi } from "@/stores/ui";
 import { IconButton } from "@/components/Button";
 import { HoverHint } from "@/components/HoverHint";
+import { Kbd } from "@/components/Kbd";
 import { Label } from "@/components/Label";
 import type { Thread } from "@/lib/types";
 
@@ -79,6 +80,7 @@ function SplitTabs({ overlay }: { overlay?: boolean }) {
   const splitCounts = useMail((s) => s.splitCounts);
   const splits = useSettings((s) => s.settings.splits);
   const activeAccount = useSettings((s) => s.accounts.active);
+  const keyHints = useSettings((s) => s.settings.showKeyHints);
 
   // Backend SQL counts cover the whole mailbox; the local list length is the
   // fallback until the first refresh lands.
@@ -128,18 +130,20 @@ function SplitTabs({ overlay }: { overlay?: boolean }) {
         );
       })}
       <div className="flex-1" />
-      <span
-        style={shadow}
-        className={`whitespace-nowrap text-[11px] ${overlay ? "text-white/75" : "text-ink-3"}`}
-      >
-        {overlay ? (
-          <>Tab to switch</>
-        ) : (
-          <>
-            <span className="kbd">Tab</span> to switch
-          </>
-        )}
-      </span>
+      {keyHints && (
+        <span
+          style={shadow}
+          className={`whitespace-nowrap text-[11px] ${overlay ? "text-white/75" : "text-ink-3"}`}
+        >
+          {overlay ? (
+            <>Tab to switch</>
+          ) : (
+            <>
+              <Kbd>Tab</Kbd> to switch
+            </>
+          )}
+        </span>
+      )}
       <CalendarToggle overlay={overlay} />
     </div>
   );
@@ -274,6 +278,9 @@ function Row({
 }
 
 function BulkBar({ count }: { count: number }) {
+  // Keycaps are the decoration here; the button labels carry the meaning, so
+  // with hints off these stay buttons that simply say what they do.
+  const keyHints = useSettings((s) => s.settings.showKeyHints);
   return (
     <div className="zb-fade-in flex items-center gap-2 border-b border-line bg-accent-dim px-4 py-1.5 text-[12.5px] text-ink">
       <span className="font-medium">{count} selected</span>
@@ -282,19 +289,19 @@ function BulkBar({ count }: { count: number }) {
         className="rounded-md border border-line-strong px-2.5 py-0.5 hover:bg-hover"
         onClick={() => runCommandById("thread.done")}
       >
-        Mark Done <span className="kbd">E</span>
+        Mark Done {keyHints && <Kbd>E</Kbd>}
       </button>
       <button
         className="rounded-md border border-line-strong px-2.5 py-0.5 hover:bg-hover"
         onClick={() => runCommandById("thread.trash")}
       >
-        Trash <span className="kbd">#</span>
+        Trash {keyHints && <Kbd>#</Kbd>}
       </button>
       <button
         className="rounded-md border border-line-strong px-2.5 py-0.5 hover:bg-hover"
         onClick={() => runCommandById("thread.move")}
       >
-        Label <span className="kbd">V</span>
+        Label {keyHints && <Kbd>V</Kbd>}
       </button>
       <button
         className="rounded-md px-2 py-0.5 text-ink-3 hover:bg-hover hover:text-ink"

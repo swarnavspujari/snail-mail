@@ -7,7 +7,9 @@
 import { useEffect, useRef, useState } from "react";
 import { backend } from "@/lib/ipc";
 import { useCalendar } from "@/stores/calendar";
+import { useSettings } from "@/stores/settings";
 import { useUi } from "@/stores/ui";
+import { Kbd } from "@/components/Kbd";
 import { RecipientInput } from "@/features/compose/RecipientInput";
 import type { CalendarEvent, EventDraft, SendUpdates } from "@/lib/types";
 
@@ -65,6 +67,7 @@ const labelCls = "mb-1 block text-[11px] font-medium uppercase tracking-wide tex
 export function EventModal() {
   const modal = useCalendar((s) => s.modal);
   const calendars = useCalendar((s) => s.calendars);
+  const keyHints = useSettings((s) => s.settings.showKeyHints);
   const ev = modal?.event ?? null;
   const editing = modal?.mode === "edit";
 
@@ -226,7 +229,7 @@ export function EventModal() {
         <span className="flex-1 text-[14px] font-semibold text-ink">
           {editing ? "Edit event" : "New event"}
         </span>
-        <span className="kbd">esc</span>
+        {keyHints && <Kbd>esc</Kbd>}
         <button
           className="rounded px-1.5 text-[15px] leading-none text-ink-3 hover:bg-hover hover:text-ink"
           onClick={() => useCalendar.getState().closeModal()}

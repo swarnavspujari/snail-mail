@@ -140,11 +140,6 @@
   --palette-text-dim: oklch(0.80 0.012 210);
   --palette-text-faint: oklch(0.63 0.016 210);
 
-  /* ---- Signature "wash": Snail Mail's calm answer to Superhuman's peach
-     glow. Tells the cerulean story — a green whisper at the very bottom
-     edge blending up into cerulean, then fading out. */
-  --wash-bottom: linear-gradient(to top, oklch(0.82 0.14 158 / 0.05), oklch(0.802 0.122 222 / 0.10) 34%, transparent 62%); /* @kind other */
-
   color-scheme: dark;
 }
 
@@ -221,9 +216,6 @@ html[data-theme="light"] {
   --cal-rose: oklch(0.52 0.18 352);
   --cal-teal: oklch(0.48 0.09 200);
   --cal-gray: oklch(0.55 0.02 210);
-
-  /* Cool, airy wash — cerulean with a faint green hint at the bottom edge. */
-  --wash-bottom: linear-gradient(to top, oklch(0.50 0.13 158 / 0.05), oklch(0.522 0.142 222 / 0.06) 40%, transparent 130px); /* @kind other */
 
   color-scheme: light;
 }

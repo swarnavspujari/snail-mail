@@ -87,6 +87,7 @@ export function FolderSidebar() {
   const listView = useMail((s) => s.listView);
   const inboxCount = useMail((s) => s.inbox.length);
   const active = useSettings((s) => s.accounts.active);
+  const keyHints = useSettings((s) => s.settings.showKeyHints);
   const [labels, setLabels] = useState<string[]>(() => labelsCache ?? []);
 
   useEffect(() => {
@@ -115,10 +116,11 @@ export function FolderSidebar() {
       </div>
       {FOLDERS.map((f) => {
         // compact chord hint: "g i" → "G+I" (not "G then I")
-        const hint = f.shortcut
-          ? formatKeyExpr(shortcutHint(f.shortcut)).replace(/ then /gi, "+") ||
-            undefined
-          : undefined;
+        const hint =
+          keyHints && f.shortcut
+            ? formatKeyExpr(shortcutHint(f.shortcut)).replace(/ then /gi, "+") ||
+              undefined
+            : undefined;
         return f.id === "drafts" ? (
           <Item
             key={f.id}

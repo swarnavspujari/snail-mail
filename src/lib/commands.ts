@@ -1031,11 +1031,24 @@ export function allCommands(): Command[] {
     },
     {
       id: "shortcutBar.toggle",
-      title: "Toggle Shortcut Hints",
+      title: "Toggle the Bottom Hint Bar",
       group: "General",
       run: () => {
         const s = useSettings.getState();
         void s.save({ showShortcutBar: !s.settings.showShortcutBar });
+      },
+    },
+    {
+      // Sibling of shortcutBar.toggle: that one owns the footer strip, this
+      // one owns every other visual keycap (hover hints, inline strips,
+      // sidebar chords). The shortcuts panel and Settings → Shortcuts are
+      // about keys and ignore both.
+      id: "keyHints.toggle",
+      title: "Toggle Keyboard Hints",
+      group: "General",
+      run: () => {
+        const s = useSettings.getState();
+        void s.save({ showKeyHints: !s.settings.showKeyHints });
       },
     },
     {

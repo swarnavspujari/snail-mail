@@ -34,6 +34,7 @@ export function accountDisplayName(
 export function AccountPane({ email }: { email: string }) {
   const accounts = useSettings((s) => s.accounts);
   const capabilities = useSettings((s) => s.capabilities);
+  const keyHints = useSettings((s) => s.settings.showKeyHints);
   const profiles = useProfiles((s) => s.profiles);
   const account = accounts.accounts.find((a) => a.email === email);
   const [busy, setBusy] = useState(false);
@@ -93,9 +94,13 @@ export function AccountPane({ email }: { email: string }) {
           )}
           <div className="mt-1 flex items-center gap-2 text-[11.5px] text-ink-3">
             <span>{account.provider === "mock" ? "Demo data" : "Gmail"}</span>
-            <span>·</span>
-            <span>Slot</span>
-            <KeyHint expr={`alt+${slot}`} size="sm" />
+            {keyHints && (
+              <>
+                <span>·</span>
+                <span>Slot</span>
+                <KeyHint expr={`alt+${slot}`} size="sm" />
+              </>
+            )}
           </div>
         </div>
         <div className="flex shrink-0 gap-2">

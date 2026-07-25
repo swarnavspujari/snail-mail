@@ -1,13 +1,16 @@
 import { useSettings } from "@/stores/settings";
 import { useUi } from "@/stores/ui";
 import { exprKeycaps } from "@/lib/keyboard";
+import { Kbd } from "@/components/Kbd";
 import {
   SHORTCUTS_CATALOG,
   liveKeysFor,
   type CatalogItem,
 } from "@/lib/shortcuts-catalog";
 
-/** A binding as keycap chips; chords render "G then I" with a plain "then". */
+/** A binding as keycap chips; chords render "G then I" with a plain "then".
+ *  Exempt from settings.showKeyHints on purpose — this panel IS the shortcut
+ *  reference, so hiding its keycaps would empty it. */
 function Keycaps({ expr }: { expr: string }) {
   return (
     <span className="flex flex-wrap items-center justify-end gap-1">
@@ -20,9 +23,7 @@ function Keycaps({ expr }: { expr: string }) {
                 then
               </span>
             ) : (
-              <span key={`${i}-${j}`} className="kbd">
-                {chip}
-              </span>
+              <Kbd key={`${i}-${j}`}>{chip}</Kbd>
             )
           )
         )}
@@ -68,7 +69,7 @@ export function ShortcutsPanel() {
         <span className="flex-1 text-[14px] font-semibold text-ink">
           Shortcuts
         </span>
-        <span className="kbd">esc</span>
+        <Kbd>esc</Kbd>
         <button
           className="rounded px-1.5 text-[15px] leading-none text-ink-3 hover:bg-hover hover:text-ink"
           onClick={() => useUi.getState().setShortcutsOpen(false)}
