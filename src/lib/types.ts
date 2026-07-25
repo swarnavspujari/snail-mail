@@ -379,6 +379,28 @@ export interface SyncProgress {
   done: boolean;
 }
 
+/** Which pass a `sync:activity` tick belongs to. Mirrors the Rust
+ *  `SyncStage` (serde kebab-case). */
+export type SyncStage =
+  | "reconcile-inbox"
+  | "reconcile-rest"
+  | "incremental"
+  | "crawl"
+  | "resync"
+  | "load-older";
+
+/** Live download activity — "Downloading 17 of 30…". Distinct from
+ *  SyncProgress: that measures long-term crawl COMPLETENESS from persisted
+ *  state, this measures what the Gmail API is doing right now. `done`/`total`
+ *  are thread counts within the current pass (one thread = one `threads.get`),
+ *  not lifetime totals. A tick with `done >= total` ends the pass. */
+export interface SyncActivity {
+  account: string;
+  stage: SyncStage;
+  done: number;
+  total: number;
+}
+
 /** One-time per-account storage split (desktop). A payload with
  *  table === "done" means the split finished and the strip hides. */
 export interface MigrationProgress {

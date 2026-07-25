@@ -33,6 +33,7 @@ import type {
   Settings,
   Split,
   Streaks,
+  SyncActivity,
   SyncProgress,
   Thread,
   ThreadId,
@@ -59,6 +60,10 @@ const LS_KEY = "fission-mock-state-v1";
 // Upper bound on the contact panel's mail-history query (mirrors the Rust
 // command's limit). The panel drops the open thread and shows the top 5.
 const CONTACT_HISTORY_LIMIT = 20;
+/** Threads a simulated "Sync now" pass downloads. Bigger than the fixture
+ *  corpus on purpose: a real incremental tick fetches whatever history.list
+ *  turned up, and the pill needs a pass long enough to actually watch. */
+const MOCK_SYNC_THREADS = 30;
 
 /** Fixture "Google contacts" — people NOT in the demo mail corpus, so the
  *  browser demo shows address-book-sourced autocomplete (mirrors the desktop
@@ -259,6 +264,12 @@ export class MockBackend implements Backend {
   private lastProgress: SyncProgress | null = null;
   private downloading = false;
   private downloadStarted = false;
+  private activityListeners = new Set<(a: SyncActivity) => void>();
+  /** The in-flight simulated pass (what get_sync_activity serves), or null. */
+  private lastActivity: SyncActivity | null = null;
+  /** Cancels the running simulated pass so a second syncNow() can't interleave
+   *  two counts into one pill. */
+  private activityTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor() {
     const seed = buildSeedData();
@@ -341,6 +352,44 @@ export class MockBackend implements Backend {
     for (const cb of this.syncListeners) cb(p);
   }
 
+  private emitActivity(a: SyncActivity) {
+    // Mirror the core: the parked value is the IN-FLIGHT pass, so a terminal
+    // tick clears it rather than leaving get_sync_activity reporting a
+    // finished download forever.
+    this.lastActivity = a.total === 0 || a.done >= a.total ? null : a;
+    for (const cb of this.activityListeners) cb(a);
+  }
+
+  /** Run a simulated download pass, ticking once per thread the way the real
+   *  fetch loop does (every Gmail round-trip is one `threads.get`). Deliberately
+   *  NOT a single synthetic climb — the pill's whole job is to count real
+   *  round-trips, so the demo has to produce real per-item ticks or it proves
+   *  nothing. Resolves when the pass completes. */
+  private runActivityPass(
+    stage: SyncActivity["stage"],
+    total: number,
+    everyMs = 60
+  ): Promise<void> {
+    if (this.activityTimer) clearInterval(this.activityTimer);
+    const account = this.state.activeAccount;
+    if (total <= 0) {
+      this.emitActivity({ account, stage, done: 0, total: 0 });
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => {
+      let done = 0;
+      this.activityTimer = setInterval(() => {
+        done += 1;
+        this.emitActivity({ account, stage, done, total });
+        if (done >= total) {
+          if (this.activityTimer) clearInterval(this.activityTimer);
+          this.activityTimer = null;
+          resolve();
+        }
+      }, everyMs);
+    });
+  }
+
   /** Mirror the desktop's background history download: the inbox is "ready"
    *  immediately while done/trash/etc. fill in a beat later, and a
    *  `sync:progress` count climbs from the inbox size toward a "full history",
@@ -364,6 +413,14 @@ export class MockBackend implements Backend {
     this.downloading = true;
     let indexed = Math.max(1, inboxCount);
     this.emitProgress({ indexed, total, done: false });
+    // The activity pill rides the same first pass: the inbox is fetched thread
+    // by thread before anything else, exactly as reconcile() does. Real fixture
+    // count, one tick each — no synthetic denominator here (unlike the
+    // completeness bar above, which needs one to have anything to climb).
+    void this.runActivityPass("reconcile-inbox", inboxCount).then(() =>
+      // …then the backfill behind it, which is what fills the rest of the bar.
+      this.runActivityPass("reconcile-rest", Math.max(0, total - inboxCount), 80)
+    );
     const step = Math.max(1, Math.ceil((total - indexed) / 14));
     const iv = setInterval(() => {
       // first beat reveals the non-inbox views (inbox was visible from the
@@ -474,12 +531,24 @@ export class MockBackend implements Backend {
     this.emitAccounts();
     return snapshot;
   }
+  /** Honest about what it does: wakes snoozes AND runs a real per-item
+   *  download pass, so "Sync now" in the demo exercises the same event stream
+   *  the desktop emits from `sync_now` → full_sync → incremental. Awaits the
+   *  pass, like the desktop command awaits its sync. */
   async syncNow() {
     this.wakeDueSnoozes();
+    await this.runActivityPass("incremental", MOCK_SYNC_THREADS);
+    this.notify();
   }
+  /** Repair Mail: a forced reconcile that re-parses every listed thread — the
+   *  heaviest download in the app, and the one that used to run with no
+   *  feedback at all. The demo fixtures carry real HTML, so nothing is actually
+   *  repaired; the pass is simulated for parity. */
   async resyncAccount() {
-    // demo fixtures carry real HTML already — nothing to repair
     this.wakeDueSnoozes();
+    const total = this.threads.filter((t) => this.inActiveAccount(t)).length;
+    await this.runActivityPass("resync", total);
+    this.notify();
   }
 
   async listThreads(view: MailView): Promise<Thread[]> {
@@ -1755,6 +1824,16 @@ export class MockBackend implements Backend {
     // the in-flight progress.
     if (this.lastProgress) cb(this.lastProgress);
     return () => this.syncListeners.delete(cb);
+  }
+  onSyncActivity(cb: (a: SyncActivity) => void): () => void {
+    this.activityListeners.add(cb);
+    return () => this.activityListeners.delete(cb);
+  }
+  /** The desktop's pull command: subscribers get the in-flight pass on mount
+   *  rather than replaying through the listener (which would double-count for
+   *  anyone already subscribed). */
+  async getSyncActivity(): Promise<SyncActivity | null> {
+    return this.lastActivity;
   }
   onCalendarUpdated(cb: (error: string | null) => void): () => void {
     this.calendarListeners.add(cb);

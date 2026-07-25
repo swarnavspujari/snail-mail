@@ -24,22 +24,87 @@ fn history_key(account_id: &str) -> String {
     format!("history:{account_id}")
 }
 
+// ---------------------------------------------------------------- activity
+//
+// Every Gmail round-trip below is exactly one `threads.get`, so "downloading X
+// of N" maps 1:1 onto requests. These counts always existed here; the old
+// zero-argument `Fn()` callback threw them away and the consumer re-derived a
+// worse number with a SQL COUNT. The tick carries them out instead.
+//
+// Emission policy (throttling, coalescing, what the UI does with it) lives at
+// the callback's other end in lib.rs — this module fires on every item and
+// stays policy-free.
+
+/// Which pass is doing the fetching. Serializes kebab-case to match the TS
+/// `SyncStage` union.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SyncStage {
+    /// Reconcile phase 1 — the inbox, fetched before anything else.
+    ReconcileInbox,
+    /// Reconcile phase 2 — done + trash, behind the now-visible inbox.
+    ReconcileRest,
+    /// history.list catch-up: the common case, silent until now.
+    Incremental,
+    /// Background full-history walk, one listing page per beat.
+    Crawl,
+    /// Repair Mail — a forced reconcile that re-parses every listed thread.
+    Resync,
+    /// "Load older" paging at the bottom of a list.
+    LoadOlder,
+}
+
+/// One beat of download activity. `done`/`total` are thread counts within the
+/// current pass, not lifetime totals — `total` is the exact denominator the
+/// fetch loop already holds.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct SyncTick {
+    pub account: String,
+    pub stage: SyncStage,
+    pub done: usize,
+    pub total: usize,
+}
+
+/// Callback shape shared by every fetching path.
+pub type ProgressFn<'a> = &'a (dyn Fn(SyncTick) + Send + Sync);
+
+/// Distinguishes Repair Mail from every other forced reconcile. `reconcile()`
+/// sees only `force_reconcile: bool`, so without this a resync is
+/// indistinguishable from the boot pass or the ~10-minute forced tick.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncPass {
+    Normal,
+    Resync,
+}
+
+impl SyncPass {
+    /// The stage to report for a reconcile phase under this pass.
+    fn stage(self, phase: SyncStage) -> SyncStage {
+        match self {
+            SyncPass::Resync => SyncStage::Resync,
+            SyncPass::Normal => phase,
+        }
+    }
+}
+
 /// Sync one account. Returns true if anything changed (caller emits
 /// mail:updated). `force_reconcile` ignores the stored historyId and does a full
 /// listing pass — the periodic safety net that catches inbox removals the
 /// incremental path missed.
 ///
-/// `on_progress` is called as the initial reconcile streams threads in (see
-/// `reconcile`); the caller wires it to emit `mail:updated` (+ `sync:progress`)
-/// so the inbox paints and fills in live instead of all-at-once at the end. It's
-/// a no-op-friendly hook — the cheap incremental path never invokes it.
+/// `on_progress` is called as threads stream in; the caller wires it to emit
+/// `mail:updated` (+ `sync:progress` and `sync:activity`) so the inbox paints
+/// and fills in live instead of all-at-once at the end. Every fetching path
+/// invokes it now — including the cheap incremental one, which used to be
+/// silent even though it knows exactly how many threads it is about to refetch.
 pub async fn full_sync(
     http: &reqwest::Client,
     session: &mut GmailSession,
     db: &std::sync::Mutex<Connection>,
     account_id: &str,
     force_reconcile: bool,
-    on_progress: &(dyn Fn() + Send + Sync),
+    pass: SyncPass,
+    on_progress: ProgressFn<'_>,
 ) -> Result<bool, String> {
     let key = history_key(account_id);
     let start: Option<String> = if force_reconcile {
@@ -49,17 +114,18 @@ pub async fn full_sync(
         store::get_json(&conn, &key)
     };
     let mut changed = match start {
-        Some(hid) => match incremental(http, session, db, account_id, &hid, &key).await {
+        Some(hid) => match incremental(http, session, db, account_id, &hid, &key, on_progress).await
+        {
             Ok(c) => c,
             // An expired historyId (Gmail keeps ~a week) returns 404; an invalid
             // one returns 400. Either way reconcile from scratch instead of
             // pinning a dead baseline and re-failing the same window forever.
             Err(e) if e.contains("(404") || e.contains("(400") => {
-                reconcile(http, session, db, account_id, &key, on_progress).await?
+                reconcile(http, session, db, account_id, &key, pass, on_progress).await?
             }
             Err(e) => return Err(e),
         },
-        None => reconcile(http, session, db, account_id, &key, on_progress).await?,
+        None => reconcile(http, session, db, account_id, &key, pass, on_progress).await?,
     };
 
     // Muted threads never sit in the inbox: any that resurfaced (new reply)
@@ -85,6 +151,7 @@ async fn incremental(
     account_id: &str,
     start_history_id: &str,
     key: &str,
+    on_progress: ProgressFn<'_>,
 ) -> Result<bool, String> {
     let mut affected: HashSet<String> = HashSet::new();
     let mut latest = start_history_id.to_string();
@@ -113,7 +180,10 @@ async fn incremental(
     }
 
     let mut changed = false;
-    for tid in &affected {
+    // `affected.len()` is the exact denominator for this pass — the common-case
+    // 30s tick, which reported nothing at all before.
+    let total = affected.len();
+    for (i, tid) in affected.iter().enumerate() {
         match refetch_thread(http, session, db, account_id, tid).await {
             Ok(c) => changed |= c,
             // One thread failing (rate-limit, transient network, an unexpected
@@ -122,6 +192,14 @@ async fn incremental(
             // re-fails every cycle. Log it and keep going.
             Err(e) => eprintln!("[sync:{account_id}] refetch {tid} failed: {e}"),
         }
+        // Tick after the fetch (failures included): the count tracks round-trips
+        // spent, so it always reaches `total` and the terminal tick fires.
+        on_progress(SyncTick {
+            account: account_id.to_string(),
+            stage: SyncStage::Incremental,
+            done: i + 1,
+            total,
+        });
     }
     if latest != start_history_id {
         let conn = db.lock().unwrap();
@@ -134,7 +212,7 @@ async fn incremental(
 /// historyId (captured BEFORE listing, so nothing in between is missed).
 ///
 /// Inbox-first: the inbox is listed, diffed, and fetched **before** done/trash,
-/// and `on_progress` fires every `STREAM_EVERY` threads, so the inbox paints
+/// and `on_progress` fires once per thread, so the inbox paints
 /// and fills in live while the rest of history backfills behind it (the crawler
 /// takes the tail past the caps). The per-folder caps are unchanged — the
 /// "archived elsewhere" flip below assumes the inbox listing is complete, which
@@ -145,7 +223,8 @@ async fn reconcile(
     db: &std::sync::Mutex<Connection>,
     account_id: &str,
     key: &str,
-    on_progress: &(dyn Fn() + Send + Sync),
+    pass: SyncPass,
+    on_progress: ProgressFn<'_>,
 ) -> Result<bool, String> {
     // Captured BEFORE the listings so a thread the user trashes mid-reconcile
     // isn't mistaken for a server-side restore and resurrected below.
@@ -163,12 +242,21 @@ async fn reconcile(
     // threadsTotal is the denominator for the "downloading mail history"
     // indicator (see emit_sync_progress). Gmail may report it as a number or a
     // string; keep any prior value if this profile omitted it.
+    //
+    // profile.threadsTotal counts the WHOLE mailbox — spam, trash and drafts
+    // included — while both the crawl (CRAWL_QUERY) and the local numerator
+    // exclude them. Mismatched populations are why the bar asymptoted below
+    // 100% and had to be clamped. labels.list carries no counts, so subtract
+    // the three excluded labels' own threadsTotal via labels.get.
     let threads_total = prof["threadsTotal"]
         .as_i64()
         .or_else(|| prof["threadsTotal"].as_str().and_then(|s| s.parse().ok()));
     if let Some(total) = threads_total.filter(|&t| t > 0) {
+        let excluded = session.excluded_thread_totals(http).await;
+        // Never let a bad subtraction invert the denominator.
+        let net = (total - excluded).max(1);
         let conn = db.lock().unwrap();
-        let _ = store::set_json(&conn, &format!("threads_total:{account_id}"), &total);
+        let _ = store::set_json(&conn, &format!("threads_total:{account_id}"), &net);
     }
 
     // Refresh the label id→name map; older syncs stored opaque ids in
@@ -211,10 +299,21 @@ async fn reconcile(
             }
         }
     }
-    changed |= fetch_streaming(http, session, db, account_id, &inbox_to_fetch, on_progress).await;
-    // Repaint once more so the last (sub-batch) of inbox threads shows before we
-    // move on to the slower done/trash backfill.
-    on_progress();
+    // The extra repaint that used to sit here is gone: fetch_streaming now ends
+    // every phase on a terminal tick, and the caller repaints on those, so the
+    // last sub-batch of inbox threads still shows before the slower done/trash
+    // backfill starts. Re-emitting it would restart the pill on a pass that had
+    // just completed.
+    changed |= fetch_streaming(
+        http,
+        session,
+        db,
+        account_id,
+        &inbox_to_fetch,
+        pass.stage(SyncStage::ReconcileInbox),
+        on_progress,
+    )
+    .await;
 
     // ---- Phase 2: done + trash behind the now-visible inbox ----
     let done = session
@@ -237,7 +336,16 @@ async fn reconcile(
             }
         }
     }
-    changed |= fetch_streaming(http, session, db, account_id, &rest_to_fetch, on_progress).await;
+    changed |= fetch_streaming(
+        http,
+        session,
+        db,
+        account_id,
+        &rest_to_fetch,
+        pass.stage(SyncStage::ReconcileRest),
+        on_progress,
+    )
+    .await;
 
     // Two-way trash: threads the server has in trash get hidden locally
     // (upsert never touches the hidden column), and threads restored on the
@@ -287,32 +395,39 @@ fn thread_history_matches(conn: &Connection, id: &str, history_id: &str) -> bool
     known.as_deref() == Some(history_id)
 }
 
-/// Refetch a batch of threads, pinging `on_progress` every `STREAM_EVERY` so the
-/// UI reveals them as they land instead of all-at-once at the end. Returns true
-/// if anything was fetched. One poison thread is logged and skipped — it must
-/// not abort the pass (which would skip storing the reconcile baseline and pin
-/// the account to re-run the full listing every cycle).
+/// Refetch a batch of threads, pinging `on_progress` after every one so the UI
+/// can count them live and reveal them as they land instead of all-at-once at
+/// the end. Returns true if anything was fetched. One poison thread is logged
+/// and skipped — it must not abort the pass (which would skip storing the
+/// reconcile baseline and pin the account to re-run the full listing every
+/// cycle).
+///
+/// Ticking per item is deliberate: the caller decides how often that becomes a
+/// repaint and how often it becomes a `sync:activity` emit (see `ActivityGate`
+/// and `REPAINT_EVERY` in lib.rs). The old `STREAM_EVERY` batching lived here
+/// and coupled the two.
 async fn fetch_streaming(
     http: &reqwest::Client,
     session: &mut GmailSession,
     db: &std::sync::Mutex<Connection>,
     account_id: &str,
     ids: &[String],
-    on_progress: &(dyn Fn() + Send + Sync),
+    stage: SyncStage,
+    on_progress: ProgressFn<'_>,
 ) -> bool {
-    const STREAM_EVERY: usize = 25;
     let mut changed = false;
-    let mut since_emit = 0usize;
-    for id in ids {
+    let total = ids.len();
+    for (i, id) in ids.iter().enumerate() {
         match refetch_thread(http, session, db, account_id, id).await {
             Ok(_) => changed = true,
             Err(e) => eprintln!("[sync:{account_id}] reconcile refetch {id} failed: {e}"),
         }
-        since_emit += 1;
-        if since_emit >= STREAM_EVERY {
-            on_progress();
-            since_emit = 0;
-        }
+        on_progress(SyncTick {
+            account: account_id.to_string(),
+            stage,
+            done: i + 1,
+            total,
+        });
     }
     changed
 }
@@ -518,6 +633,13 @@ pub struct CrawlCursor {
     /// Threads fetched + indexed by the crawl (progress logging).
     #[serde(default)]
     pub indexed: u64,
+    /// Threads the crawl has ENUMERATED (fetched + already-local), across every
+    /// page so far. This is the walk's own measure of the mailbox population —
+    /// exactly the CRAWL_QUERY population the local numerator counts — so
+    /// emit_sync_progress floors its denominator here and a low estimate from
+    /// profile.threadsTotal can never pin the bar at 99%.
+    #[serde(default)]
+    pub listed: u64,
     /// Whole history walked; nothing left to do.
     #[serde(default)]
     pub done: bool,
@@ -554,6 +676,7 @@ pub async fn crawl_step(
     gmail: &tokio::sync::Mutex<HashMap<String, GmailSession>>,
     db: &std::sync::Mutex<Connection>,
     account_id: &str,
+    on_progress: ProgressFn<'_>,
 ) -> Result<CrawlBeat, String> {
     let key = crawl_key(account_id);
     let mut cur: CrawlCursor = {
@@ -602,7 +725,10 @@ pub async fn crawl_step(
         done: false,
     };
     let mut page_oldest: Option<i64> = None;
-    for (id, history_id) in &page {
+    // "X of N" within this page: the crawl fetches at most one page per beat,
+    // so the page is the pass the user is watching.
+    let page_total = page.len();
+    for (i, (id, history_id)) in page.iter().enumerate() {
         let known: Option<String> = {
             let conn = db.lock().unwrap();
             conn.query_row(
@@ -643,6 +769,12 @@ pub async fn crawl_step(
         if let Some(d) = date {
             page_oldest = Some(page_oldest.map_or(d, |o| o.min(d)));
         }
+        on_progress(SyncTick {
+            account: account_id.to_string(),
+            stage: SyncStage::Crawl,
+            done: i + 1,
+            total: page_total,
+        });
     }
 
     // Every fetch failing looks like an outage, not poison threads — keep the
@@ -655,6 +787,10 @@ pub async fn crawl_step(
         cur.oldest_ms = Some(cur.oldest_ms.map_or(d, |o| o.min(d)));
     }
     cur.indexed += beat.fetched as u64;
+    // Everything on this page was enumerated, whether it needed fetching or was
+    // already local — that's what makes `listed` a population size rather than a
+    // work count.
+    cur.listed += page_total as u64;
     cur.page_token = next;
     if cur.page_token.is_none() {
         cur.done = true; // listing exhausted: full history is indexed
@@ -816,6 +952,7 @@ mod tests {
             anchor: Some(1_700_000_000),
             oldest_ms: Some(1_699_999_999_000),
             indexed: 4200,
+            listed: 4600,
             done: false,
         };
         store::set_json(&conn, &crawl_key("a@b.c"), &cur).unwrap();
@@ -833,6 +970,7 @@ mod tests {
             anchor: None,
             oldest_ms: Some(1_699_999_999_123),
             indexed: 7,
+            listed: 12,
             done: false,
         };
         reanchor(&mut cur);

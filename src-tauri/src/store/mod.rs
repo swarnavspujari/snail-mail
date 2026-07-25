@@ -712,13 +712,21 @@ pub fn account_of_thread(conn: &Connection, id: &str) -> Option<String> {
         .ok()
 }
 
-/// How many threads are stored locally for an account — the numerator of the
-/// "downloading mail history" progress (denominator is Gmail's threadsTotal).
-/// Counts every stored thread, hidden (trash) included, to track the crawl's
-/// coverage against the whole mailbox.
-pub fn count_threads(conn: &Connection, account_id: &str) -> i64 {
+/// The numerator of the "downloading mail history" progress: threads stored
+/// locally that the crawl's population actually contains.
+///
+/// `hidden IS NULL` excludes trash and spam, matching CRAWL_QUERY
+/// (`-in:spam -in:trash -in:draft`) and the label-adjusted denominator in
+/// emit_sync_progress. Counting hidden rows here against a spam-free
+/// denominator is what made the percentage overshoot its own population and
+/// forced the 99% clamp. (Drafts are never stored locally — reconcile excludes
+/// them from every listing.)
+///
+/// Rides idx_threads_account_split's leading account_id column, so the
+/// per-beat COUNT stays indexed.
+pub fn count_threads_visible(conn: &Connection, account_id: &str) -> i64 {
     conn.query_row(
-        "SELECT COUNT(*) FROM threads WHERE account_id = ?1",
+        "SELECT COUNT(*) FROM threads WHERE account_id = ?1 AND hidden IS NULL",
         params![account_id],
         |r| r.get(0),
     )
@@ -2348,6 +2356,54 @@ mod tests {
         upsert_thread(conn, ACCT, &t, &[(m, None, None, None, vec![])]).unwrap();
     }
 
+    /// The download-progress numerator must describe the crawl's population.
+    /// The crawl lists `-in:spam -in:trash -in:draft`, so trashed threads are
+    /// not part of what it is downloading — counting them pushed the numerator
+    /// past its own denominator's population and forced the 99% clamp.
+    #[test]
+    fn count_visible_excludes_hidden() {
+        let conn = open(std::path::Path::new(":memory:")).unwrap();
+        seed(&conn, "t-1", "Kept", "body", "Ann", 3_000);
+        seed(&conn, "t-2", "Trashed", "body", "Bob", 2_000);
+        seed(&conn, "t-3", "Spammed", "body", "Cal", 1_000);
+        assert_eq!(count_threads_visible(&conn, ACCT), 3);
+
+        set_hidden(&conn, "t-2", Some("trash")).unwrap();
+        set_hidden(&conn, "t-3", Some("spam")).unwrap();
+        assert_eq!(count_threads_visible(&conn, ACCT), 1);
+
+        // restoring one puts it back in the population
+        clear_hidden(&conn, "t-2").unwrap();
+        assert_eq!(count_threads_visible(&conn, ACCT), 2);
+
+        // and it stays scoped per account
+        assert_eq!(count_threads_visible(&conn, "someone@else.test"), 0);
+    }
+
+    /// emit_sync_progress runs this COUNT once per download beat, per account.
+    /// It needs an index on threads(account_id) — and already has one: the
+    /// v0.23 composite idx_threads_account_split leads with account_id, so a
+    /// dedicated single-column index would be redundant. Asserted rather than
+    /// eyeballed, because "the composite covers it" is exactly the kind of
+    /// claim that silently stops being true.
+    #[test]
+    fn progress_count_is_index_covered() {
+        let conn = open(std::path::Path::new(":memory:")).unwrap();
+        let plan: String = conn
+            .query_row(
+                "EXPLAIN QUERY PLAN
+                 SELECT COUNT(*) FROM threads WHERE account_id = ?1 AND hidden IS NULL",
+                params![ACCT],
+                |r| r.get(3),
+            )
+            .unwrap();
+        assert!(
+            plan.contains("idx_threads_account_split"),
+            "progress COUNT fell back to a scan: {plan}"
+        );
+        assert!(!plan.contains("SCAN threads"), "full table scan: {plan}");
+    }
+
     fn travel_split() -> Split {
         Split {
             id: "travel".into(),
@@ -2511,8 +2567,21 @@ mod tests {
 
         clear_account_mail(&conn, "other@x.test").unwrap();
 
-        assert_eq!(count_threads(&conn, "other@x.test"), 0);
-        assert_eq!(count_threads(&conn, ACCT), 1);
+        // Every row, hidden included — a wipe must leave nothing behind, which
+        // is stricter than the visible-only count the progress bar uses.
+        let all_rows = |account: &str| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM threads WHERE account_id = ?1",
+                params![account],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(all_rows("other@x.test"), 0);
+        assert_eq!(all_rows(ACCT), 1);
+        // The progress numerator agrees while nothing is hidden — the two only
+        // diverge once a thread is trashed (see count_visible_excludes_hidden).
+        assert_eq!(count_threads_visible(&conn, ACCT), 1);
         // FTS rows follow their account: the cleared account's text is gone,
         // the kept account still searches.
         assert_eq!(search(&conn, "farewell", "other@x.test").unwrap().len(), 0);

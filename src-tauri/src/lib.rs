@@ -39,6 +39,11 @@ pub struct AppState {
     /// Overlap guard for the history crawl: a throttled beat can outlast the
     /// 30s sync tick, and later ticks must skip instead of stacking beats.
     crawl_busy: AtomicBool,
+    /// Last `sync:activity` tick of the pass currently in flight, or None when
+    /// nothing is downloading. Served by `get_sync_activity` so a UI that
+    /// mounts mid-pass (onboarding, a reopened window) doesn't have to wait for
+    /// the next beat to learn a download is running.
+    activity: Mutex<Option<mail::sync::SyncTick>>,
     /// App data dir (model cache lives under it).
     data_dir: std::path::PathBuf,
     /// Lazy local embedding model for semantic search.
@@ -1769,14 +1774,106 @@ fn emit_sync_progress(app: &AppHandle) {
         let Ok(db) = state.account_db(email) else { continue };
         let conn = db.lock().unwrap();
         any = true;
-        indexed += store::count_threads(&conn, email);
-        total += store::get_json::<i64>(&conn, &format!("threads_total:{email}")).unwrap_or(0);
+        // Numerator and denominator must describe the SAME population or the
+        // percentage can never reach 100. Both are now the crawl's population:
+        // non-hidden local threads, against threadsTotal minus spam/trash/draft.
+        // (Demo threads need no exclusion — this loop is gmail-only and, since
+        // the per-account split, a gmail file cannot hold mock rows.)
+        indexed += store::count_threads_visible(&conn, email);
         let cur: mail::sync::CrawlCursor =
             store::get_json(&conn, &format!("crawl:{email}")).unwrap_or_default();
+        // The crawl's own enumeration is ground truth for how many threads
+        // exist in that population; Gmail's (adjusted) threadsTotal is only an
+        // estimate. Taking the larger keeps a low estimate from parking the bar
+        // just short of done.
+        let estimate = store::get_json::<i64>(&conn, &format!("threads_total:{email}")).unwrap_or(0);
+        total += estimate.max(cur.listed as i64);
         all_done &= cur.done;
     }
     let done = any && all_done;
     let _ = app.emit("sync:progress", SyncProgress { indexed, total, done });
+}
+
+// ------------------------------------------------------------ sync:activity
+//
+// The live "Downloading 17 of 30…" counter. sync.rs ticks once per thread
+// fetched (one Gmail round-trip each); everything about how often that reaches
+// the webview is decided here.
+
+/// Minimum gap between `sync:activity` emits — ~4/s. A reconcile can fetch
+/// hundreds of threads and the pill only needs to look alive.
+const ACTIVITY_MIN_GAP_MS: u128 = 250;
+/// How often a tick also triggers a repaint (`mail:updated` + `sync:progress`).
+/// Matches the old STREAM_EVERY that used to live in fetch_streaming, so the
+/// per-item ticking below costs no extra list refreshes or COUNT(*) beats.
+const REPAINT_EVERY: usize = 25;
+
+/// Per-pass coalescing for `sync:activity`. The callback is a `Fn`, so the
+/// last-emit timestamp lives in an atomic rather than `&mut`.
+struct ActivityGate {
+    last_ms: std::sync::atomic::AtomicU64,
+}
+
+impl ActivityGate {
+    fn new() -> Self {
+        Self { last_ms: std::sync::atomic::AtomicU64::new(0) }
+    }
+
+    /// Should this tick be emitted? Terminal ticks (`done == total`) always
+    /// pass: swallowing one would leave the pill frozen mid-count with no
+    /// completion to fade on. `total == 0` counts as terminal — an empty pass
+    /// still has to clear any pill left over from the previous one.
+    fn allows(&self, tick: &mail::sync::SyncTick) -> bool {
+        if tick.total == 0 || tick.done >= tick.total {
+            self.last_ms.store(now_ms() as u64, Ordering::SeqCst);
+            return true;
+        }
+        let now = now_ms() as u64;
+        let last = self.last_ms.load(Ordering::SeqCst);
+        if (now as u128).saturating_sub(last as u128) < ACTIVITY_MIN_GAP_MS {
+            return false;
+        }
+        self.last_ms.store(now, Ordering::SeqCst);
+        true
+    }
+}
+
+/// Emit one `sync:activity` beat and park it for `get_sync_activity`. The
+/// parked value is cleared on the terminal tick so a late subscriber is never
+/// told a finished pass is still running.
+fn emit_sync_activity(app: &AppHandle, tick: mail::sync::SyncTick) {
+    let finished = tick.total == 0 || tick.done >= tick.total;
+    {
+        let state = app.state::<AppState>();
+        let mut slot = state.activity.lock().unwrap();
+        *slot = if finished { None } else { Some(tick.clone()) };
+    }
+    let _ = app.emit("sync:activity", tick);
+}
+
+/// Build the progress callback every fetching path shares: activity ticks at
+/// ~4/s, repaints every REPAINT_EVERY threads (and at the end of each pass).
+/// Returned as an owned closure so each pass gets its own gate.
+fn progress_callback(app: AppHandle) -> impl Fn(mail::sync::SyncTick) + Send + Sync {
+    let gate = ActivityGate::new();
+    move |tick: mail::sync::SyncTick| {
+        let repaint = tick.done % REPAINT_EVERY == 0 || tick.done >= tick.total;
+        if gate.allows(&tick) {
+            emit_sync_activity(&app, tick);
+        }
+        if repaint {
+            let _ = app.emit("mail:updated", ());
+            emit_sync_progress(&app);
+        }
+    }
+}
+
+/// Pull the in-flight download pass, if any. Lets a UI that mounts mid-pass
+/// (onboarding's first sync, a reopened window) show the counter immediately
+/// instead of waiting for the next beat — or missing the pass entirely.
+#[tauri::command]
+fn get_sync_activity(state: State<'_, AppState>) -> Option<mail::sync::SyncTick> {
+    state.activity.lock().unwrap().clone()
 }
 
 /// Google answered `invalid_grant`: the refresh token is expired or revoked
@@ -1867,16 +1964,23 @@ fn sync_in_background(app: AppHandle) {
         let state = app.state::<AppState>();
         // The inbox streams in live as reconcile fetches it (and the download
         // bar climbs) rather than appearing all-at-once when sync finishes.
-        let on_progress = || {
-            let _ = app.emit("mail:updated", ());
-            emit_sync_progress(&app);
-        };
+        let on_progress = progress_callback(app.clone());
         let mut changed = false;
         let mut lost: Vec<String> = vec![];
         let mut sessions = state.gmail.lock().await;
         for (email, session) in sessions.iter_mut() {
             let Ok(db) = state.account_db(email) else { continue };
-            match mail::sync::full_sync(&state.http, session, &db, email, false, &on_progress).await {
+            match mail::sync::full_sync(
+                &state.http,
+                session,
+                &db,
+                email,
+                false,
+                mail::sync::SyncPass::Normal,
+                &on_progress,
+            )
+            .await
+            {
                 Ok(c) => changed |= c,
                 Err(e) => {
                     eprintln!("[sync:{email}] {e}");
@@ -1967,7 +2071,20 @@ fn spawn_history_crawl(app: AppHandle) {
             if !ready {
                 continue;
             }
-            match mail::sync::crawl_step(&state.http, &state.gmail, &db, &email).await {
+            // The crawl reports its page as a pass ("17 of 100") — it was
+            // stderr-only before. Repaints stay off: the crawl surfaces old
+            // mail that no open list is showing.
+            let on_progress = {
+                let app = app.clone();
+                let gate = ActivityGate::new();
+                move |tick: mail::sync::SyncTick| {
+                    if gate.allows(&tick) {
+                        emit_sync_activity(&app, tick);
+                    }
+                }
+            };
+            match mail::sync::crawl_step(&state.http, &state.gmail, &db, &email, &on_progress).await
+            {
                 // steady state after the walk finishes: nothing to report
                 Ok(b) if b.done && b.fetched == 0 && b.skipped == 0 && b.failed == 0 => {}
                 Ok(b) => eprintln!(
@@ -2035,10 +2152,7 @@ async fn sync_now(app: AppHandle, state: State<'_, AppState>) -> Result<(), Stri
             store::wake_due_snoozes(&conn, now_ms())?;
         }
     }
-    let on_progress = || {
-        let _ = app.emit("mail:updated", ());
-        emit_sync_progress(&app);
-    };
+    let on_progress = progress_callback(app.clone());
     // Per-account: one failing account no longer aborts the loop and strands
     // every account after it; dead grants classify instead of just erroring.
     let mut first_err: Option<String> = None;
@@ -2046,8 +2160,16 @@ async fn sync_now(app: AppHandle, state: State<'_, AppState>) -> Result<(), Stri
     let mut sessions = state.gmail.lock().await;
     for (email, session) in sessions.iter_mut() {
         let db = state.account_db(email)?;
-        if let Err(e) =
-            mail::sync::full_sync(&state.http, session, &db, email, false, &on_progress).await
+        if let Err(e) = mail::sync::full_sync(
+            &state.http,
+            session,
+            &db,
+            email,
+            false,
+            mail::sync::SyncPass::Normal,
+            &on_progress,
+        )
+        .await
         {
             eprintln!("[sync-now:{email}] {e}");
             if is_grant_dead(&state.http, session, &e).await {
@@ -2085,20 +2207,30 @@ async fn resync_account(app: AppHandle, state: State<'_, AppState>) -> Result<()
         let db = state.account_db(email)?;
         let conn = db.lock().unwrap();
         conn.execute("DELETE FROM kv WHERE key = ?1", [format!("history:{email}")]).ok();
+        // Drop the crawl cursor too. `CrawlCursor.done` is terminal and nothing
+        // else ever cleared it — so Repair Mail re-downloaded the entire
+        // mailbox with the progress footer permanently suppressed, which is
+        // exactly when a user most wants to see it.
+        conn.execute("DELETE FROM kv WHERE key = ?1", [format!("crawl:{email}")]).ok();
         store::reset_history(&conn, email)?;
     }
-    let on_progress = || {
-        let _ = app.emit("mail:updated", ());
-        emit_sync_progress(&app);
-    };
+    let on_progress = progress_callback(app.clone());
     let mut first_err: Option<String> = None;
     let mut lost: Vec<String> = vec![];
     let mut sessions = state.gmail.lock().await;
     for (email, session) in sessions.iter_mut() {
         // force a full reconcile — every thread re-parsed, bodies healed
         let db = state.account_db(email)?;
-        if let Err(e) =
-            mail::sync::full_sync(&state.http, session, &db, email, true, &on_progress).await
+        if let Err(e) = mail::sync::full_sync(
+            &state.http,
+            session,
+            &db,
+            email,
+            true,
+            mail::sync::SyncPass::Resync,
+            &on_progress,
+        )
+        .await
         {
             eprintln!("[resync:{email}] {e}");
             if is_grant_dead(&state.http, session, &e).await {
@@ -2903,16 +3035,27 @@ async fn load_older(
     {
         let mut sessions = state.gmail.lock().await;
         if let Some(session) = sessions.get_mut(&active) {
-            for id in ids {
-                let have = { store::get_thread(&db.lock().unwrap(), &id).is_some() };
-                if have {
-                    continue;
-                }
-                if mail::sync::refetch_thread(&state.http, session, &db, &active, &id)
-                    .await
-                    .is_ok()
+            // Paging older mail is a user-initiated download of a known size —
+            // report it like any other pass so a slow page isn't a dead scroll.
+            let gate = ActivityGate::new();
+            let total = ids.len();
+            for (i, id) in ids.iter().enumerate() {
+                let have = { store::get_thread(&db.lock().unwrap(), id).is_some() };
+                if !have
+                    && mail::sync::refetch_thread(&state.http, session, &db, &active, id)
+                        .await
+                        .is_ok()
                 {
                     added += 1;
+                }
+                let tick = mail::sync::SyncTick {
+                    account: active.clone(),
+                    stage: mail::sync::SyncStage::LoadOlder,
+                    done: i + 1,
+                    total,
+                };
+                if gate.allows(&tick) {
+                    emit_sync_activity(&app, tick);
                 }
             }
         }
@@ -3971,6 +4114,7 @@ pub fn run() {
                 drive_uploads: Mutex::new(HashMap::new()),
                 drive_upload_seq: std::sync::atomic::AtomicU64::new(1),
                 crawl_busy: AtomicBool::new(false),
+                activity: Mutex::new(None),
                 data_dir: data_dir.clone(),
                 embedder: tokio::sync::Mutex::new(embed::Slot::Idle),
             });
@@ -4189,17 +4333,23 @@ pub fn run() {
                 }
                 // One forced reconcile: refreshes the inbox immediately on
                 // launch and sweeps server-side removals missed while closed.
-                let on_progress = || {
-                    let _ = boot.emit("mail:updated", ());
-                    emit_sync_progress(&boot);
-                };
+                let on_progress = progress_callback(boot.clone());
                 let mut changed = false;
                 let mut lost: Vec<String> = vec![];
                 {
                     let mut sessions = state.gmail.lock().await;
                     for (email, session) in sessions.iter_mut() {
                         let Ok(db) = state.account_db(email) else { continue };
-                        match mail::sync::full_sync(&state.http, session, &db, email, true, &on_progress).await
+                        match mail::sync::full_sync(
+                            &state.http,
+                            session,
+                            &db,
+                            email,
+                            true,
+                            mail::sync::SyncPass::Normal,
+                            &on_progress,
+                        )
+                        .await
                         {
                             Ok(c) => changed |= c,
                             // The boot reconcile used to swallow this — a dead
@@ -4272,13 +4422,21 @@ pub fn run() {
                         let force = tick % 20 == 0;
                         // A forced reconcile re-lists the whole inbox — stream it
                         // in (and keep the download bar live) like the boot pass.
-                        let on_progress = || {
-                            let _ = handle.emit("mail:updated", ());
-                            emit_sync_progress(&handle);
-                        };
+                        // The plain incremental tick now reports too: it's the
+                        // common case, and it was completely silent before.
+                        let on_progress = progress_callback(handle.clone());
                         for (email, session) in sessions.iter_mut() {
                             let Ok(db) = state.account_db(email) else { continue };
-                            match mail::sync::full_sync(&state.http, session, &db, email, force, &on_progress).await
+                            match mail::sync::full_sync(
+                                &state.http,
+                                session,
+                                &db,
+                                email,
+                                force,
+                                mail::sync::SyncPass::Normal,
+                                &on_progress,
+                            )
+                            .await
                             {
                                 Ok(c) => changed |= c,
                                 // Errors were silently discarded here — a dead
@@ -4371,6 +4529,7 @@ pub fn run() {
             disconnect_account,
             sync_now,
             resync_account,
+            get_sync_activity,
             list_threads,
             get_thread,
             refetch_message_body,
@@ -4470,6 +4629,55 @@ fn migrate_legacy_db(data_dir: &std::path::Path) {
             }
         }
         return;
+    }
+}
+
+#[cfg(test)]
+mod activity_gate_tests {
+    use super::{ActivityGate, ACTIVITY_MIN_GAP_MS};
+    use crate::mail::sync::{SyncStage, SyncTick};
+
+    fn tick(done: usize, total: usize) -> SyncTick {
+        SyncTick {
+            account: "a@x.test".into(),
+            stage: SyncStage::ReconcileInbox,
+            done,
+            total,
+        }
+    }
+
+    #[test]
+    fn coalesces_mid_pass_ticks() {
+        let gate = ActivityGate::new();
+        // first tick of a pass always lands (last_ms starts at 0)
+        assert!(gate.allows(&tick(1, 500)));
+        // the burst behind it is dropped — a 500-thread reconcile must not
+        // push 500 events at the webview
+        assert!(!gate.allows(&tick(2, 500)));
+        assert!(!gate.allows(&tick(3, 500)));
+    }
+
+    #[test]
+    fn terminal_tick_always_emits() {
+        let gate = ActivityGate::new();
+        assert!(gate.allows(&tick(1, 30)));
+        assert!(!gate.allows(&tick(2, 30)), "mid-pass tick should be coalesced");
+        // Swallowing this one would freeze the pill at "2 of 30" forever with
+        // no completion to fade on — it must pass the gate no matter how
+        // recently we emitted.
+        assert!(gate.allows(&tick(30, 30)));
+    }
+
+    #[test]
+    fn empty_pass_reports_so_a_stale_pill_clears() {
+        let gate = ActivityGate::new();
+        assert!(gate.allows(&tick(0, 0)));
+    }
+
+    #[test]
+    fn gap_is_a_sane_cadence() {
+        // ~4/s: fast enough to read as live, slow enough to be free
+        assert!((100..=500).contains(&(ACTIVITY_MIN_GAP_MS as u64)));
     }
 }
 

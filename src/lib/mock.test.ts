@@ -80,3 +80,63 @@ describe("MockBackend.disconnect", () => {
     expect(state.accounts.map((a) => a.email)).toContain(first);
   });
 });
+
+// The demo has to emit REAL per-item ticks, not one synthetic climb — the pill
+// counts Gmail round-trips, so a fake ramp would demo nothing.
+describe("MockBackend sync:activity", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    vi.useFakeTimers();
+  });
+  afterEach(() => vi.useRealTimers());
+
+  test("syncNow ticks once per thread, 1..30, and ends on the terminal tick", async () => {
+    const be = new MockBackend();
+    const seen: Array<[number, number]> = [];
+    be.onSyncActivity((a) => {
+      if (a.stage === "incremental") seen.push([a.done, a.total]);
+    });
+
+    const pass = be.syncNow();
+    await vi.advanceTimersByTimeAsync(60 * 30 + 10);
+    await pass;
+
+    expect(seen).toHaveLength(30);
+    expect(seen[0]).toEqual([1, 30]);
+    expect(seen[16]).toEqual([17, 30]); // "Downloading 17 of 30…"
+    expect(seen[29]).toEqual([30, 30]);
+    // strictly monotonic — a pill that jumped backwards would read as two
+    // interleaved passes
+    expect(seen.every(([done], i) => done === i + 1)).toBe(true);
+  });
+
+  test("getSyncActivity serves the in-flight pass, then clears when it ends", async () => {
+    const be = new MockBackend();
+    expect(await be.getSyncActivity()).toBeNull();
+
+    const pass = be.syncNow();
+    await vi.advanceTimersByTimeAsync(60 * 3);
+    const mid = await be.getSyncActivity();
+    expect(mid?.stage).toBe("incremental");
+    expect(mid?.done).toBe(3);
+    expect(mid?.total).toBe(30);
+
+    await vi.advanceTimersByTimeAsync(60 * 30);
+    await pass;
+    // a finished pass must not keep reporting itself to late subscribers
+    expect(await be.getSyncActivity()).toBeNull();
+  });
+
+  test("resyncAccount reports a repair pass over the account's threads", async () => {
+    const be = new MockBackend();
+    const stages: string[] = [];
+    be.onSyncActivity((a) => stages.push(a.stage));
+
+    const pass = be.resyncAccount();
+    await vi.advanceTimersByTimeAsync(60 * 200);
+    await pass;
+
+    expect(stages.length).toBeGreaterThan(0);
+    expect(new Set(stages)).toEqual(new Set(["resync"]));
+  });
+});

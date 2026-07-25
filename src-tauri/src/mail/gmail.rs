@@ -78,6 +78,31 @@ impl GmailSession {
         Ok(out)
     }
 
+    /// Threads in the labels sync deliberately never downloads (SPAM, TRASH,
+    /// DRAFT), summed. `profile.threadsTotal` counts the whole mailbox, so
+    /// subtracting this gives a denominator over the SAME population the crawl
+    /// walks and the local thread count measures — without it the download
+    /// percentage asymptotes below 100 forever.
+    ///
+    /// `labels.list` carries no counts (only `labels.get` does), hence three
+    /// small round-trips. Best-effort: a label that fails to read contributes 0,
+    /// which can only make the bar conservative, never wrong past 100%.
+    pub async fn excluded_thread_totals(&mut self, http: &reqwest::Client) -> i64 {
+        let mut sum = 0i64;
+        for id in ["SPAM", "TRASH", "DRAFT"] {
+            match self.get_json(http, &format!("{BASE}/labels/{id}")).await {
+                Ok(v) => {
+                    sum += v["threadsTotal"]
+                        .as_i64()
+                        .or_else(|| v["threadsTotal"].as_str().and_then(|s| s.parse().ok()))
+                        .unwrap_or(0);
+                }
+                Err(e) => eprintln!("[gmail] label {id} totals unavailable: {e}"),
+            }
+        }
+        sum
+    }
+
     /// Resolve a label name to its Gmail id, creating the label if needed.
     /// System labels (INBOX, UNREAD, STARRED, IMPORTANT) are their own ids.
     pub async fn ensure_label_id(

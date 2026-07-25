@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { backend, isTauri } from "@/lib/ipc";
+import { SyncActivityPill } from "@/components/SyncActivityPill";
 import { useMail } from "@/stores/mail";
 import { useSettings } from "@/stores/settings";
 
@@ -131,6 +132,14 @@ export function Onboarding() {
                 leaves your computer.
               </p>
             )}
+            {/* connect() awaits syncNow() — the first reconcile of the whole
+                mailbox, and the single biggest download the app ever does. It
+                used to run behind nothing but a static "Waiting for your
+                browser…". No account prop: there is no switcher yet, so follow
+                whatever pass is running. */}
+            <div className="mt-5">
+              <SyncActivityPill inline />
+            </div>
             {msg && <p className="mt-3 text-[12.5px] text-bad">{msg}</p>}
           </div>
         )}

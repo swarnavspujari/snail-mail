@@ -31,6 +31,7 @@ import type {
   SendAsAlias,
   Settings,
   Streaks,
+  SyncActivity,
   SyncProgress,
   Thread,
   ThreadId,
@@ -227,6 +228,14 @@ export interface Backend {
   /** Fires as background mail history downloads (initial reconcile + crawl).
    *  Drives the "Downloading mail history… N%" indicator. Returns unsubscribe. */
   onSyncProgress(cb: (p: SyncProgress) => void): () => void;
+  /** Fires per beat while the Gmail API is actively being hit, coalesced to
+   *  ~4/s in the core. Drives the transient "Downloading 17 of 30…" pill.
+   *  Subscribe from a LEAF component — this fires far more often than
+   *  sync:progress, which already re-renders the whole App tree per event. */
+  onSyncActivity(cb: (a: SyncActivity) => void): () => void;
+  /** The in-flight download pass, or null. Pull once on mount so a late
+   *  subscriber (onboarding, a reopened window) can't miss a running pass. */
+  getSyncActivity(): Promise<SyncActivity | null>;
   /** Fires when a calendar refresh lands (payload = error message or null). */
   onCalendarUpdated(cb: (error: string | null) => void): () => void;
   /** Fires when an opened thread's inline images finish resolving (threadId). */
@@ -575,6 +584,15 @@ class TauriBackend implements Backend {
     return () => {
       void un.then((f) => f());
     };
+  }
+  onSyncActivity(cb: (a: SyncActivity) => void): () => void {
+    const un = listen<SyncActivity>("sync:activity", (e) => cb(e.payload));
+    return () => {
+      void un.then((f) => f());
+    };
+  }
+  getSyncActivity() {
+    return invoke<SyncActivity | null>("get_sync_activity");
   }
   onCalendarUpdated(cb: (error: string | null) => void): () => void {
     const un = listen<string | null>("calendar:updated", (e) => cb(e.payload));

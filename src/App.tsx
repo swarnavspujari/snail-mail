@@ -14,6 +14,7 @@ import { NavRail } from "@/components/NavRail";
 import { RestState } from "@/components/RestState";
 import { UndoToast } from "@/components/UndoToast";
 import { UndoSendBar } from "@/components/UndoSendBar";
+import { SyncActivityPill } from "@/components/SyncActivityPill";
 import { MailScreen } from "@/features/inbox/MailScreen";
 import { CalendarPanel } from "@/features/calendar/CalendarPanel";
 import { CalendarWeek } from "@/features/calendar/CalendarWeek";
@@ -103,12 +104,14 @@ export default function App() {
   const showShortcutBar = useSettings((s) => s.settings.showShortcutBar);
 
   // Show the download strip only while history is actively downloading (total
-  // known, crawl not done). Clamp to 1–99% so it never reads "0%" or lingers at
-  // "100%" — `done` hides it outright.
+  // known, crawl not done). The ceiling is a real 100 now: the numerator counts
+  // only non-hidden threads and the denominator subtracts spam/trash/drafts, so
+  // both describe the crawl's population and the bar can actually reach the top.
+  // It used to be clamped to 99 to hide the mismatched-population asymptote.
   const downloading =
     !!syncProgress && !syncProgress.done && syncProgress.total > 0;
   const downloadPct = downloading
-    ? Math.min(99, Math.max(1, Math.round((syncProgress.indexed / syncProgress.total) * 100)))
+    ? Math.min(100, Math.max(1, Math.round((syncProgress.indexed / syncProgress.total) * 100)))
     : 0;
   // One-time storage split after the per-account-files update: same strip
   // treatment, cleared by the final `table === "done"` payload.
@@ -490,6 +493,17 @@ export default function App() {
       )}
       {shortcutsOpen && <ShortcutsPanel />}
       </div>
+
+      {/* Live "Downloading 17 of 30…" counter. Anchored beside the footer strip
+          but rendered OUTSIDE its gate — the footer only exists when the
+          shortcut bar, the crawl bar, or a migration is showing, and the pill's
+          whole point is the passes that have no bar (the 30s incremental tick,
+          sync_now, load-older). Scoped to the active account so two concurrent
+          syncs can't fight over one count. */}
+      <SyncActivityPill
+        account={accounts.active}
+        bottomOffset={footerVisible ? 38 : 12}
+      />
 
       {footerVisible && (
         <footer
