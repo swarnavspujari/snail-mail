@@ -356,4 +356,186 @@ mod tests {
         drop(conn);
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    fn test_mail(subject: &str) -> crate::types::OutgoingMail {
+        crate::types::OutgoingMail {
+            thread_id: None,
+            to: vec!["x@y.test".into()],
+            cc: vec![],
+            bcc: vec![],
+            subject: subject.into(),
+            body_text: "b".into(),
+            body_html: None,
+            reply_all: false,
+            attachments: vec![],
+        }
+    }
+
+    fn draft_payload(reg: &DbRegistry, account: &str, id: i64) -> Option<String> {
+        let db = reg.account(account).unwrap();
+        let conn = db.lock().unwrap();
+        conn.query_row(
+            "SELECT payload FROM drafts WHERE id = ?1 AND account_id = ?2",
+            rusqlite::params![id, account],
+            |r| r.get(0),
+        )
+        .ok()
+    }
+
+    fn outbox_subject(reg: &DbRegistry, account: &str, id: i64) -> Option<String> {
+        let db = reg.account(account).unwrap();
+        let conn = db.lock().unwrap();
+        crate::store::outbox_get(&conn, id, account).map(|m| m.subject)
+    }
+
+    /// `drafts.id` / `outbox.id` are per-file AUTOINCREMENT, so id 1 in account
+    /// A and id 1 in account B are different rows with the same name. The old
+    /// commands resolved a bare id by probing account connections active-first,
+    /// so whichever account happened to be active shadowed the real owner —
+    /// deleting or sending a draft acted on the wrong mailbox. Identity is the
+    /// pair (id, account) now; pin that every mutator honors it.
+    #[test]
+    fn colliding_draft_ids_resolve_to_the_owning_account() {
+        let dir = tmp_dir("draftcollide");
+        let reg = DbRegistry::open(&dir).unwrap();
+
+        let id_a = {
+            let db = reg.account("a@x.test").unwrap();
+            let conn = db.lock().unwrap();
+            crate::store::draft_insert(&conn, "a@x.test", "draft-A", 1_000).unwrap()
+        };
+        let id_b = {
+            let db = reg.account("b@x.test").unwrap();
+            let conn = db.lock().unwrap();
+            crate::store::draft_insert(&conn, "b@x.test", "draft-B", 1_000).unwrap()
+        };
+        assert_eq!((id_a, id_b), (1, 1), "the id collision this test is about");
+
+        // deleting B's draft leaves A's identically-numbered row alone
+        {
+            let db = reg.account("b@x.test").unwrap();
+            let conn = db.lock().unwrap();
+            crate::store::draft_delete(&conn, id_b, "b@x.test");
+        }
+        assert_eq!(draft_payload(&reg, "a@x.test", id_a).as_deref(), Some("draft-A"));
+        assert_eq!(draft_payload(&reg, "b@x.test", id_b), None, "B's row is the one that goes");
+
+        // an update addressed to the wrong owner must miss rather than clobber
+        {
+            let db = reg.account("a@x.test").unwrap();
+            let conn = db.lock().unwrap();
+            assert!(
+                !crate::store::draft_update(&conn, id_a, "b@x.test", "clobbered", 2_000),
+                "an id owned by A must not be writable as B"
+            );
+            assert!(crate::store::draft_update(&conn, id_a, "a@x.test", "draft-A2", 2_000));
+        }
+        assert_eq!(draft_payload(&reg, "a@x.test", id_a).as_deref(), Some("draft-A2"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn colliding_outbox_ids_send_and_cancel_the_owning_accounts_row() {
+        let dir = tmp_dir("outboxcollide");
+        let reg = DbRegistry::open(&dir).unwrap();
+
+        let id_a = {
+            let db = reg.account("a@x.test").unwrap();
+            let conn = db.lock().unwrap();
+            crate::store::outbox_add(&conn, "a@x.test", &test_mail("for-A"), 0).unwrap()
+        };
+        let id_b = {
+            let db = reg.account("b@x.test").unwrap();
+            let conn = db.lock().unwrap();
+            crate::store::outbox_add(&conn, "b@x.test", &test_mail("for-B"), 0).unwrap()
+        };
+        assert_eq!((id_a, id_b), (1, 1), "the id collision this test is about");
+
+        // send (claim → read → delete) B's row: A's identically-numbered row
+        // must stay queued and unclaimed
+        {
+            let db = reg.account("b@x.test").unwrap();
+            let conn = db.lock().unwrap();
+            assert!(crate::store::outbox_claim(&conn, id_b, "b@x.test"));
+            assert_eq!(
+                crate::store::outbox_get(&conn, id_b, "b@x.test").map(|m| m.subject),
+                Some("for-B".to_string()),
+                "send must read the owner's payload, not a same-id neighbour's"
+            );
+            crate::store::outbox_delete(&conn, id_b, "b@x.test");
+        }
+        assert_eq!(outbox_subject(&reg, "a@x.test", id_a).as_deref(), Some("for-A"));
+        assert_eq!(outbox_subject(&reg, "b@x.test", id_b), None, "B's row is the one that sent");
+        {
+            let db = reg.account("a@x.test").unwrap();
+            let conn = db.lock().unwrap();
+            assert_eq!(crate::store::outbox_due(&conn, 1).len(), 1, "A's send is still pending");
+        }
+
+        // cancel (Undo Send) addressed to the wrong owner is a no-op
+        {
+            let db = reg.account("a@x.test").unwrap();
+            let conn = db.lock().unwrap();
+            assert!(crate::store::outbox_cancel(&conn, id_a, "b@x.test").is_none());
+            assert_eq!(
+                crate::store::outbox_cancel(&conn, id_a, "a@x.test").map(|m| m.subject),
+                Some("for-A".to_string())
+            );
+        }
+        assert_eq!(outbox_subject(&reg, "a@x.test", id_a), None, "cancel removed A's row");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Mid-migration both accounts share the legacy file, so picking "the right
+    /// connection" resolves nothing on its own — `account_id` has to be in the
+    /// WHERE clause. Ids can't collide inside one file, but a bare-id mutator
+    /// still reaches straight across accounts, which is the same bug.
+    #[test]
+    fn shared_legacy_db_scopes_mutations_by_account() {
+        let dir = tmp_dir("legacyscope");
+        {
+            let legacy = crate::store::open(&dir.join("fission.db")).unwrap();
+            let acc = crate::types::AccountsState {
+                accounts: vec![
+                    crate::types::AccountInfo {
+                        email: "a@x.test".into(),
+                        provider: "gmail".into(),
+                        connected: true,
+                        removing: false,
+                    },
+                    crate::types::AccountInfo {
+                        email: "b@x.test".into(),
+                        provider: "gmail".into(),
+                        connected: true,
+                        removing: false,
+                    },
+                ],
+                active: "a@x.test".into(),
+            };
+            crate::store::save_accounts(&legacy, &acc).unwrap();
+        }
+        let reg = DbRegistry::open(&dir).unwrap();
+        let a = reg.account("a@x.test").unwrap();
+        let b = reg.account("b@x.test").unwrap();
+        assert!(Arc::ptr_eq(&a, &b), "unmigrated accounts share the legacy conn");
+
+        let conn = a.lock().unwrap();
+        let draft_b = crate::store::draft_insert(&conn, "b@x.test", "draft-B", 1_000).unwrap();
+        let out_b = crate::store::outbox_add(&conn, "b@x.test", &test_mail("for-B"), 0).unwrap();
+
+        // A is active; acting on B's ids as A must not reach B's rows
+        crate::store::draft_delete(&conn, draft_b, "a@x.test");
+        assert!(!crate::store::outbox_claim(&conn, out_b, "a@x.test"));
+        assert!(crate::store::outbox_cancel(&conn, out_b, "a@x.test").is_none());
+        crate::store::outbox_delete(&conn, out_b, "a@x.test");
+
+        assert_eq!(crate::store::draft_list(&conn, "b@x.test").len(), 1, "B's draft survived");
+        assert_eq!(
+            crate::store::outbox_get(&conn, out_b, "b@x.test").map(|m| m.subject),
+            Some("for-B".to_string()),
+            "B's queued send survived"
+        );
+        drop(conn);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
