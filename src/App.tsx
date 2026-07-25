@@ -154,7 +154,11 @@ export default function App() {
     listView === "inbox" &&
     mailLoaded &&
     splitThreads(inboxThreads, activeSplitId).length === 0;
-  const footerVisible = showShortcutBar || downloading || migrating;
+  // Settings carries its own footer strip (the receipt + that pane's keys), so
+  // the triage hint bar stands down there — "Hit E Mark Done" is a lie on the
+  // settings screen. The sync/migration strips are global and stay.
+  const hintsVisible = showShortcutBar && screen !== "settings";
+  const footerVisible = hintsVisible || downloading || migrating;
 
   // The attribute must flip BEFORE React re-renders: QuoteFrame (compose)
   // bakes the current token values into its iframe srcDoc during render, and
@@ -536,7 +540,7 @@ export default function App() {
               Downloading mail history… {downloadPct}%
             </span>
           )}
-          {showShortcutBar && (
+          {hintsVisible && (
             <div className="flex min-w-0 flex-1 items-center justify-center gap-4 overflow-hidden">
               <span className="flex shrink-0 items-center gap-1.5 whitespace-nowrap">
                 Hit <span className="kbd">E</span> Mark Done

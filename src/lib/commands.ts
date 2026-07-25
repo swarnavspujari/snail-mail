@@ -23,6 +23,13 @@ export interface Command {
   title: string;
   /** Section header in the palette. */
   group: string;
+  /** Where this command's key is live, as a short label ("in thread",
+   *  "compose", …). Declarative twin of `when`: the keyboard engine resolves
+   *  overlaps with `when` + registration order, and the shortcuts editor uses
+   *  this to tell a legitimate context-shared key ("↓" is three commands)
+   *  apart from a real conflict (two global commands on the same key).
+   *  Absent = the key is live everywhere the engine allows. */
+  context?: string;
   /** Extra search terms (space-separated) the palette matches besides the
    *  title — e.g. "dark mode light mode" for the theme command. */
   keywords?: string;
@@ -474,6 +481,7 @@ export function allCommands(): Command[] {
       id: "thread.focusNext",
       title: "Next Message in Thread",
       group: "Navigate",
+      context: "multi-message",
       hidden: true,
       when: () => inThread() && mail().openMessages.length > 1,
       run: () =>
@@ -485,6 +493,7 @@ export function allCommands(): Command[] {
       id: "thread.focusPrev",
       title: "Previous Message in Thread",
       group: "Navigate",
+      context: "multi-message",
       hidden: true,
       when: () => inThread() && mail().openMessages.length > 1,
       run: () =>
@@ -496,6 +505,7 @@ export function allCommands(): Command[] {
       id: "thread.focusEnter",
       title: "Open / Reply to Focused Message",
       group: "Navigate",
+      context: "multi-message",
       hidden: true,
       when: () => inThread() && mail().openMessages.length > 1,
       run: () => window.dispatchEvent(new CustomEvent("fission:thread-enter")),
@@ -606,6 +616,7 @@ export function allCommands(): Command[] {
       id: "thread.cycleSuggestion",
       title: "Preview Next Instant Reply",
       group: "AI",
+      context: "in thread",
       hidden: true,
       when: () => inThread() && ui().suggestions.length > 0,
       run: () => ui().cycleSuggestion(),
@@ -618,6 +629,7 @@ export function allCommands(): Command[] {
       id: "thread.scrollDown",
       title: "Scroll Message Down",
       group: "Navigate",
+      context: "in thread",
       hidden: true,
       when: () => inThread(),
       run: () => scrollReader(0.9),
@@ -626,6 +638,7 @@ export function allCommands(): Command[] {
       id: "reader.pageUp",
       title: "Scroll Message Up",
       group: "Navigate",
+      context: "in thread",
       hidden: true,
       when: () => inThread(),
       run: () => scrollReader(-0.9),
@@ -634,6 +647,7 @@ export function allCommands(): Command[] {
       id: "reader.lineDown",
       title: "Scroll Message Down a Little",
       group: "Navigate",
+      context: "in thread",
       hidden: true,
       when: () => inThread(),
       run: () => scrollReader(0.3),
@@ -642,6 +656,7 @@ export function allCommands(): Command[] {
       id: "reader.lineUp",
       title: "Scroll Message Up a Little",
       group: "Navigate",
+      context: "in thread",
       hidden: true,
       when: () => inThread(),
       run: () => scrollReader(-0.3),
@@ -650,6 +665,7 @@ export function allCommands(): Command[] {
       id: "list.cursorDown",
       title: "Move Cursor Down",
       group: "Navigate",
+      context: "in list",
       hidden: true,
       when: () => inList(),
       run: () => mail().moveSelection(1),
@@ -658,6 +674,7 @@ export function allCommands(): Command[] {
       id: "list.cursorUp",
       title: "Move Cursor Up",
       group: "Navigate",
+      context: "in list",
       hidden: true,
       when: () => inList(),
       run: () => mail().moveSelection(-1),
@@ -741,6 +758,7 @@ export function allCommands(): Command[] {
       id: "list.selectAll",
       title: "Select All From Here Down",
       group: "Triage",
+      context: "in list",
       when: () => inList(),
       run: () => {
         mail().selectFromCursorDown();
@@ -752,6 +770,7 @@ export function allCommands(): Command[] {
       id: "list.toggleSelect",
       title: "Select / Deselect Conversation",
       group: "Triage",
+      context: "in list",
       hidden: true,
       when: () => inList(),
       run: () => {
@@ -763,6 +782,7 @@ export function allCommands(): Command[] {
       id: "compose.ai",
       title: "Write with AI",
       group: "AI",
+      context: "compose",
       when: () => inCompose(),
       run: () => ui().setAiBarOpen(!ui().aiBarOpen),
     },
@@ -770,6 +790,7 @@ export function allCommands(): Command[] {
       id: "compose.send",
       title: "Send",
       group: "Compose",
+      context: "compose",
       hidden: true,
       when: () => inCompose(),
       run: () => {
@@ -782,6 +803,7 @@ export function allCommands(): Command[] {
       id: "compose.sendDone",
       title: "Send & Mark Done",
       group: "Compose",
+      context: "compose",
       hidden: true,
       when: () => inCompose(),
       run: () => {
@@ -794,6 +816,7 @@ export function allCommands(): Command[] {
       id: "compose.sendLater",
       title: "Send Later…",
       group: "Compose",
+      context: "compose",
       when: () => inCompose(),
       run: () => ui().openPicker("sendLater"),
     },
@@ -801,6 +824,7 @@ export function allCommands(): Command[] {
       id: "compose.snippet",
       title: "Insert Snippet…",
       group: "Compose",
+      context: "compose",
       when: () => inCompose(),
       run: () => ui().openPicker("snippet"),
     },
@@ -808,6 +832,7 @@ export function allCommands(): Command[] {
       id: "compose.attachDrive",
       title: "Attach from Google Drive…",
       group: "Compose",
+      context: "compose",
       when: () => inCompose(),
       run: () => ui().openPicker("drivePicker"),
     },
@@ -817,6 +842,7 @@ export function allCommands(): Command[] {
       id: "compose.discard",
       title: "Discard Draft",
       group: "Compose",
+      context: "compose",
       when: () => inCompose(),
       run: () => {
         const c = ui().compose;
@@ -833,6 +859,7 @@ export function allCommands(): Command[] {
       id: "compose.prevEmail",
       title: "New Message: Previous Email",
       group: "Compose",
+      context: "compose",
       hidden: true,
       when: () => ui().compose?.mode === "new",
       run: () => composeGoToEmail(-1),
@@ -841,6 +868,7 @@ export function allCommands(): Command[] {
       id: "compose.nextEmail",
       title: "New Message: Next Email",
       group: "Compose",
+      context: "compose",
       hidden: true,
       when: () => ui().compose?.mode === "new",
       run: () => composeGoToEmail(1),
@@ -878,6 +906,7 @@ export function allCommands(): Command[] {
       id: "compose.expandTo",
       title: "Reply: Edit To",
       group: "Compose",
+      context: "compose",
       hidden: true,
       when: () => inCompose(),
       run: () => focusComposeField("to"),
@@ -886,6 +915,7 @@ export function allCommands(): Command[] {
       id: "compose.expandCc",
       title: "Reply: Add Cc",
       group: "Compose",
+      context: "compose",
       hidden: true,
       when: () => inCompose(),
       run: () => focusComposeField("cc"),
@@ -894,6 +924,7 @@ export function allCommands(): Command[] {
       id: "compose.expandBcc",
       title: "Reply: Add Bcc",
       group: "Compose",
+      context: "compose",
       hidden: true,
       when: () => inCompose(),
       run: () => focusComposeField("bcc"),
@@ -902,6 +933,7 @@ export function allCommands(): Command[] {
       id: "compose.expandSubject",
       title: "Reply: Edit Subject",
       group: "Compose",
+      context: "compose",
       hidden: true,
       when: () => inCompose(),
       run: () => focusComposeField("subject"),
@@ -947,6 +979,7 @@ export function allCommands(): Command[] {
       id: "calendar.prevDay",
       title: "Calendar: Previous Day",
       group: "Navigate",
+      context: "calendar",
       hidden: true,
       when: () => calendarFocused(),
       run: () => useCalendar.getState().shiftDay(-1),
@@ -955,6 +988,7 @@ export function allCommands(): Command[] {
       id: "calendar.nextDay",
       title: "Calendar: Next Day",
       group: "Navigate",
+      context: "calendar",
       hidden: true,
       when: () => calendarFocused(),
       run: () => useCalendar.getState().shiftDay(1),
@@ -971,6 +1005,7 @@ export function allCommands(): Command[] {
       id: "calendar.newEvent",
       title: "New Calendar Event",
       group: "Navigate",
+      context: "calendar",
       when: () => !inCompose(),
       run: () => {
         const cal = useCalendar.getState();
