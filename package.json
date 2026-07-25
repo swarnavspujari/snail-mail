@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
+    "dev:desktop": "vite --mode desktop",
+    "build:desktop": "tsc --noEmit && vite build --mode desktop",
     "preview": "vite preview",
     "tauri": "tauri",
     "app:dev": "tauri dev",
