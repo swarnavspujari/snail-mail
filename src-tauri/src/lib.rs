@@ -504,7 +504,10 @@ async fn finish_removal(app: AppHandle, email: String) {
     if accounts.accounts.iter().all(|a| a.provider != "gmail") {
         secrets::delete(secrets::GMAIL_REFRESH_TOKEN_LEGACY);
     }
-    // 7. Demo fallback: seed each demo account's fixtures into its own file.
+    // 7. Removing the last account leaves zero accounts, full stop. This used
+    //    to re-seed the demo pair — which is exactly why a disconnect could
+    //    never actually empty the app.
+    #[cfg(feature = "demo-fixtures")]
     if accounts.accounts.iter().all(|a| a.provider == "mock") {
         for a in &accounts.accounts {
             if let Ok(db) = state.account_db(&a.email) {
@@ -647,10 +650,16 @@ async fn list_events(
     }
     let active = { store::active_account(&state.global().lock().unwrap()) };
     if active.provider != "gmail" {
-        let mut events = mail::mock::demo_events(start_ms, end_ms);
-        // the RSVP overlay is app-wide demo state, so it lives in global.db
-        apply_demo_rsvps(&state.global().lock().unwrap(), &mut events);
-        return Ok(events);
+        #[cfg(feature = "demo-fixtures")]
+        {
+            let mut events = mail::mock::demo_events(start_ms, end_ms);
+            // the RSVP overlay is app-wide demo state, so it lives in global.db
+            apply_demo_rsvps(&state.global().lock().unwrap(), &mut events);
+            return Ok(events);
+        }
+        // No account, no calendar. An empty week is the honest answer.
+        #[cfg(not(feature = "demo-fixtures"))]
+        return Ok(vec![]);
     }
     let db = state.account_db(&active.email)?;
     let conn = db.lock().unwrap();
@@ -658,8 +667,9 @@ async fn list_events(
 }
 
 /// Demo mode synthesizes events on read, so RSVPs record into a kv overlay
-/// (uid → response) that this re-applies — the desktop demo's RSVP bar and
-/// popover stay coherent without a real backend.
+/// (uid → response) that this re-applies — the demo's RSVP bar and popover
+/// stay coherent without a real backend.
+#[cfg(feature = "demo-fixtures")]
 fn apply_demo_rsvps(conn: &rusqlite::Connection, events: &mut [CalendarEvent]) {
     let overlay: std::collections::HashMap<String, String> =
         store::get_json(conn, "demo_rsvp").unwrap_or_default();
@@ -1175,6 +1185,10 @@ async fn rsvp_event(
     // never be routed into the fixture overlay.
     let is_demo = { store::active_account(&state.global().lock().unwrap()).provider != "gmail" };
     if is_demo {
+        #[cfg(not(feature = "demo-fixtures"))]
+        return Err("Connect an account to RSVP.".into());
+        #[cfg(feature = "demo-fixtures")]
+        {
         let uid = format!("{event_id}@fission.local");
         let mut ev = mail::mock::demo_event_by_uid(&uid).ok_or("event not found")?;
         if !ev.attendees.iter().any(|a| a.self_) {
@@ -1196,6 +1210,7 @@ async fn rsvp_event(
         }
         let _ = app.emit("calendar:updated", Option::<String>::None);
         return Ok(ev);
+        }
     }
     let email = active_gmail_cal(&state)?;
     let (bearer, cal) = resolve_calendar(&state, &email, &calendar_id).await?;
@@ -1300,10 +1315,17 @@ async fn thread_invite(
     } else if is_gmail {
         resolve_invite_event(&state, &account, &parsed.uid).await
     } else {
-        mail::mock::demo_event_by_uid(&parsed.uid).map(|mut ev| {
-            apply_demo_rsvps(&state.global().lock().unwrap(), std::slice::from_mut(&mut ev));
-            ev
-        })
+        #[cfg(feature = "demo-fixtures")]
+        {
+            mail::mock::demo_event_by_uid(&parsed.uid).map(|mut ev| {
+                apply_demo_rsvps(&state.global().lock().unwrap(), std::slice::from_mut(&mut ev));
+                ev
+            })
+        }
+        // Not a gmail account and no fixtures: the invite strip still renders
+        // from the parsed .ics, there is just no live event behind it.
+        #[cfg(not(feature = "demo-fixtures"))]
+        None
     };
     Ok(Some(ThreadInvite {
         method: parsed.method,
@@ -2931,7 +2953,14 @@ async fn search_all(
     let qvec: Option<Vec<f32>> = if plan.terms.is_empty() {
         None
     } else if !is_gmail {
-        mail::mock::demo_embed(&plan.terms.join(" "))
+        #[cfg(feature = "demo-fixtures")]
+        {
+            mail::mock::demo_embed(&plan.terms.join(" "))
+        }
+        // No fixtures, no toy embedder — search stays lexical, as it already
+        // does whenever the embedder is unavailable.
+        #[cfg(not(feature = "demo-fixtures"))]
+        None
     } else {
         query_vector(&state, &plan.terms.join(" ")).await
     };
@@ -4011,6 +4040,44 @@ pub fn run() {
             // account reads until the backgrounded split migration verifies.
             let dbs = store::registry::DbRegistry::open(&data_dir).map_err(std::io::Error::other)?;
 
+            // One-shot: strip demo data that pre-cut builds seeded into this
+            // user's real databases. Must run BEFORE the registry is read, so
+            // the rest of boot never sees the demo pair. Flag-guarded, because
+            // a real account that happens to look like a fixture must not be
+            // re-examined on every launch.
+            {
+                let gdb = dbs.global();
+                let purge_needed = {
+                    let conn = gdb.lock().unwrap();
+                    !store::demo_purge::already_purged(&conn)
+                };
+                if purge_needed {
+                    // Narrow lock scopes: close_and_delete takes the registry's
+                    // own lock, so the global guard must be released first.
+                    let removed = {
+                        let conn = gdb.lock().unwrap();
+                        let _ = store::demo_purge::sweep_demo_kv(&conn);
+                        store::demo_purge::purge_registry(&conn).unwrap_or_default()
+                    };
+                    for email in &removed {
+                        if let Err(e) = dbs.close_and_delete(email) {
+                            eprintln!("[demo-purge] {email}: {e}");
+                        }
+                    }
+                    // Pre-split installs kept every account's mail in one file.
+                    if let Some(legacy) = dbs.legacy() {
+                        let conn = legacy.lock().unwrap();
+                        match store::demo_purge::sweep_demo_rows(&conn) {
+                            Ok(n) if n > 0 => eprintln!("[demo-purge] legacy db: {n} threads"),
+                            Err(e) => eprintln!("[demo-purge] legacy db: {e}"),
+                            _ => {}
+                        }
+                    }
+                    let conn = gdb.lock().unwrap();
+                    let _ = store::demo_purge::mark_purged(&conn);
+                }
+            }
+
             let accounts = { store::get_accounts(&dbs.global().lock().unwrap()) };
             let mut sessions = HashMap::new();
             let mut lost_accounts = vec![];
@@ -4042,8 +4109,10 @@ pub fn run() {
             // Demo fixtures: each mock account seeds into its own file
             // (re-read — the lost-token path may have fallen back to the
             // demo pair). Idempotent per account; heal + stand-in vectors
-            // cover demo dbs from older builds.
+            // cover demo dbs from older builds. Shipped builds seed nothing:
+            // a fresh install has no accounts and shows the connect screen.
             let accounts = { store::get_accounts(&dbs.global().lock().unwrap()) };
+            #[cfg(feature = "demo-fixtures")]
             for a in &accounts.accounts {
                 if a.provider == "gmail" {
                     continue;

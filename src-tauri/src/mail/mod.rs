@@ -2,6 +2,9 @@ pub mod calendar;
 pub mod drive;
 pub mod gmail;
 pub mod ics;
+/// Demo fixtures. Compiled only with the `demo-fixtures` feature — shipped
+/// desktop builds contain no fake mail, accounts or events.
+#[cfg(feature = "demo-fixtures")]
 pub mod mock;
 pub mod oauth;
 pub mod people;

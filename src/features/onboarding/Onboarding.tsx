@@ -107,8 +107,10 @@ export function Onboarding() {
             </h1>
             <p className="mx-auto mt-3 max-w-[400px] text-[14px] leading-relaxed text-ink-2">
               Keyboard-first triage, split inboxes, and AI drafting — all local,
-              on your machine. Connect Gmail to begin, or look around with the
-              demo inbox first.
+              on your machine.{" "}
+              {isTauri
+                ? "Connect Gmail to begin."
+                : "Connect Gmail to begin, or look around with the demo inbox first."}
             </p>
             <div className="mt-8 flex items-center justify-center gap-3">
               {isTauri ? (
@@ -120,9 +122,13 @@ export function Onboarding() {
                   Connecting Gmail needs the desktop app — this is the browser demo.
                 </span>
               )}
-              <button className={ghostBtn} onClick={next}>
-                Explore the demo first
-              </button>
+              {/* Browser demo only — the desktop app ships no demo data, so
+                  there is nowhere for this button to lead. */}
+              {!isTauri && (
+                <button className={ghostBtn} onClick={next}>
+                  Explore the demo first
+                </button>
+              )}
             </div>
             {isTauri && (
               <p className="mt-4 text-[12px] leading-relaxed text-ink-3">

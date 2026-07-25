@@ -44,6 +44,14 @@ pdf-extract = "0.7"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 harper-core = { version = "2.5.0", features = ["concurrent"] }
 
+# Demo fixtures: the fake account pair, seeded mail, synthesized calendar
+# events and the toy concept embedder. Default OFF — shipped builds must
+# contain none of it, and with the feature off the fixture module is not even
+# compiled. Enable only to exercise the fixture tests:
+#     cargo test --features demo-fixtures
+[features]
+demo-fixtures = []
+
 [profile.release]
 strip = true
 lto = true

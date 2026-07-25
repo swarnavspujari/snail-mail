@@ -39,7 +39,10 @@ import type {
   UnsubResult,
   ZeroEvent,
 } from "./types";
-import { MockBackend } from "./mock";
+// Build-time split: this specifier is aliased to demo-backend.desktop.ts by
+// `vite --mode desktop`, so the mock never enters the shipped bundle. Must stay
+// exactly "@/lib/demo-backend" — the alias matches that string.
+import { createDemoBackend } from "@/lib/demo-backend";
 
 export type MailView =
   | "inbox"
@@ -710,5 +713,5 @@ function instrument(real: Backend): Backend {
 }
 
 export const backend: Backend = instrument(
-  isTauri ? new TauriBackend() : new MockBackend()
+  isTauri ? new TauriBackend() : createDemoBackend()
 );

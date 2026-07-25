@@ -1,6 +1,7 @@
 //! SQLite persistence: threads/messages/attachments, JSON settings blobs,
 //! an FTS5 index for instant full-text search, and a sqlite-vec table for
 //! semantic (vector) search.
+pub mod demo_purge;
 pub mod migrate;
 pub mod registry;
 pub mod vec;
@@ -312,22 +313,31 @@ pub fn get_accounts(conn: &Connection) -> AccountsState {
             return state;
         }
     }
-    AccountsState {
-        accounts: vec![
-            AccountInfo {
-                email: DEMO_ACCOUNT.into(),
-                provider: "mock".into(),
-                connected: true,
-                removing: false,
-            },
-            AccountInfo {
-                email: DEMO_ACCOUNT_2.into(),
-                provider: "mock".into(),
-                connected: true,
-                removing: false,
-            },
-        ],
-        active: DEMO_ACCOUNT.into(),
+    #[cfg(feature = "demo-fixtures")]
+    {
+        AccountsState {
+            accounts: vec![
+                AccountInfo {
+                    email: DEMO_ACCOUNT.into(),
+                    provider: "mock".into(),
+                    connected: true,
+                    removing: false,
+                },
+                AccountInfo {
+                    email: DEMO_ACCOUNT_2.into(),
+                    provider: "mock".into(),
+                    connected: true,
+                    removing: false,
+                },
+            ],
+            active: DEMO_ACCOUNT.into(),
+        }
+    }
+    // Shipped builds have no demo pair to fall back on: an empty list is the
+    // honest answer, and the UI turns it into the connect screen.
+    #[cfg(not(feature = "demo-fixtures"))]
+    {
+        AccountsState { accounts: vec![], active: String::new() }
     }
 }
 
@@ -629,14 +639,28 @@ pub fn get_streaks(conn: &Connection) -> Streaks {
     get_json(conn, "streaks").unwrap_or(Streaks { daily: 0, weekly: 0, last_zero_day: None })
 }
 
+/// The active account, or a disconnected placeholder when nothing is connected.
+///
+/// Zero accounts is a real state now that shipped builds have no demo pair to
+/// fall back on, and every one of this function's callers wants a value rather
+/// than an Option. The placeholder's provider is deliberately neither "gmail"
+/// nor "mock", so `provider == "gmail"` guards stay false and callers fall into
+/// their no-backend branches (empty lists, not fabricated mail). Indexing
+/// `accounts[0]` here used to panic the moment the list was empty.
 pub fn active_account(conn: &Connection) -> AccountInfo {
     let state = get_accounts(conn);
     state
         .accounts
         .iter()
         .find(|a| a.email == state.active)
+        .or_else(|| state.accounts.first())
         .cloned()
-        .unwrap_or_else(|| state.accounts[0].clone())
+        .unwrap_or_else(|| AccountInfo {
+            email: String::new(),
+            provider: "none".into(),
+            connected: false,
+            removing: false,
+        })
 }
 
 // ---------------------------------------------------------------- rows
@@ -2354,6 +2378,53 @@ mod tests {
             attachments: vec![],
         };
         upsert_thread(conn, ACCT, &t, &[(m, None, None, None, vec![])]).unwrap();
+    }
+
+    /// Zero accounts must stay zero accounts. This is the whole point of
+    /// cutting the demo from shipped builds: get_accounts used to invent a
+    /// fake pair here, which is what made a fresh install boot "signed in"
+    /// and made disconnecting your last account impossible to actually do.
+    #[test]
+    #[cfg(not(feature = "demo-fixtures"))]
+    fn get_accounts_has_no_demo_fallback() {
+        let conn = open_global(std::path::Path::new(":memory:")).unwrap();
+        let state = get_accounts(&conn);
+        assert!(state.accounts.is_empty(), "shipped builds must not invent accounts");
+        assert_eq!(state.active, "");
+    }
+
+    /// active_account indexed accounts[0] unconditionally, so the moment
+    /// get_accounts could return an empty list it became a panic reachable
+    /// from eleven commands. The placeholder's provider is neither "gmail"
+    /// nor "mock", so provider guards fall through to the no-backend branch.
+    #[test]
+    #[cfg(not(feature = "demo-fixtures"))] // with fixtures, the demo pair is the answer
+    fn active_account_survives_an_empty_registry() {
+        let conn = open_global(std::path::Path::new(":memory:")).unwrap();
+        conn.execute("DELETE FROM kv WHERE key = 'accounts'", []).unwrap();
+        let a = active_account(&conn);
+        assert_eq!(a.email, "");
+        assert_ne!(a.provider, "gmail");
+        assert!(!a.connected);
+    }
+
+    /// A saved registry still wins, and a stale `active` pointing at an
+    /// account that is gone falls back to the first real one rather than the
+    /// placeholder.
+    #[test]
+    fn active_account_falls_back_to_the_first_real_account() {
+        let conn = open_global(std::path::Path::new(":memory:")).unwrap();
+        let state = AccountsState {
+            accounts: vec![AccountInfo {
+                email: "real@gmail.com".into(),
+                provider: "gmail".into(),
+                connected: true,
+                removing: false,
+            }],
+            active: "vanished@gmail.com".into(),
+        };
+        save_accounts(&conn, &state).unwrap();
+        assert_eq!(active_account(&conn).email, "real@gmail.com");
     }
 
     /// The download-progress numerator must describe the crawl's population.

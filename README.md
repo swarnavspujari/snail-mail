@@ -45,7 +45,12 @@ npm install
 npm run app:dev     # desktop app (first Rust build takes a few minutes)
 ```
 
-The app starts in **demo mode** with a realistic mock inbox — every feature works before you connect anything.
+The desktop app starts on the connect screen — it ships no demo data and no
+fake accounts, so it needs a real Gmail account to show you anything.
+
+To explore the whole UI without credentials, use the browser demo below: it
+runs the same interface against a realistic mock inbox, and every feature works
+there before you connect anything.
 
 Build an installer:
 
@@ -53,7 +58,11 @@ Build an installer:
 npm run app:build   # NSIS installer in src-tauri/target/release/bundle/nsis/
 ```
 
-Browser-only UI dev (mock backend, instant reload): `npm run dev` → http://localhost:1420
+Browser demo / UI dev (mock backend, instant reload): `npm run dev` → http://localhost:1420
+
+The mock backend is a **web-only** build artifact. `npm run dev` and `npm run
+build` include it; `npm run dev:desktop` and `npm run build:desktop` — which is
+what `app:dev` / `app:build` run — alias it out of the bundle entirely.
 
 ## Connect Gmail
 
