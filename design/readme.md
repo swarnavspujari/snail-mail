@@ -19,7 +19,7 @@ Targets **WCAG 2.2**: visible keyboard focus rings everywhere, AA contrast on **
 
 ## The brand in one paragraph
 
-The mark is a **snail whose shell is a rocket-borne envelope** — antennae, a smile, cyan fast-lines and a gold booster-flame trailing behind. It's the whole positioning in one drawing: *looks slow, moves fast.* Three fixed brand colors — **navy `#002839`** (ink, outlines, wordmark, app-tile ground), **cyan `#52d0f6`** (the shell + speed lines), **gold `#fbca60`** (the booster flame). Cyan and gold **are** the product's dark-theme `--accent` and `--accent-2`, so identity and interface are one family. Voice is calm, direct, second-person, keyboard-forward — lean into the irony once ("It only sounds slow."), then get out of the way. See *Brand → Logo* and `explorations/Snail Mail Brand.html`.
+The mark is a **snail whose shell is a rocket-borne envelope** — antennae, a smile, cyan fast-lines and a gold booster-flame trailing behind. It's the whole positioning in one drawing: *looks slow, moves fast.* Three fixed brand colors — **navy `#002839`** (ink, outlines, wordmark, app-tile body), **cyan `#52d0f6`** (the shell + speed lines), **gold `#fbca60`** (the booster flame). Cyan and gold **are** the product's dark-theme `--accent` and `--accent-2`, so identity and interface are one family. Voice is calm, direct, second-person, keyboard-forward — lean into the irony once ("It only sounds slow."), then get out of the way. See *Brand → Logo* and `explorations/Snail Mail Brand.html`.
 
 ---
 
@@ -43,7 +43,7 @@ The mark is a **snail whose shell is a rocket-borne envelope** — antennae, a s
   - `shortcuts/` — **ShortcutsPanel**
 - **`ui_kits/snail-mail/`** — full interactive recreation of the app (nav rail, folder sidebar, split inbox with labels + colored dots + hover actions, thread view with contact rail + instant reply, compose, Shell Command palette, search with operator tips, calendar week view, undo toasts). Light + dark. Open `index.html`.
 - **`guidelines/`** — foundation specimen cards (Colors, Type, Spacing, Brand).
-- **`assets/`** — the brand SVG set: `snail-mail-logo.svg` (+ `-on-dark`), `snail-mail-icon.svg` (+ `-on-dark`), `snail-mail-app-tile.svg` (square navy favicon / desktop icon).
+- **`assets/`** — the brand SVG set: `snail-mail-logo.svg` (+ `-on-dark`), `snail-mail-icon.svg` (+ `-on-dark`), `snail-mail-app-tile.svg` (square paper-white favicon / desktop icon).
 - **`SKILL.md`** — Agent-Skill wrapper.
 
 ---
