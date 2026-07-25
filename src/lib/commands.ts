@@ -1039,6 +1039,17 @@ export function allCommands(): Command[] {
       },
     },
     {
+      // The Rust core repaints the taskbar/dock/launcher badge on save; the
+      // browser demo has none of those, so there this only persists.
+      id: "badge.toggle",
+      title: "Toggle Unread Badge",
+      group: "General",
+      run: () => {
+        const s = useSettings.getState();
+        void s.save({ showBadge: !s.settings.showBadge });
+      },
+    },
+    {
       // The full Superhuman-style sheet in the right-hand dock (where the
       // calendar panel lives). Esc or × closes it.
       id: "shortcuts.show",

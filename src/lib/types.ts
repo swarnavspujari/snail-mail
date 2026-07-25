@@ -113,6 +113,11 @@ export interface Settings {
   theme: "dark" | "light";
   /** Desktop notifications for new mail (while the window is unfocused). */
   notifications: boolean;
+  /** Unread badge on the taskbar (Windows), dock (macOS) or launcher (Linux) —
+   *  the Important split's unread count, summed across accounts. Driven by the
+   *  Rust core; the browser demo has none of those, so there it only
+   *  persists. */
+  showBadge: boolean;
   /** Welcome flow completed. */
   onboarded: boolean;
   /** Calendar side panel visible. */

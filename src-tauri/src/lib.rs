@@ -1,6 +1,7 @@
 //! Snail Mail core: IPC surface, app state, and the background loop.
 //! Every command validates its inputs; every secret stays in the keychain.
 mod ai;
+pub mod badge;
 mod embed;
 mod harper;
 mod mail;
@@ -113,6 +114,18 @@ impl AppState {
         }
         Err("unknown thread".into())
     }
+}
+
+/// The single door `mail:updated` leaves through. Everything that changes the
+/// mailbox — sync, triage, send, reclassify, disconnect, migration — funnels
+/// here rather than calling `emit` directly, so anything that must track the
+/// mailbox is wired once instead of at every producer.
+///
+/// Today that's the taskbar badge: hanging it off the funnel is what makes it
+/// impossible for a new emit site to leave a stale count on the taskbar.
+fn emit_mail_updated(app: &AppHandle) {
+    let _ = app.emit("mail:updated", ());
+    badge::refresh(app);
 }
 
 // A Google OAuth "Desktop app" client baked in at build time (CI secrets), so
@@ -422,7 +435,7 @@ async fn disconnect_account(
     };
     if started {
         let _ = app.emit("accounts:updated", &accounts);
-        let _ = app.emit("mail:updated", ());
+        emit_mail_updated(&app);
         let app2 = app.clone();
         let email2 = email.clone();
         tauri::async_runtime::spawn(async move {
@@ -518,7 +531,7 @@ async fn finish_removal(app: AppHandle, email: String) {
         }
     }
     let _ = app.emit("accounts:updated", &accounts);
-    let _ = app.emit("mail:updated", ());
+    emit_mail_updated(&app);
 }
 
 /// The removed account's attachment-cache filenames, minus any name another
@@ -1884,7 +1897,7 @@ fn progress_callback(app: AppHandle) -> impl Fn(mail::sync::SyncTick) + Send + S
             emit_sync_activity(&app, tick);
         }
         if repaint {
-            let _ = app.emit("mail:updated", ());
+            emit_mail_updated(&app);
             emit_sync_progress(&app);
         }
     }
@@ -2020,7 +2033,7 @@ fn sync_in_background(app: AppHandle) {
             mark_auth_lost(&app, email);
         }
         if changed {
-            let _ = app.emit("mail:updated", ());
+            emit_mail_updated(&app);
         }
         emit_sync_progress(&app);
     });
@@ -2207,7 +2220,7 @@ async fn sync_now(app: AppHandle, state: State<'_, AppState>) -> Result<(), Stri
     for email in &lost {
         mark_auth_lost(&app, email);
     }
-    let _ = app.emit("mail:updated", ());
+    emit_mail_updated(&app);
     emit_sync_progress(&app);
     match first_err {
         Some(e) => Err(e),
@@ -2268,7 +2281,7 @@ async fn resync_account(app: AppHandle, state: State<'_, AppState>) -> Result<()
     for email in &lost {
         mark_auth_lost(&app, email);
     }
-    let _ = app.emit("mail:updated", ());
+    emit_mail_updated(&app);
     emit_sync_progress(&app);
     match first_err {
         Some(e) => Err(e),
@@ -3090,7 +3103,7 @@ async fn load_older(
         }
     }
     if added > 0 {
-        let _ = app.emit("mail:updated", ());
+        emit_mail_updated(&app);
     }
     Ok(added)
 }
@@ -3191,7 +3204,7 @@ fn spawn_remote(app: AppHandle, thread_id: String, op: RemoteTriage) {
                 let _ = mail::sync::refetch_thread(&state.http, sess, &db, &account, &thread_id).await;
             }
             drop(sessions);
-            let _ = app.emit("mail:updated", ());
+            emit_mail_updated(&app);
         }
     });
 }
@@ -3466,7 +3479,7 @@ async fn bulk_archive(
             }
         });
     }
-    let _ = app.emit("mail:updated", ());
+    emit_mail_updated(&app);
     Ok(n)
 }
 
@@ -3504,7 +3517,7 @@ fn spawn_reclassify(app: AppHandle, only_missing: bool) {
             }
         }
         if moved > 0 {
-            let _ = app.emit("mail:updated", ());
+            emit_mail_updated(&app);
         }
     });
 }
@@ -3681,7 +3694,7 @@ async fn send_mail_now(app: AppHandle, mail: OutgoingMail) -> Result<(), String>
         email
     };
     deliver_mail(&app, &account, &mail).await?;
-    let _ = app.emit("mail:updated", ());
+    emit_mail_updated(&app);
     Ok(())
 }
 
@@ -3711,7 +3724,7 @@ async fn send_outbox_now(app: AppHandle, outbox_id: i64) -> Result<(), String> {
             let conn = db.lock().unwrap();
             store::outbox_delete(&conn, outbox_id);
             drop(conn);
-            let _ = app.emit("mail:updated", ());
+            emit_mail_updated(&app);
             Ok(())
         }
         Err(e) => {
@@ -3756,6 +3769,10 @@ async fn save_settings(app: AppHandle, state: State<'_, AppState>, settings: Set
         store::set_json(&conn, "settings", &settings)?;
         before != serde_json::to_value(&settings.splits).unwrap_or_default()
     };
+    // Not on the mail:updated funnel: toggling showBadge (or renaming the
+    // Important split out from under it) changes the badge without changing
+    // any mail.
+    badge::refresh(&app);
     // A changed definition re-files the whole mailbox in the background; the
     // tabs repaint on the mail:updated it emits when done.
     if splits_changed {
@@ -4188,6 +4205,11 @@ pub fn run() {
                 embedder: tokio::sync::Mutex::new(embed::Slot::Idle),
             });
 
+            // Paint the badge from what's already on disk, before the first
+            // sync lands — the taskbar shouldn't sit empty through boot when
+            // the mailbox is right there.
+            badge::refresh(app.handle());
+
             // Dev-only: SNAIL_AI_SMOKE=1 (legacy FISSION_AI_SMOKE) streams one
             // real draft at startup and logs the result — end-to-end proof of
             // context assembly + adapter + SSE parsing against the configured
@@ -4320,7 +4342,7 @@ pub fn run() {
                         }
                     }
                     if sent_any {
-                        let _ = outbox_handle.emit("mail:updated", ());
+                        emit_mail_updated(&outbox_handle);
                     }
                 }
             });
@@ -4383,7 +4405,7 @@ pub fn run() {
                             total: 1,
                         },
                     );
-                    let _ = boot.emit("mail:updated", ());
+                    emit_mail_updated(&boot);
                 } else {
                     store::migrate::delete_bak_if_verified(&state.dbs);
                 }
@@ -4439,7 +4461,7 @@ pub fn run() {
                     mark_auth_lost(&boot, email);
                 }
                 if changed {
-                    let _ = boot.emit("mail:updated", ());
+                    emit_mail_updated(&boot);
                 }
                 emit_sync_progress(&boot);
             });
@@ -4580,7 +4602,7 @@ pub fn run() {
                         }
                     }
                     if changed {
-                        let _ = handle.emit("mail:updated", ());
+                        emit_mail_updated(&handle);
                         notify_new_mail(&handle, notify_watermark);
                         notify_watermark = now_ms();
                     }

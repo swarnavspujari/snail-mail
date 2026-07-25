@@ -122,6 +122,10 @@ pub struct Settings {
     /// Desktop notifications for new mail (while the window is unfocused).
     #[serde(default = "default_true")]
     pub notifications: bool,
+    /// Unread badge on the taskbar / dock / launcher — the Important split's
+    /// unread count, summed across accounts.
+    #[serde(default = "default_true")]
+    pub show_badge: bool,
     /// Onboarding completed — the welcome flow shows until this flips.
     #[serde(default)]
     pub onboarded: bool,
