@@ -58,14 +58,14 @@
 
   /* ---- Brand marks — the FIXED logo colors (theme-independent). The
      rocket-snail lockup is drawn in exactly these three; the app-icon
-     tile sits on --brand-navy. Cyan/gold match the dark accent + gold,
+     tile sits on --brand-paper. Cyan/gold match the dark accent + gold,
      so the identity and the UI accent are one family. Do NOT theme
      these — they are brand constants, used for the logo, the app tile,
      and brand/marketing surfaces only. */
-  --brand-navy: #002839;   /* deep teal-navy — ink, outlines, wordmark, app-tile ground */
+  --brand-navy: #002839;   /* deep teal-navy — ink, outlines, wordmark, app-tile body */
   --brand-cyan: #52d0f6;   /* the shell + fast-lines cyan (= dark --accent) */
   --brand-gold: #fbca60;   /* the booster-flame gold (= dark --accent-2) */
-  --brand-paper: #ffffff;  /* the snail's body reads as the page behind it */
+  --brand-paper: #ffffff;  /* the app-tile ground; the snail's body on dark */
 
   /* ---- Semantic status — lifted for the dark tonal surface. Success
      is the green end of the cerulean family. */
