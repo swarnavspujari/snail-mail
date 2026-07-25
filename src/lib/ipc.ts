@@ -19,6 +19,7 @@ import type {
   EventDraft,
   EventWriteResult,
   MailAttachment,
+  MigrationProgress,
   LintHit,
   RsvpResponse,
   SendUpdates,
@@ -234,6 +235,12 @@ export interface Backend {
   onTriageError(cb: (message: string) => void): () => void;
   /** General user-facing notice from the core (e.g. a partial OAuth grant). */
   onNotice(cb: (message: string) => void): () => void;
+  /** Fires while the one-time per-account storage split runs (desktop only).
+   *  A payload with table === "done" means the split finished. */
+  onMigrationProgress(cb: (p: MigrationProgress) => void): () => void;
+  /** Backend pushes when the accounts list changes out from under the UI —
+   *  a background removal finished, or a grant died (connected flipped). */
+  onAccountsUpdated(cb: (a: AccountsState) => void): () => void;
 }
 
 export const isTauri =
@@ -589,6 +596,18 @@ class TauriBackend implements Backend {
   }
   onNotice(cb: (message: string) => void): () => void {
     const un = listen<string>("app:notice", (e) => cb(e.payload));
+    return () => {
+      void un.then((f) => f());
+    };
+  }
+  onMigrationProgress(cb: (p: MigrationProgress) => void): () => void {
+    const un = listen<MigrationProgress>("migration:progress", (e) => cb(e.payload));
+    return () => {
+      void un.then((f) => f());
+    };
+  }
+  onAccountsUpdated(cb: (a: AccountsState) => void): () => void {
+    const un = listen<AccountsState>("accounts:updated", (e) => cb(e.payload));
     return () => {
       void un.then((f) => f());
     };

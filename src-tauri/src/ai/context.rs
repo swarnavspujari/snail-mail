@@ -90,17 +90,22 @@ struct AttachmentRow {
 
 /// Assemble everything for a draft/ask request. `sessions` holds live Gmail
 /// sessions per account (enables attachment fetches for real threads).
+/// `global_db` carries the app-wide rows (Knowledge Base, accounts); `db` is
+/// the thread's account file.
 pub async fn assemble(
+    global_db: &std::sync::Mutex<Connection>,
     db: &std::sync::Mutex<Connection>,
     http: &reqwest::Client,
     sessions: &tokio::sync::Mutex<std::collections::HashMap<String, GmailSession>>,
     req: &DraftRequest,
     multimodal: bool,
 ) -> Result<AssembledContext, String> {
-    let (kb, account, thread_account, messages, att_rows) = {
+    let (kb, account) = {
+        let conn = global_db.lock().unwrap();
+        (store::get_kb(&conn), store::active_account(&conn))
+    };
+    let (thread_account, messages, att_rows) = {
         let conn = db.lock().unwrap();
-        let kb = store::get_kb(&conn);
-        let account = store::active_account(&conn);
         let thread_account = req
             .thread_id
             .as_ref()
@@ -129,7 +134,7 @@ pub async fn assemble(
                 });
             }
         }
-        (kb, account, thread_account, messages, att_rows)
+        (thread_account, messages, att_rows)
     };
 
     let system = build_system(&kb, &account.email);

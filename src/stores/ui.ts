@@ -3,7 +3,7 @@ import { backend } from "@/lib/ipc";
 import { sanitizeUserHtml } from "@/lib/sanitize";
 import { splitThreads, useMail, visibleThreads } from "./mail";
 import { activeSignature, useSettings } from "./settings";
-import type { MailAttachment, OutgoingMail, SyncProgress, ThreadId, ZeroEvent } from "@/lib/types";
+import type { MailAttachment, MigrationProgress, OutgoingMail, SyncProgress, ThreadId, ZeroEvent } from "@/lib/types";
 
 export type Screen = "mail" | "settings" | "search" | "calendar";
 
@@ -237,6 +237,10 @@ interface UiState {
    *  drives the "Downloading mail history… N%" footer strip. Null until the
    *  first sync:progress arrives. */
   syncProgress: SyncProgress | null;
+  /** One-time per-account storage split (desktop update path); drives the
+   *  "Optimizing mail storage… N%" footer strip. Null before it starts and
+   *  after the `table === "done"` payload clears it. */
+  migration: MigrationProgress | null;
   /** A message queued in the Undo Send window: drives the bottom-left bar with
    *  its countdown, Z-to-undo, and Send-now (accelerate). Null when nothing is
    *  pending or the window has elapsed. */
@@ -285,6 +289,7 @@ interface UiState {
   setPendingSend: (p: PendingSend | null) => void;
   clearPendingSend: () => void;
   setSyncProgress: (p: SyncProgress) => void;
+  setMigration: (p: MigrationProgress) => void;
   /** Called after any archive-ish action: fires the celebration if the
    *  active split just hit zero. */
   checkInboxZero: () => Promise<void>;
@@ -319,6 +324,7 @@ export const useUi = create<UiState>((set, get) => ({
   celebration: null,
   toast: null,
   syncProgress: null,
+  migration: null,
   pendingSend: null,
   settingsTab: "account",
   suggestions: [],
@@ -378,6 +384,7 @@ export const useUi = create<UiState>((set, get) => ({
   setPendingSend: (p) => set({ pendingSend: p }),
   clearPendingSend: () => set({ pendingSend: null }),
   setSyncProgress: (p) => set({ syncProgress: p }),
+  setMigration: (p) => set({ migration: p.table === "done" ? null : p }),
 
   showToast: (msg) => {
     set({ toast: msg });

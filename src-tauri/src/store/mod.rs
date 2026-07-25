@@ -1,22 +1,67 @@
 //! SQLite persistence: threads/messages/attachments, JSON settings blobs,
 //! an FTS5 index for instant full-text search, and a sqlite-vec table for
 //! semantic (vector) search.
+pub mod migrate;
+pub mod registry;
 pub mod vec;
 
 use crate::types::*;
 use rusqlite::{params, Connection};
 use std::collections::HashMap;
 
-pub fn open(path: &std::path::Path) -> Result<Connection, String> {
-    // sqlite-vec's vec0 module rides every connection opened after this via
-    // SQLite's process-global auto-extension hook. Registered here (not in
-    // main) so tests that open stores directly get it too.
+/// sqlite-vec's vec0 module rides every connection opened after this via
+/// SQLite's process-global auto-extension hook. Every opener (account files,
+/// the global db, tests) must route through here so no connection kind can
+/// miss the hook.
+pub fn register_vec_extension() {
     static VEC_INIT: std::sync::Once = std::sync::Once::new();
     VEC_INIT.call_once(|| unsafe {
         rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
             sqlite_vec::sqlite3_vec_init as *const (),
         )));
     });
+}
+
+/// The app-wide db (`global.db`): kv only — `settings`, `accounts`, `streaks`,
+/// `kb`, and the other non-account keys. Account mail never lives here.
+pub fn open_global(path: &std::path::Path) -> Result<Connection, String> {
+    register_vec_extension();
+    let conn = Connection::open(path).map_err(|e| e.to_string())?;
+    conn.execute_batch(
+        r#"
+        PRAGMA journal_mode = WAL;
+        PRAGMA foreign_keys = ON;
+        CREATE TABLE IF NOT EXISTS kv (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        "#,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(conn)
+}
+
+/// Deterministic on-disk name for an account's db: readable sanitized prefix
+/// plus a stable hash, so the boot sweep can derive the expected file set
+/// straight from the registry. FNV-1a by hand — std's DefaultHasher isn't
+/// stable across Rust releases and these names must never change.
+pub fn account_db_filename(email: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in email.as_bytes() {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    let stem: String = email
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_lowercase() || c.is_ascii_digit() { c } else { '_' })
+        .take(40)
+        .collect();
+    format!("{stem}-{hash:016x}.db")
+}
+
+pub fn open(path: &std::path::Path) -> Result<Connection, String> {
+    register_vec_extension();
     let conn = Connection::open(path).map_err(|e| e.to_string())?;
     conn.execute_batch(
         r#"
@@ -269,8 +314,18 @@ pub fn get_accounts(conn: &Connection) -> AccountsState {
     }
     AccountsState {
         accounts: vec![
-            AccountInfo { email: DEMO_ACCOUNT.into(), provider: "mock".into(), connected: true },
-            AccountInfo { email: DEMO_ACCOUNT_2.into(), provider: "mock".into(), connected: true },
+            AccountInfo {
+                email: DEMO_ACCOUNT.into(),
+                provider: "mock".into(),
+                connected: true,
+                removing: false,
+            },
+            AccountInfo {
+                email: DEMO_ACCOUNT_2.into(),
+                provider: "mock".into(),
+                connected: true,
+                removing: false,
+            },
         ],
         active: DEMO_ACCOUNT.into(),
     }
@@ -1336,10 +1391,23 @@ pub fn outbox_delete(conn: &Connection, id: i64) {
     let _ = conn.execute("DELETE FROM outbox WHERE id = ?1", params![id]);
 }
 
-pub fn outbox_bump_attempts(conn: &Connection, id: i64) {
+/// Bump a failed send's attempt count and return the new value. Rows are
+/// NEVER deleted here — a message that keeps failing parks at the attempt
+/// cap (outbox_due stops offering it) until a reconnect/resync resets it.
+/// The old behavior silently destroyed queued mail after five tries.
+pub fn outbox_bump_attempts(conn: &Connection, id: i64) -> i64 {
     let _ = conn.execute("UPDATE outbox SET attempts = attempts + 1 WHERE id = ?1", params![id]);
-    // rows that exhausted their retries are dropped so they can't loop forever
-    let _ = conn.execute("DELETE FROM outbox WHERE attempts >= 5", []);
+    conn.query_row("SELECT attempts FROM outbox WHERE id = ?1", params![id], |r| r.get(0))
+        .unwrap_or(0)
+}
+
+/// Fresh attempts for every parked row of an account — called when its grant
+/// comes back so queued mail resumes delivering.
+pub fn outbox_reset_attempts(conn: &Connection, account_id: &str) {
+    let _ = conn.execute(
+        "UPDATE outbox SET attempts = 0, claimed = 0 WHERE account_id = ?1",
+        params![account_id],
+    );
 }
 
 /// Trash = remove the thread from the local cache entirely (Gmail keeps it
@@ -2687,6 +2755,43 @@ mod tests {
         assert_eq!(vec::count_embedded(&conn, ACCT).unwrap(), 0);
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM mail_vec", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 0);
+    }
+
+    // ------------------------------------------------- per-account files
+
+    #[test]
+    fn account_db_filename_is_stable_safe_and_distinct() {
+        let a = account_db_filename("ssp@pujariventurepartners.com");
+        assert_eq!(a, account_db_filename("ssp@pujariventurepartners.com"));
+        assert!(a.ends_with(".db"), "{a}");
+        let stem = a.trim_end_matches(".db");
+        assert!(
+            stem.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-'),
+            "{stem}"
+        );
+        assert_ne!(account_db_filename("a@x.test"), account_db_filename("b@x.test"));
+        // the hash disambiguates emails that sanitize to the same prefix
+        assert_ne!(account_db_filename("a.b@x.test"), account_db_filename("a_b@x.test"));
+        // unicode/path-hostile input stays a bounded, plain-ascii name
+        let odd = account_db_filename("Ünïcode+weird/..\\name@Ex.Test");
+        assert!(odd.len() <= 60, "{odd}");
+        assert!(!odd.contains('.') || odd.ends_with(".db"));
+    }
+
+    #[test]
+    fn open_global_creates_only_kv() {
+        let conn = open_global(std::path::Path::new(":memory:")).unwrap();
+        set_json(&conn, "probe", &42).unwrap();
+        assert_eq!(get_json::<i32>(&conn, "probe"), Some(42));
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table'
+                 AND name IN ('threads','messages','attachments','outbox','drafts','events')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0, "global db must not carry account tables");
     }
 
     #[test]

@@ -1,10 +1,10 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import type { CSSProperties } from "react";
 import { backend, isTauri } from "@/lib/ipc";
 import { commandBindings, runCommandById } from "@/lib/commands";
 import { installKeyboard } from "@/lib/keyboard";
 import { startUpdateChecks, useUpdater } from "@/lib/updater";
-import { splitThreads, useMail } from "@/stores/mail";
+import { clearMailCaches, splitThreads, useMail } from "@/stores/mail";
 import { useProfiles, useSettings } from "@/stores/settings";
 import { useUi } from "@/stores/ui";
 import { Avatar } from "@/components/Avatar";
@@ -83,6 +83,7 @@ export default function App() {
   const toast = useUi((s) => s.toast);
   const pendingSend = useUi((s) => s.pendingSend);
   const syncProgress = useUi((s) => s.syncProgress);
+  const migration = useUi((s) => s.migration);
   const openThreadId = useMail((s) => s.openThreadId);
   const listView = useMail((s) => s.listView);
   const activeSplitId = useMail((s) => s.activeSplitId);
@@ -109,6 +110,36 @@ export default function App() {
   const downloadPct = downloading
     ? Math.min(99, Math.max(1, Math.round((syncProgress.indexed / syncProgress.total) * 100)))
     : 0;
+  // One-time storage split after the per-account-files update: same strip
+  // treatment, cleared by the final `table === "done"` payload.
+  const migrating = !!migration && migration.total > 0;
+  const migrationPct = migrating
+    ? Math.min(99, Math.max(1, Math.round((migration.copied / migration.total) * 100)))
+    : 0;
+
+  // Dead grants: gmail accounts whose refresh token no longer works. The
+  // banner + amber dot stay until a reconnect fixes it.
+  const deadAccounts = accounts.accounts.filter(
+    (a) => a.provider === "gmail" && !a.connected && !a.removing
+  );
+  const activeConnected =
+    accounts.accounts.find((a) => a.email === accounts.active)?.connected ?? true;
+  const [reconnecting, setReconnecting] = useState(false);
+  const reconnectDead = async () => {
+    setReconnecting(true);
+    try {
+      // in-place re-consent: token + scopes refresh, the mailbox is untouched
+      await backend.startOauth("", "");
+      await useSettings.getState().refreshAccounts();
+      await backend.syncNow();
+      await useMail.getState().refresh();
+    } catch (e) {
+      useUi.getState().showToast(String(e));
+      await useSettings.getState().refreshAccounts();
+    } finally {
+      setReconnecting(false);
+    }
+  };
 
   // Inbox zero (design "Inbox Zero" pattern): the active split is empty, so
   // the daily photo fills the WHOLE app and the chrome goes translucent above
@@ -120,7 +151,7 @@ export default function App() {
     listView === "inbox" &&
     mailLoaded &&
     splitThreads(inboxThreads, activeSplitId).length === 0;
-  const footerVisible = showShortcutBar || downloading;
+  const footerVisible = showShortcutBar || downloading || migrating;
 
   // The attribute must flip BEFORE React re-renders: QuoteFrame (compose)
   // bakes the current token values into its iframe srcDoc during render, and
@@ -163,6 +194,10 @@ export default function App() {
     const unSync = backend.onSyncProgress((p) =>
       useUi.getState().setSyncProgress(p)
     );
+    // one-time per-account storage split → "Optimizing mail storage… N%"
+    const unMigration = backend.onMigrationProgress((p) =>
+      useUi.getState().setMigration(p)
+    );
     // inline images for the open thread resolved in the background — re-read it
     const unImages = backend.onThreadImages((id) => {
       if (useMail.getState().openThreadId === id)
@@ -185,6 +220,7 @@ export default function App() {
       clearTimeout(timer);
       unMail();
       unSync();
+      unMigration();
       unImages();
       unTriage();
       unNotice();
@@ -293,7 +329,14 @@ export default function App() {
         </span>
         <div className="flex items-center gap-2 rounded-full border border-line bg-surface py-1 pl-1.5 pr-2 hover:border-line-strong">
           <ActiveAvatar email={accounts.active} />
-          <span className="h-1.5 w-1.5 rounded-full bg-ok" title="connected" />
+          <span
+            className={`h-1.5 w-1.5 rounded-full ${activeConnected ? "bg-ok" : "bg-warn"}`}
+            title={
+              activeConnected
+                ? "connected"
+                : "sign-in expired — reconnect in Settings → Account"
+            }
+          />
           {accounts.accounts.length > 1 ? (
             <select
               value={accounts.active}
@@ -301,16 +344,21 @@ export default function App() {
                 void useSettings
                   .getState()
                   .switchAccount(e.target.value)
-                  .then(() => useMail.getState().refresh());
+                  .then(() => {
+                    clearMailCaches();
+                    return useMail.getState().refresh();
+                  });
               }}
               title="Switch account (Alt+1…9)"
               className="max-w-56 cursor-pointer appearance-none truncate bg-transparent pr-1 text-[12px] text-ink-2 outline-none"
             >
-              {accounts.accounts.map((a, i) => (
-                <option key={a.email} value={a.email}>
-                  {i + 1} · {a.email}
-                </option>
-              ))}
+              {accounts.accounts
+                .filter((a) => !a.removing)
+                .map((a, i) => (
+                  <option key={a.email} value={a.email}>
+                    {i + 1} · {a.email}
+                  </option>
+                ))}
             </select>
           ) : (
             <span className="pr-1 text-[12px] text-ink-2">{accounts.active}</span>
@@ -370,6 +418,30 @@ export default function App() {
         {/* Theme toggle is intentionally NOT a button — it lives in Shell
             Command (type "theme" or "dark mode"), Superhuman-style. */}
       </header>
+
+      {/* Persistent per-account Reconnect strip: a dead Google grant stays
+          visible (and one click from fixed) until it IS fixed. Gated on
+          `connected` — not on scopes — so it survives restarts, unlike the
+          old one-shot 2.6s toast. */}
+      {deadAccounts.map((a) => (
+        <div
+          key={a.email}
+          className="flex h-9 shrink-0 items-center gap-3 border-b border-warn/40 bg-warn/10 px-3.5 text-[12.5px] text-ink-2"
+        >
+          <span className="h-2 w-2 shrink-0 rounded-full bg-warn" />
+          <span className="min-w-0 flex-1 truncate">
+            Google sign-in for {a.email} expired or was revoked — mail and
+            calendar are paused, queued sends are parked.
+          </span>
+          <button
+            className="shrink-0 rounded-md bg-accent px-2.5 py-1 text-[12px] font-medium text-on-accent hover:opacity-90 disabled:opacity-60"
+            disabled={reconnecting}
+            onClick={() => void reconnectDead()}
+          >
+            {reconnecting ? "Waiting for consent…" : "Reconnect"}
+          </button>
+        </div>
+      ))}
 
       {/* The shortcuts panel docks OUTSIDE <main> so it stays put across
           screens and thread views — the same right-hand slot the calendar
@@ -432,6 +504,15 @@ export default function App() {
               : undefined
           }
         >
+          {migrating && (
+            <span
+              className="flex shrink-0 items-center gap-2 whitespace-nowrap text-ink-2"
+              title={`${migration!.copied.toLocaleString()} of ${migration!.total.toLocaleString()} rows moved for ${migration!.email}`}
+            >
+              <span className="zb-spin inline-block h-3 w-3 rounded-full border-2 border-line-strong border-t-accent" />
+              Optimizing mail storage… {migrationPct}%
+            </span>
+          )}
           {downloading && (
             <span
               className="flex shrink-0 items-center gap-2 whitespace-nowrap text-ink-2"

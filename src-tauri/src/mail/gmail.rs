@@ -132,8 +132,19 @@ impl GmailSession {
         Ok(tok)
     }
 
+    /// Drop the cached access token so the next token() call must go through
+    /// a refresh. A Google-side revoke invalidates the access token
+    /// immediately but our cache thinks it's valid for up to an hour — the
+    /// 401-retry path below forces the refresh, and the refresh's
+    /// `invalid_grant` is what mark_auth_lost classifies on, so a dead grant
+    /// surfaces in seconds instead of at cache expiry.
+    pub(crate) fn invalidate_access_token(&mut self) {
+        self.access_token = None;
+    }
+
     pub(crate) async fn get_json(&mut self, http: &reqwest::Client, url: &str) -> Result<Value, String> {
-        let tok = self.token(http).await?;
+        let mut tok = self.token(http).await?;
+        let mut auth_retried = false;
         for attempt in 0..3u32 {
             let resp = http
                 .get(url)
@@ -144,6 +155,16 @@ impl GmailSession {
             let status = resp.status();
             if status.as_u16() == 429 || status.as_u16() >= 500 {
                 tokio::time::sleep(Duration::from_millis(500 * 2u64.pow(attempt))).await;
+                continue;
+            }
+            if status.as_u16() == 401 && !auth_retried {
+                // Token rejected before its cached expiry (server-side revoke,
+                // password change): force ONE refresh and retry. If the grant
+                // is dead the refresh returns `invalid_grant`, which the
+                // caller classifies.
+                auth_retried = true;
+                self.invalidate_access_token();
+                tok = self.token(http).await?;
                 continue;
             }
             if !status.is_success() {
@@ -168,7 +189,8 @@ impl GmailSession {
         url: &str,
         body: Value,
     ) -> Result<Value, String> {
-        let tok = self.token(http).await?;
+        let mut tok = self.token(http).await?;
+        let mut auth_retried = false;
         for attempt in 0..3u32 {
             let resp = http
                 .post(url)
@@ -180,6 +202,14 @@ impl GmailSession {
             let status = resp.status();
             if status.as_u16() == 429 || status.as_u16() >= 500 {
                 tokio::time::sleep(Duration::from_millis(500 * 2u64.pow(attempt))).await;
+                continue;
+            }
+            if status.as_u16() == 401 && !auth_retried {
+                // See get_json: one forced refresh so a revoked grant
+                // classifies now, not at access-token expiry.
+                auth_retried = true;
+                self.invalidate_access_token();
+                tok = self.token(http).await?;
                 continue;
             }
             if !status.is_success() {
