@@ -4,7 +4,7 @@ import { backend, isTauri } from "@/lib/ipc";
 import { commandBindings, runCommandById } from "@/lib/commands";
 import { installKeyboard } from "@/lib/keyboard";
 import { startUpdateChecks, useUpdater } from "@/lib/updater";
-import { splitThreads, useMail } from "@/stores/mail";
+import { clearMailCaches, splitThreads, useMail } from "@/stores/mail";
 import { useProfiles, useSettings } from "@/stores/settings";
 import { useUi } from "@/stores/ui";
 import { Avatar } from "@/components/Avatar";
@@ -313,16 +313,21 @@ export default function App() {
                 void useSettings
                   .getState()
                   .switchAccount(e.target.value)
-                  .then(() => useMail.getState().refresh());
+                  .then(() => {
+                    clearMailCaches();
+                    return useMail.getState().refresh();
+                  });
               }}
               title="Switch account (Alt+1…9)"
               className="max-w-56 cursor-pointer appearance-none truncate bg-transparent pr-1 text-[12px] text-ink-2 outline-none"
             >
-              {accounts.accounts.map((a, i) => (
-                <option key={a.email} value={a.email}>
-                  {i + 1} · {a.email}
-                </option>
-              ))}
+              {accounts.accounts
+                .filter((a) => !a.removing)
+                .map((a, i) => (
+                  <option key={a.email} value={a.email}>
+                    {i + 1} · {a.email}
+                  </option>
+                ))}
             </select>
           ) : (
             <span className="pr-1 text-[12px] text-ink-2">{accounts.active}</span>

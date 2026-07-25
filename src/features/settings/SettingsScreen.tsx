@@ -3,7 +3,7 @@ import { backend, isTauri } from "@/lib/ipc";
 import { formatKeyExpr } from "@/lib/keyboard";
 import { allCommands } from "@/lib/commands";
 import { useUpdater } from "@/lib/updater";
-import { useMail } from "@/stores/mail";
+import { clearMailCaches, useMail } from "@/stores/mail";
 import { useProfiles, useSettings } from "@/stores/settings";
 import { useUi } from "@/stores/ui";
 import { Avatar } from "@/components/Avatar";
@@ -166,18 +166,40 @@ function AccountTab() {
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
   const [sigDrafts, setSigDrafts] = useState<Record<string, string>>({});
+  // Two-step removal: first click arms the confirm, second click commits.
+  const [confirmRemove, setConfirmRemove] = useState<string | null>(null);
+  const [disconnectPending, setDisconnectPending] = useState<string | null>(null);
+
+  const disconnect = async (email: string) => {
+    setDisconnectPending(email);
+    try {
+      await backend.disconnect(email);
+      // the removed account's lists/threads must not keep painting from memory
+      clearMailCaches();
+      await useSettings.getState().refreshAccounts();
+      await useMail.getState().refresh();
+    } catch (e) {
+      useUi.getState().showToast(`Couldn't remove ${email}: ${String(e)}`);
+      await useSettings.getState().refreshAccounts();
+    } finally {
+      setDisconnectPending(null);
+      setConfirmRemove(null);
+    }
+  };
 
   useEffect(() => {
     void backend.hasGmailClient().then(setClientStored);
   }, []);
 
-  // Disconnect (revokes server-side) then a fresh Connect — the one-time
-  // re-consent that unlocks scopes added after the account was connected.
+  // Re-consent IN PLACE: start_oauth updates the existing account row (token,
+  // granted scopes, connected flag) without touching its mail, cursors, or
+  // history. The old flow routed through disconnect first, which purged the
+  // whole local mailbox just to add a scope.
   const reconnect = async (email: string) => {
+    void email; // Google's consent screen picks the account; the row updates in place
     setBusy(true);
     setMsg(null);
     try {
-      await backend.disconnect(email);
       await backend.startOauth("", "");
       await useSettings.getState().refreshAccounts();
       await backend.syncNow();
@@ -267,14 +289,17 @@ function AccountTab() {
                   >
                     ↓
                   </button>
-                  {!active && (
+                  {!active && !a.removing && (
                     <button
                       className={btnGhost}
                       onClick={() =>
                         void useSettings
                           .getState()
                           .switchAccount(a.email)
-                          .then(() => useMail.getState().refresh())
+                          .then(() => {
+                            clearMailCaches();
+                            return useMail.getState().refresh();
+                          })
                       }
                     >
                       Switch
@@ -296,19 +321,40 @@ function AccountTab() {
                       Refresh contacts
                     </button>
                   )}
-                  {a.provider === "gmail" && (
-                    <button
-                      className={btnGhost}
-                      onClick={async () => {
-                        await backend.disconnect(a.email);
-                        await useSettings.getState().refreshAccounts();
-                        await useMail.getState().refresh();
-                      }}
-                    >
+                  {a.removing && (
+                    <span className="flex shrink-0 items-center gap-2 whitespace-nowrap text-[12px] text-ink-3">
+                      <span className="zb-spin inline-block h-3 w-3 rounded-full border-2 border-line-strong border-t-accent" />
+                      Removing…
+                    </span>
+                  )}
+                  {a.provider === "gmail" && !a.removing && confirmRemove !== a.email && (
+                    <button className={btnGhost} onClick={() => setConfirmRemove(a.email)}>
                       Disconnect
                     </button>
                   )}
                 </div>
+                {a.provider === "gmail" && !a.removing && confirmRemove === a.email && (
+                  <div className="mt-2 flex items-center gap-2 rounded-md border border-warn/40 bg-warn/10 px-3 py-2">
+                    <span className="flex-1 text-[12px] text-ink-2">
+                      Remove {a.email}? Its locally synced mail is deleted from
+                      this device (your mail stays in Gmail).
+                    </span>
+                    <button
+                      className={btnCls}
+                      disabled={disconnectPending === a.email}
+                      onClick={() => void disconnect(a.email)}
+                    >
+                      {disconnectPending === a.email ? "Removing…" : "Remove account"}
+                    </button>
+                    <button
+                      className={btnGhost}
+                      disabled={disconnectPending === a.email}
+                      onClick={() => setConfirmRemove(null)}
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                )}
                 {a.provider === "gmail" && missingGrants(capabilities[a.email]).length > 0 && (
                   <div className="mt-2 flex items-center gap-2 rounded-md border border-warn/40 bg-warn/10 px-3 py-2">
                     <span className="flex-1 text-[12px] text-ink-2">

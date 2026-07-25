@@ -686,6 +686,57 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Phase-1 acceptance measurement: while an account migrates, the app's
+    /// list_threads path (against whatever conn the registry serves) must stay
+    /// responsive. Run with:
+    ///   cargo test --release -- --ignored perf_migration --nocapture
+    #[test]
+    #[ignore]
+    fn perf_migration_responsiveness() {
+        let dir = tmp_dir("perf");
+        let n: usize = std::env::var("SNAIL_PERF_THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5_000);
+        let t0 = std::time::Instant::now();
+        build_legacy(&dir, &["a@x.test"], n);
+        println!("seeded {n} threads (+msgs/fts/vec/attachments) in {:?}", t0.elapsed());
+        let reg = DbRegistry::open(&dir).unwrap();
+        let mut lat_ms: Vec<f64> = vec![];
+        std::thread::scope(|s| {
+            let reg_ref = &reg;
+            let mig = s.spawn(move || {
+                let t = std::time::Instant::now();
+                migrate_account(reg_ref, "a@x.test", &MigrateOpts::default(), &mut |_| {})
+                    .unwrap();
+                t.elapsed()
+            });
+            // hammer list_threads the way the UI would while the split runs
+            while !mig.is_finished() {
+                let t = std::time::Instant::now();
+                let db = reg.account("a@x.test").unwrap();
+                let conn = db.lock().unwrap();
+                let rows = crate::store::list_threads(&conn, "inbox", "a@x.test").unwrap();
+                drop(conn);
+                assert!(!rows.is_empty());
+                lat_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            let wall = mig.join().unwrap();
+            lat_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let pick = |q: f64| lat_ms[((lat_ms.len() - 1) as f64 * q) as usize];
+            println!(
+                "migration wall-time {wall:?}; list_threads during migration: {} samples, median {:.2}ms, p95 {:.2}ms, max {:.2}ms",
+                lat_ms.len(),
+                pick(0.5),
+                pick(0.95),
+                lat_ms[lat_ms.len() - 1],
+            );
+        });
+        assert!(reg.is_migrated("a@x.test"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn verify_failure_blocks_the_flip() {
         let dir = tmp_dir("verifyfail");
