@@ -1318,37 +1318,36 @@ pub fn attachment_data(conn: &Connection, id: &str) -> Option<Vec<u8>> {
 
 // ---------------------------------------------------------------- drafts
 
-/// Overwrite an existing draft. `id` alone doesn't name a row — it's per-file
-/// AUTOINCREMENT, so the same number exists in every account — hence the
-/// account_id predicate. Returns false when no row matched (the caller then
-/// re-inserts rather than losing the user's work).
-pub fn draft_update(
+pub fn draft_save(
     conn: &Connection,
-    id: i64,
-    account_id: &str,
-    payload: &str,
-    now_ms: i64,
-) -> bool {
-    conn.execute(
-        "UPDATE drafts SET payload = ?3, updated_at = ?4 WHERE id = ?1 AND account_id = ?2",
-        params![id, account_id, payload, now_ms],
-    )
-    .map(|n| n > 0)
-    .unwrap_or(false)
-}
-
-pub fn draft_insert(
-    conn: &Connection,
+    id: Option<i64>,
     account_id: &str,
     payload: &str,
     now_ms: i64,
 ) -> Result<i64, String> {
-    conn.execute(
-        "INSERT INTO drafts (account_id, payload, updated_at) VALUES (?1, ?2, ?3)",
-        params![account_id, payload, now_ms],
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(conn.last_insert_rowid())
+    match id {
+        Some(id) => {
+            let n = conn
+                .execute(
+                    "UPDATE drafts SET payload = ?2, updated_at = ?3 WHERE id = ?1",
+                    params![id, payload, now_ms],
+                )
+                .map_err(|e| e.to_string())?;
+            if n > 0 {
+                return Ok(id);
+            }
+            // row vanished (sent elsewhere) — recreate rather than lose work
+            draft_save(conn, None, account_id, payload, now_ms)
+        }
+        None => {
+            conn.execute(
+                "INSERT INTO drafts (account_id, payload, updated_at) VALUES (?1, ?2, ?3)",
+                params![account_id, payload, now_ms],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(conn.last_insert_rowid())
+        }
+    }
 }
 
 pub fn draft_list(conn: &Connection, account_id: &str) -> Vec<(i64, String, i64)> {
@@ -1364,11 +1363,8 @@ pub fn draft_list(conn: &Connection, account_id: &str) -> Vec<(i64, String, i64)
     .unwrap_or_default()
 }
 
-pub fn draft_delete(conn: &Connection, id: i64, account_id: &str) {
-    let _ = conn.execute(
-        "DELETE FROM drafts WHERE id = ?1 AND account_id = ?2",
-        params![id, account_id],
-    );
+pub fn draft_delete(conn: &Connection, id: i64) {
+    let _ = conn.execute("DELETE FROM drafts WHERE id = ?1", params![id]);
 }
 
 // ---------------------------------------------------------------- outbox
@@ -1387,64 +1383,52 @@ pub fn outbox_add(
     Ok(conn.last_insert_rowid())
 }
 
-/// Remove a pending send and hand the draft back (None = already sent, or the
-/// row belongs to another account). Only an UNCLAIMED row can be pulled back —
-/// a claimed row is mid-flight, so Undo returns None ("already sent") rather
-/// than silently failing to stop it. The caller holds the DB lock, so this
-/// SELECT+DELETE is atomic w.r.t. the outbox processor and accelerate.
-///
-/// Every mutator below takes `account_id` for the same reason `drafts` does:
-/// `id` is per-file AUTOINCREMENT, so it only names a row together with its
-/// owner. (It also keeps accounts apart inside the shared legacy db, which
-/// still serves several of them until the split migration finishes.)
-pub fn outbox_cancel(conn: &Connection, id: i64, account_id: &str) -> Option<OutgoingMail> {
+/// Remove a pending send and hand the draft back (None = already sent). Only an
+/// UNCLAIMED row can be pulled back — a claimed row is mid-flight, so Undo
+/// returns None ("already sent") rather than silently failing to stop it. The
+/// caller holds the DB lock, so this SELECT+DELETE is atomic w.r.t. the outbox
+/// processor and accelerate.
+pub fn outbox_cancel(conn: &Connection, id: i64) -> Option<OutgoingMail> {
     let payload: String = conn
         .query_row(
-            "SELECT payload FROM outbox WHERE id = ?1 AND account_id = ?2 AND claimed = 0",
-            params![id, account_id],
+            "SELECT payload FROM outbox WHERE id = ?1 AND claimed = 0",
+            params![id],
             |r| r.get(0),
         )
         .ok()?;
-    conn.execute(
-        "DELETE FROM outbox WHERE id = ?1 AND account_id = ?2",
-        params![id, account_id],
-    )
-    .ok()?;
+    conn.execute("DELETE FROM outbox WHERE id = ?1", params![id]).ok()?;
     serde_json::from_str(&payload).ok()
 }
 
-/// Read a pending send WITHOUT removing it — the caller (send_outbox_now)
-/// deletes it only after delivery succeeds, so a failed flush leaves it queued
-/// for the processor to retry.
-pub fn outbox_get(conn: &Connection, id: i64, account_id: &str) -> Option<OutgoingMail> {
-    let payload: String = conn
+/// Read a pending send (account + draft) WITHOUT removing it — the caller
+/// (send_outbox_now) deletes it only after delivery succeeds, so a failed flush
+/// leaves it queued for the processor to retry.
+pub fn outbox_get(conn: &Connection, id: i64) -> Option<(String, OutgoingMail)> {
+    let row: Option<(String, String)> = conn
         .query_row(
-            "SELECT payload FROM outbox WHERE id = ?1 AND account_id = ?2",
-            params![id, account_id],
-            |r| r.get(0),
+            "SELECT account_id, payload FROM outbox WHERE id = ?1",
+            params![id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
         )
-        .ok()?;
-    serde_json::from_str(&payload).ok()
+        .ok();
+    row.and_then(|(acc, p)| serde_json::from_str(&p).ok().map(|m| (acc, m)))
 }
 
 /// Atomically mark a pending row as in-flight (claimed 0→1). Returns true only
 /// for the single caller that wins the flip, so exactly one of {processor,
 /// accelerate} ever delivers a given row — the DB lock serializes the UPDATE.
-pub fn outbox_claim(conn: &Connection, id: i64, account_id: &str) -> bool {
+pub fn outbox_claim(conn: &Connection, id: i64) -> bool {
     conn.execute(
-        "UPDATE outbox SET claimed = 1 WHERE id = ?1 AND account_id = ?2 AND claimed = 0",
-        params![id, account_id],
+        "UPDATE outbox SET claimed = 1 WHERE id = ?1 AND claimed = 0",
+        params![id],
     )
     .map(|n| n > 0)
     .unwrap_or(false)
 }
 
 /// Release a claim so a failed delivery can be retried (or cancelled).
-pub fn outbox_unclaim(conn: &Connection, id: i64, account_id: &str) {
-    let _ = conn.execute(
-        "UPDATE outbox SET claimed = 0 WHERE id = ?1 AND account_id = ?2",
-        params![id, account_id],
-    );
+pub fn outbox_unclaim(conn: &Connection, id: i64) {
+    let _ = conn.execute("UPDATE outbox SET claimed = 0 WHERE id = ?1", params![id]);
 }
 
 pub fn outbox_due(conn: &Connection, now_ms: i64) -> Vec<(i64, String, OutgoingMail)> {
@@ -1464,28 +1448,18 @@ pub fn outbox_due(conn: &Connection, now_ms: i64) -> Vec<(i64, String, OutgoingM
     .unwrap_or_default()
 }
 
-pub fn outbox_delete(conn: &Connection, id: i64, account_id: &str) {
-    let _ = conn.execute(
-        "DELETE FROM outbox WHERE id = ?1 AND account_id = ?2",
-        params![id, account_id],
-    );
+pub fn outbox_delete(conn: &Connection, id: i64) {
+    let _ = conn.execute("DELETE FROM outbox WHERE id = ?1", params![id]);
 }
 
 /// Bump a failed send's attempt count and return the new value. Rows are
 /// NEVER deleted here — a message that keeps failing parks at the attempt
 /// cap (outbox_due stops offering it) until a reconnect/resync resets it.
 /// The old behavior silently destroyed queued mail after five tries.
-pub fn outbox_bump_attempts(conn: &Connection, id: i64, account_id: &str) -> i64 {
-    let _ = conn.execute(
-        "UPDATE outbox SET attempts = attempts + 1 WHERE id = ?1 AND account_id = ?2",
-        params![id, account_id],
-    );
-    conn.query_row(
-        "SELECT attempts FROM outbox WHERE id = ?1 AND account_id = ?2",
-        params![id, account_id],
-        |r| r.get(0),
-    )
-    .unwrap_or(0)
+pub fn outbox_bump_attempts(conn: &Connection, id: i64) -> i64 {
+    let _ = conn.execute("UPDATE outbox SET attempts = attempts + 1 WHERE id = ?1", params![id]);
+    conn.query_row("SELECT attempts FROM outbox WHERE id = ?1", params![id], |r| r.get(0))
+        .unwrap_or(0)
 }
 
 /// Fresh attempts for every parked row of an account — called when its grant

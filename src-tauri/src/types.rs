@@ -519,34 +519,12 @@ pub struct OutgoingMail {
 
 /// A locally persisted, unsent compose draft. `payload` is the frontend's
 /// compose state as opaque JSON — the core only stores and lists it.
-///
-/// `account` is part of the row's identity, not decoration: `id` is per-file
-/// AUTOINCREMENT, so it only names a row alongside its owning account.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct DraftEntry {
     pub id: i64,
-    pub account: String,
     pub payload: String,
     pub updated_at: i64,
-}
-
-/// Where a just-saved draft actually landed. The frontend holds this pair and
-/// hands it back on the next save/delete so the row is never resolved by a
-/// bare id (which another account can shadow).
-#[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct DraftRef {
-    pub id: i64,
-    pub account: String,
-}
-
-/// Where a just-queued send landed — the handle Undo Send and "send now" use.
-#[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct OutboxRef {
-    pub id: i64,
-    pub account: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
