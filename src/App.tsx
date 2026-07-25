@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import type { CSSProperties } from "react";
 import { backend, isTauri } from "@/lib/ipc";
 import { commandBindings, runCommandById } from "@/lib/commands";
@@ -116,6 +116,30 @@ export default function App() {
   const migrationPct = migrating
     ? Math.min(99, Math.max(1, Math.round((migration.copied / migration.total) * 100)))
     : 0;
+
+  // Dead grants: gmail accounts whose refresh token no longer works. The
+  // banner + amber dot stay until a reconnect fixes it.
+  const deadAccounts = accounts.accounts.filter(
+    (a) => a.provider === "gmail" && !a.connected && !a.removing
+  );
+  const activeConnected =
+    accounts.accounts.find((a) => a.email === accounts.active)?.connected ?? true;
+  const [reconnecting, setReconnecting] = useState(false);
+  const reconnectDead = async () => {
+    setReconnecting(true);
+    try {
+      // in-place re-consent: token + scopes refresh, the mailbox is untouched
+      await backend.startOauth("", "");
+      await useSettings.getState().refreshAccounts();
+      await backend.syncNow();
+      await useMail.getState().refresh();
+    } catch (e) {
+      useUi.getState().showToast(String(e));
+      await useSettings.getState().refreshAccounts();
+    } finally {
+      setReconnecting(false);
+    }
+  };
 
   // Inbox zero (design "Inbox Zero" pattern): the active split is empty, so
   // the daily photo fills the WHOLE app and the chrome goes translucent above
@@ -305,7 +329,14 @@ export default function App() {
         </span>
         <div className="flex items-center gap-2 rounded-full border border-line bg-surface py-1 pl-1.5 pr-2 hover:border-line-strong">
           <ActiveAvatar email={accounts.active} />
-          <span className="h-1.5 w-1.5 rounded-full bg-ok" title="connected" />
+          <span
+            className={`h-1.5 w-1.5 rounded-full ${activeConnected ? "bg-ok" : "bg-warn"}`}
+            title={
+              activeConnected
+                ? "connected"
+                : "sign-in expired — reconnect in Settings → Account"
+            }
+          />
           {accounts.accounts.length > 1 ? (
             <select
               value={accounts.active}
@@ -387,6 +418,30 @@ export default function App() {
         {/* Theme toggle is intentionally NOT a button — it lives in Shell
             Command (type "theme" or "dark mode"), Superhuman-style. */}
       </header>
+
+      {/* Persistent per-account Reconnect strip: a dead Google grant stays
+          visible (and one click from fixed) until it IS fixed. Gated on
+          `connected` — not on scopes — so it survives restarts, unlike the
+          old one-shot 2.6s toast. */}
+      {deadAccounts.map((a) => (
+        <div
+          key={a.email}
+          className="flex h-9 shrink-0 items-center gap-3 border-b border-warn/40 bg-warn/10 px-3.5 text-[12.5px] text-ink-2"
+        >
+          <span className="h-2 w-2 shrink-0 rounded-full bg-warn" />
+          <span className="min-w-0 flex-1 truncate">
+            Google sign-in for {a.email} expired or was revoked — mail and
+            calendar are paused, queued sends are parked.
+          </span>
+          <button
+            className="shrink-0 rounded-md bg-accent px-2.5 py-1 text-[12px] font-medium text-on-accent hover:opacity-90 disabled:opacity-60"
+            disabled={reconnecting}
+            onClick={() => void reconnectDead()}
+          >
+            {reconnecting ? "Waiting for consent…" : "Reconnect"}
+          </button>
+        </div>
+      ))}
 
       {/* The shortcuts panel docks OUTSIDE <main> so it stays put across
           screens and thread views — the same right-hand slot the calendar

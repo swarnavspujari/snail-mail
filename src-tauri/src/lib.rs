@@ -303,9 +303,17 @@ async fn start_oauth(
         accounts
     };
 
+    // Parked sends from a dead-grant window get fresh attempts now that the
+    // grant is back — the outbox pump picks them up on its next beat.
+    {
+        let db = state.account_db(&email)?;
+        let conn = db.lock().unwrap();
+        store::outbox_reset_attempts(&conn, &email);
+    }
     let session = GmailSession::new_connected(email.clone(), outcome.access_token, outcome.expires_in)
         .ok_or("keychain readback failed")?;
     state.gmail.lock().await.insert(email, session);
+    let _ = app.emit("accounts:updated", &accounts);
     if !missing_features.is_empty() {
         let _ = app.emit(
             "app:notice",
@@ -864,6 +872,7 @@ fn spawn_calendar_sync(app: AppHandle, email: String, force: bool) {
                 let _ = app.emit("calendar:updated", Option::<String>::None);
             }
             Err(e) => {
+                classify_sync_error(&app, &email, &e).await;
                 let _ = app.emit("calendar:updated", Some(e));
             }
         }
@@ -1527,6 +1536,7 @@ fn spawn_people_sync(app: AppHandle, email: String) {
     tauri::async_runtime::spawn(async move {
         if let Err(e) = people_sync(&app, &email).await {
             eprintln!("[people:{email}] sync skipped: {e}");
+            classify_sync_error(&app, &email, &e).await;
         }
     });
 }
@@ -1606,6 +1616,7 @@ fn spawn_sendas_fetch(app: AppHandle, email: String) {
     tauri::async_runtime::spawn(async move {
         if let Err(e) = sendas_fetch(&app, &email).await {
             eprintln!("[sendas:{email}] fetch skipped: {e}");
+            classify_sync_error(&app, &email, &e).await;
         }
     });
 }
@@ -1775,6 +1786,45 @@ fn is_auth_revoked(err: &str) -> bool {
     err.contains("invalid_grant")
 }
 
+/// Inside a sessions-iteration loop: does this error mean the grant is dead?
+/// `invalid_grant` answers directly; a bare 401 (bearer-style calls have no
+/// internal retry) probes ONE forced refresh — a dead grant turns it into a
+/// classifiable `invalid_grant` in seconds instead of at token expiry. Takes
+/// the session directly because callers already hold the map borrow.
+async fn is_grant_dead(http: &reqwest::Client, session: &mut GmailSession, err: &str) -> bool {
+    if is_auth_revoked(err) {
+        return true;
+    }
+    if err.contains("401") {
+        session.invalidate_access_token();
+        if let Err(probe) = session.bearer(http).await {
+            return is_auth_revoked(&probe);
+        }
+    }
+    false
+}
+
+/// Classify a sync-surface failure from a path that does NOT already hold
+/// the gmail sessions map (calendar, people, send-as, crawl, outbox). On a
+/// dead grant: drop the session and flip the account to disconnected.
+/// Returns true when auth was lost.
+async fn classify_sync_error(app: &AppHandle, email: &str, err: &str) -> bool {
+    let state = app.state::<AppState>();
+    let dead = {
+        let mut sessions = state.gmail.lock().await;
+        match sessions.get_mut(email) {
+            Some(session) => is_grant_dead(&state.http, session, err).await,
+            // no session at all: only classify what the error itself proves
+            None => is_auth_revoked(err),
+        }
+    };
+    if dead {
+        state.gmail.lock().await.remove(email);
+        mark_auth_lost(app, email);
+    }
+    dead
+}
+
 /// Surface a dead grant instead of hiding it: flag the account (Settings
 /// shows the amber dot) and tell the user once. The caller drops the session,
 /// which stops the retry loop; a boot rebuilds one from the keychain, fails
@@ -1799,6 +1849,10 @@ fn mark_auth_lost(app: &AppHandle, email: &str) {
         flipped
     };
     if flipped {
+        // push the flip so the banner/dot/settings react NOW — the accounts
+        // list is otherwise pull-only and a running app never re-reads it
+        let accounts = { store::get_accounts(&state.global().lock().unwrap()) };
+        let _ = app.emit("accounts:updated", &accounts);
         let _ = app.emit(
             "app:notice",
             format!(
@@ -1826,7 +1880,7 @@ fn sync_in_background(app: AppHandle) {
                 Ok(c) => changed |= c,
                 Err(e) => {
                     eprintln!("[sync:{email}] {e}");
-                    if is_auth_revoked(&e) {
+                    if is_grant_dead(&state.http, session, &e).await {
                         lost.push(email.clone());
                     }
                 }
@@ -1924,7 +1978,10 @@ fn spawn_history_crawl(app: AppHandle) {
                     b.total_indexed,
                     if b.done { "; full history indexed" } else { "" }
                 ),
-                Err(e) => eprintln!("[crawl:{email}] {e}"),
+                Err(e) => {
+                    eprintln!("[crawl:{email}] {e}");
+                    classify_sync_error(&app, &email, &e).await;
+                }
             }
             // Semantic indexing: embed whatever the crawl/sync landed. Local
             // model by default; the optional remote provider when configured.
@@ -1982,15 +2039,36 @@ async fn sync_now(app: AppHandle, state: State<'_, AppState>) -> Result<(), Stri
         let _ = app.emit("mail:updated", ());
         emit_sync_progress(&app);
     };
+    // Per-account: one failing account no longer aborts the loop and strands
+    // every account after it; dead grants classify instead of just erroring.
+    let mut first_err: Option<String> = None;
+    let mut lost: Vec<String> = vec![];
     let mut sessions = state.gmail.lock().await;
     for (email, session) in sessions.iter_mut() {
         let db = state.account_db(email)?;
-        mail::sync::full_sync(&state.http, session, &db, email, false, &on_progress).await?;
+        if let Err(e) =
+            mail::sync::full_sync(&state.http, session, &db, email, false, &on_progress).await
+        {
+            eprintln!("[sync-now:{email}] {e}");
+            if is_grant_dead(&state.http, session, &e).await {
+                lost.push(email.clone());
+            }
+            first_err.get_or_insert(e);
+        }
+    }
+    for email in &lost {
+        sessions.remove(email);
     }
     drop(sessions);
+    for email in &lost {
+        mark_auth_lost(&app, email);
+    }
     let _ = app.emit("mail:updated", ());
     emit_sync_progress(&app);
-    Ok(())
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// Repair: forget the incremental baseline and per-thread historyIds, then
@@ -2013,16 +2091,35 @@ async fn resync_account(app: AppHandle, state: State<'_, AppState>) -> Result<()
         let _ = app.emit("mail:updated", ());
         emit_sync_progress(&app);
     };
+    let mut first_err: Option<String> = None;
+    let mut lost: Vec<String> = vec![];
     let mut sessions = state.gmail.lock().await;
     for (email, session) in sessions.iter_mut() {
         // force a full reconcile — every thread re-parsed, bodies healed
         let db = state.account_db(email)?;
-        mail::sync::full_sync(&state.http, session, &db, email, true, &on_progress).await?;
+        if let Err(e) =
+            mail::sync::full_sync(&state.http, session, &db, email, true, &on_progress).await
+        {
+            eprintln!("[resync:{email}] {e}");
+            if is_grant_dead(&state.http, session, &e).await {
+                lost.push(email.clone());
+            }
+            first_err.get_or_insert(e);
+        }
+    }
+    for email in &lost {
+        sessions.remove(email);
     }
     drop(sessions);
+    for email in &lost {
+        mark_auth_lost(&app, email);
+    }
     let _ = app.emit("mail:updated", ());
     emit_sync_progress(&app);
-    Ok(())
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 // ---------------------------------------------------------------- reading
@@ -3942,7 +4039,19 @@ pub fn run() {
                         continue; // sends resume the moment the split finishes
                     }
                     let mut sent_any = false;
+                    let snapshot = { store::get_accounts(&state.global().lock().unwrap()) };
                     for email in state.dbs.registered_emails() {
+                        // A dead grant PARKS the account's queue: rows stay,
+                        // attempts don't burn, and delivery resumes the moment
+                        // a reconnect flips `connected` back. (The old loop
+                        // burned 5 attempts in ~15s and silently deleted the
+                        // mail.)
+                        let deliverable = snapshot.accounts.iter().any(|a| {
+                            a.email == email && !a.removing && (a.connected || a.provider != "gmail")
+                        });
+                        if !deliverable {
+                            continue;
+                        }
                         let Ok(db) = state.account_db(&email) else { continue };
                         let due = {
                             let conn = db.lock().unwrap();
@@ -3972,9 +4081,27 @@ pub fn run() {
                                 }
                                 Err(e) => {
                                     eprintln!("[outbox] send failed (will retry): {e}");
-                                    let conn = db.lock().unwrap();
-                                    store::outbox_unclaim(&conn, id);
-                                    store::outbox_bump_attempts(&conn, id);
+                                    let auth_dead =
+                                        classify_sync_error(&outbox_handle, &account, &e).await;
+                                    let attempts = {
+                                        let conn = db.lock().unwrap();
+                                        store::outbox_unclaim(&conn, id);
+                                        // auth failures park without burning
+                                        // attempts — the message isn't at fault
+                                        if auth_dead {
+                                            0
+                                        } else {
+                                            store::outbox_bump_attempts(&conn, id)
+                                        }
+                                    };
+                                    if attempts == 5 {
+                                        let _ = outbox_handle.emit(
+                                            "app:notice",
+                                            format!(
+                                                "A message from {account} couldn't send after 5 tries — it stays queued and retries after a reconnect."
+                                            ),
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -4067,16 +4194,30 @@ pub fn run() {
                     emit_sync_progress(&boot);
                 };
                 let mut changed = false;
+                let mut lost: Vec<String> = vec![];
                 {
                     let mut sessions = state.gmail.lock().await;
                     for (email, session) in sessions.iter_mut() {
                         let Ok(db) = state.account_db(email) else { continue };
-                        if let Ok(c) =
-                            mail::sync::full_sync(&state.http, session, &db, email, true, &on_progress).await
+                        match mail::sync::full_sync(&state.http, session, &db, email, true, &on_progress).await
                         {
-                            changed |= c;
+                            Ok(c) => changed |= c,
+                            // The boot reconcile used to swallow this — a dead
+                            // grant was invisible until the first 30s tick.
+                            Err(e) => {
+                                eprintln!("[boot-sync:{email}] {e}");
+                                if is_grant_dead(&state.http, session, &e).await {
+                                    lost.push(email.clone());
+                                }
+                            }
                         }
                     }
+                    for email in &lost {
+                        sessions.remove(email);
+                    }
+                }
+                for email in &lost {
+                    mark_auth_lost(&boot, email);
                 }
                 if changed {
                     let _ = boot.emit("mail:updated", ());
@@ -4145,7 +4286,7 @@ pub fn run() {
                                 // no log line and no UI signal.
                                 Err(e) => {
                                     eprintln!("[sync:{email}] {e}");
-                                    if is_auth_revoked(&e) {
+                                    if is_grant_dead(&state.http, session, &e).await {
                                         lost.push(email.clone());
                                     }
                                 }
@@ -4174,7 +4315,9 @@ pub fn run() {
                             store::get_accounts(&state.global().lock().unwrap())
                                 .accounts
                                 .iter()
-                                .filter(|a| a.provider == "gmail")
+                                // a dead grant can't sync calendars/contacts;
+                                // spawning doomed passes just spams the panel
+                                .filter(|a| a.provider == "gmail" && a.connected && !a.removing)
                                 .map(|a| a.email.clone())
                                 .collect()
                         };
@@ -4327,6 +4470,65 @@ fn migrate_legacy_db(data_dir: &std::path::Path) {
             }
         }
         return;
+    }
+}
+
+#[cfg(test)]
+mod auth_classification_tests {
+    use super::is_auth_revoked;
+
+    #[test]
+    fn invalid_grant_classifies_regardless_of_wrapper() {
+        // the refresh endpoint's error, as oauth::refresh_access_token formats it
+        assert!(is_auth_revoked(
+            r#"token refresh failed (400 Bad Request): {"error": "invalid_grant", "error_description": "Token has been expired or revoked."}"#
+        ));
+        // the same marker surviving inside another surface's wrapper
+        assert!(is_auth_revoked("calendar sync: token refresh failed (400): invalid_grant"));
+    }
+
+    #[test]
+    fn non_auth_failures_do_not_classify() {
+        // a bare 401 alone is NOT proof of a dead grant — only the forced
+        // refresh probe (is_grant_dead) may promote it
+        assert!(!is_auth_revoked(r#"Gmail API error (401 Unauthorized): {"error": {"code": 401, "message": "Invalid Credentials", "status": "UNAUTHENTICATED"}}"#));
+        assert!(!is_auth_revoked("Gmail API error (403 Forbidden): accessNotConfigured"));
+        assert!(!is_auth_revoked("Gmail request failed (network)"));
+        assert!(!is_auth_revoked("Gmail API rate-limited; try again shortly"));
+        // a scope problem is fixable by re-consent, not a revoked grant
+        assert!(!is_auth_revoked("token refresh failed (400): invalid_scope"));
+    }
+
+    #[test]
+    fn outbox_rows_park_instead_of_being_destroyed() {
+        let conn = crate::store::open(std::path::Path::new(":memory:")).unwrap();
+        let mail = crate::types::OutgoingMail {
+            to: vec!["x@y.test".into()],
+            cc: vec![],
+            bcc: vec![],
+            subject: "s".into(),
+            body_text: "b".into(),
+            body_html: None,
+            reply_all: false,
+            attachments: vec![],
+            thread_id: None,
+        };
+        let id = crate::store::outbox_add(&conn, "a@x.test", &mail, 0).unwrap();
+        // five failed deliveries: the row must survive (the old code deleted it)
+        for want in 1..=5i64 {
+            assert_eq!(crate::store::outbox_bump_attempts(&conn, id), want);
+        }
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM outbox", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1, "parked, not destroyed");
+        // at the cap it is no longer offered for delivery…
+        assert!(crate::store::outbox_due(&conn, now()).is_empty());
+        // …until a reconnect resets it
+        crate::store::outbox_reset_attempts(&conn, "a@x.test");
+        assert_eq!(crate::store::outbox_due(&conn, now()).len(), 1);
+    }
+
+    fn now() -> i64 {
+        chrono::Utc::now().timestamp_millis()
     }
 }
 

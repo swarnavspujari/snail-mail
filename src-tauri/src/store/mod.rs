@@ -1391,10 +1391,23 @@ pub fn outbox_delete(conn: &Connection, id: i64) {
     let _ = conn.execute("DELETE FROM outbox WHERE id = ?1", params![id]);
 }
 
-pub fn outbox_bump_attempts(conn: &Connection, id: i64) {
+/// Bump a failed send's attempt count and return the new value. Rows are
+/// NEVER deleted here — a message that keeps failing parks at the attempt
+/// cap (outbox_due stops offering it) until a reconnect/resync resets it.
+/// The old behavior silently destroyed queued mail after five tries.
+pub fn outbox_bump_attempts(conn: &Connection, id: i64) -> i64 {
     let _ = conn.execute("UPDATE outbox SET attempts = attempts + 1 WHERE id = ?1", params![id]);
-    // rows that exhausted their retries are dropped so they can't loop forever
-    let _ = conn.execute("DELETE FROM outbox WHERE attempts >= 5", []);
+    conn.query_row("SELECT attempts FROM outbox WHERE id = ?1", params![id], |r| r.get(0))
+        .unwrap_or(0)
+}
+
+/// Fresh attempts for every parked row of an account — called when its grant
+/// comes back so queued mail resumes delivering.
+pub fn outbox_reset_attempts(conn: &Connection, account_id: &str) {
+    let _ = conn.execute(
+        "UPDATE outbox SET attempts = 0, claimed = 0 WHERE account_id = ?1",
+        params![account_id],
+    );
 }
 
 /// Trash = remove the thread from the local cache entirely (Gmail keeps it
