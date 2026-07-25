@@ -43,14 +43,63 @@ jobs:
       - name: webkit + keychain build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libssl-dev libdbus-1-dev pkg-config
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libssl-dev libdbus-1-dev pkg-config gnome-keyring
       - uses: dtolnay/rust-toolchain@stable
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
-      - name: cargo test
+      # The secrets tests talk to a REAL credential store: keyring's
+      # sync-secret-service feature resolves to dbus-secret-service, which needs
+      # org.freedesktop.secrets on the session bus. A bare runner has no
+      # provider, so the whole suite runs inside a private D-Bus session with
+      # gnome-keyring started in it. Everything must live in ONE dbus-run-session
+      # — the daemon registers on that bus and dies with it.
+      - name: cargo test (real Secret Service via gnome-keyring)
         working-directory: src-tauri
-        run: cargo test --locked --features demo-fixtures
+        run: |
+          cat > /tmp/keyring-test.sh <<'SCRIPT'
+          set -euo pipefail
+          # a stale locked login keyring would block every set_password
+          rm -rf "$HOME/.local/share/keyrings"
+          # --unlock reads the password from stdin and creates the login keyring
+          # if absent; --components=secrets skips the ssh/gpg agents we never use
+          echo -n "ci-keyring" | gnome-keyring-daemon --unlock --components=secrets
+          ready=""
+          for _ in $(seq 1 40); do
+            if dbus-send --session --dest=org.freedesktop.DBus --type=method_call \
+                 --print-reply /org/freedesktop/DBus org.freedesktop.DBus.NameHasOwner \
+                 string:org.freedesktop.secrets 2>/dev/null | grep -q "boolean true"; then
+              ready=1
+              break
+            fi
+            sleep 0.25
+          done
+          # Fail loudly. Running the suite without a store would just re-ignore
+          # the keychain tests, which is the exact silence this step removes.
+          if [ -z "$ready" ]; then
+            echo "org.freedesktop.secrets never appeared on the session bus" >&2
+            exit 1
+          fi
+          cargo test --locked --features demo-fixtures 2>&1 | tee /tmp/cargo-test.log
+          SCRIPT
+          dbus-run-session -- bash /tmp/keyring-test.sh
+      # Guards the point of the step above: these four are the credential-store
+      # chain the uninstall purge depends on. If a future change re-ignores or
+      # renames them, the suite would still pass green — so assert by name that
+      # each one actually ran.
+      - name: the keychain tests really ran
+        run: |
+          for t in primary_wins_when_present_everywhere \
+                   legacy_hit_is_returned_and_copied_forward \
+                   newer_legacy_service_wins_over_older \
+                   delete_removes_every_service_copy_so_nothing_resurrects; do
+            if ! grep -qE "secrets::tests::$t \.\.\. .*ok" /tmp/cargo-test.log; then
+              echo "keychain test did not run against a real store: $t" >&2
+              grep -E "secrets::tests::$t" /tmp/cargo-test.log >&2 || true
+              exit 1
+            fi
+            echo "ran: $t"
+          done
 
   # Same job for macOS: WebKit and Security.framework ship with the OS, so
   # unlike Linux there are no deps to install. This is the only CI leg that

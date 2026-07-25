@@ -128,6 +128,14 @@ mod tests {
 
     /// Real OS-keychain entries under throwaway service names, wiped before
     /// and after each test so nothing lingers in Credential Manager.
+    ///
+    /// These hit the actual platform store — Credential Manager on Windows,
+    /// Keychain on macOS, a Secret Service provider on Linux. CI supplies the
+    /// last one by running the suite inside a dbus-run-session with
+    /// gnome-keyring (see the linux job in .github/workflows/build.yml); a
+    /// bare headless box has no org.freedesktop.secrets and these will fail
+    /// rather than skip, which is deliberate — this chain is what the
+    /// uninstall credential purge depends on.
     struct Scratch(&'static [&'static str], &'static str);
     impl Scratch {
         fn new(services: &'static [&'static str], name: &'static str) -> Self {
@@ -159,12 +167,6 @@ mod tests {
     const MID: &str = "SnailHopTestMid";
     const OLD: &str = "SnailHopTestOld";
 
-    // Writes to the real OS credential store. Headless Linux CI has no
-    // org.freedesktop.secrets provider, so set_password errors there; these
-    // run on Windows and macOS dev machines (and any Linux desktop with a
-    // keyring). The read-only absent_everywhere_is_none case stays enabled
-    // everywhere — it tolerates a missing store by design.
-    #[cfg_attr(target_os = "linux", ignore = "needs an OS keychain (no secret service on headless CI)")]
     #[test]
     fn primary_wins_when_present_everywhere() {
         let s = Scratch::new(&[NEW, MID, OLD], "t:primary");
@@ -173,12 +175,6 @@ mod tests {
         assert_eq!(chain_get(NEW, &[MID, OLD], "t:primary").as_deref(), Some("new-v"));
     }
 
-    // Writes to the real OS credential store. Headless Linux CI has no
-    // org.freedesktop.secrets provider, so set_password errors there; these
-    // run on Windows and macOS dev machines (and any Linux desktop with a
-    // keyring). The read-only absent_everywhere_is_none case stays enabled
-    // everywhere — it tolerates a missing store by design.
-    #[cfg_attr(target_os = "linux", ignore = "needs an OS keychain (no secret service on headless CI)")]
     #[test]
     fn legacy_hit_is_returned_and_copied_forward() {
         let s = Scratch::new(&[NEW, MID, OLD], "t:copy-fwd");
@@ -188,12 +184,6 @@ mod tests {
         assert_eq!(s.get(NEW).as_deref(), Some("old-v"));
     }
 
-    // Writes to the real OS credential store. Headless Linux CI has no
-    // org.freedesktop.secrets provider, so set_password errors there; these
-    // run on Windows and macOS dev machines (and any Linux desktop with a
-    // keyring). The read-only absent_everywhere_is_none case stays enabled
-    // everywhere — it tolerates a missing store by design.
-    #[cfg_attr(target_os = "linux", ignore = "needs an OS keychain (no secret service on headless CI)")]
     #[test]
     fn newer_legacy_service_wins_over_older() {
         let s = Scratch::new(&[NEW, MID, OLD], "t:order");
@@ -208,12 +198,6 @@ mod tests {
         assert_eq!(chain_get(NEW, &[MID, OLD], "t:absent"), None);
     }
 
-    // Writes to the real OS credential store. Headless Linux CI has no
-    // org.freedesktop.secrets provider, so set_password errors there; these
-    // run on Windows and macOS dev machines (and any Linux desktop with a
-    // keyring). The read-only absent_everywhere_is_none case stays enabled
-    // everywhere — it tolerates a missing store by design.
-    #[cfg_attr(target_os = "linux", ignore = "needs an OS keychain (no secret service on headless CI)")]
     #[test]
     fn delete_removes_every_service_copy_so_nothing_resurrects() {
         let s = Scratch::new(&[NEW, MID, OLD], "t:del-all");
