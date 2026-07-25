@@ -4,6 +4,7 @@ import { backend, isTauri } from "@/lib/ipc";
 import { commandBindings, runCommandById } from "@/lib/commands";
 import { installKeyboard } from "@/lib/keyboard";
 import { startUpdateChecks, useUpdater } from "@/lib/updater";
+import { needsConnect } from "@/lib/zero-state";
 import { clearMailCaches, splitThreads, useMail } from "@/stores/mail";
 import { useProfiles, useSettings } from "@/stores/settings";
 import { useUi } from "@/stores/ui";
@@ -263,7 +264,11 @@ export default function App() {
     );
   }
 
-  if (!onboarded) {
+  // Desktop with nothing connected lands here too, not just first-run: the
+  // backend no longer invents a demo pair to stand in for "no accounts", and
+  // `onboarded` is persisted, so a user who disconnects their last account
+  // would otherwise fall through to an empty inbox.
+  if (!onboarded || needsConnect(isTauri, accounts.accounts)) {
     return (
       <div className="relative h-full bg-base">
         <Onboarding />
