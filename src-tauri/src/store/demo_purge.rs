@@ -339,6 +339,43 @@ mod tests {
         assert!(already_purged(&conn));
     }
 
+    /// Runs the sweep against a real database, for verifying the migration on
+    /// a copy of an actual install before shipping it. Never point this at a
+    /// live db — it deletes rows.
+    ///
+    ///   SNAIL_PURGE_DB=/path/to/copy-of/fission.db \
+    ///     cargo test purge_a_real_db -- --ignored --nocapture
+    #[test]
+    #[ignore = "needs SNAIL_PURGE_DB pointing at a COPY of a real database"]
+    fn purge_a_real_db() {
+        let path = std::env::var("SNAIL_PURGE_DB").expect("set SNAIL_PURGE_DB");
+        let conn = crate::store::open(std::path::Path::new(&path)).unwrap();
+
+        let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap_or(-1) };
+        let threads = "SELECT COUNT(*) FROM threads";
+        let fixtures = "SELECT COUNT(*) FROM threads
+                        WHERE (id LIKE 't-%' OR id LIKE 't2-%')
+                          AND account_id LIKE '%@fission.local'";
+        let demo_acct = "SELECT COUNT(*) FROM threads WHERE account_id LIKE '%@fission.local'";
+
+        println!("BEFORE threads={} fixtures={} demo_account_rows={} messages={}",
+            count(threads), count(fixtures), count(demo_acct),
+            count("SELECT COUNT(*) FROM messages"));
+        println!("registry: {:?}", crate::store::get_json::<AccountsState>(&conn, "accounts"));
+
+        let swept = sweep_demo_rows(&conn).unwrap();
+        let removed = purge_registry(&conn).unwrap();
+        sweep_demo_kv(&conn).unwrap();
+
+        println!("SWEPT {swept} fixture threads; removed accounts {removed:?}");
+        println!("AFTER  threads={} fixtures={} demo_account_rows={} messages={}",
+            count(threads), count(fixtures), count(demo_acct),
+            count("SELECT COUNT(*) FROM messages"));
+        println!("registry: {:?}", crate::store::get_json::<AccountsState>(&conn, "accounts"));
+
+        assert_eq!(count(fixtures), 0, "every fixture thread must be gone");
+    }
+
     #[test]
     fn sweeps_the_rsvp_overlay() {
         let conn = global_db();
