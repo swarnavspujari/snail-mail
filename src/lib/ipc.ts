@@ -19,6 +19,7 @@ import type {
   EventDraft,
   EventWriteResult,
   MailAttachment,
+  MigrationProgress,
   LintHit,
   RsvpResponse,
   SendUpdates,
@@ -234,6 +235,9 @@ export interface Backend {
   onTriageError(cb: (message: string) => void): () => void;
   /** General user-facing notice from the core (e.g. a partial OAuth grant). */
   onNotice(cb: (message: string) => void): () => void;
+  /** Fires while the one-time per-account storage split runs (desktop only).
+   *  A payload with table === "done" means the split finished. */
+  onMigrationProgress(cb: (p: MigrationProgress) => void): () => void;
 }
 
 export const isTauri =
@@ -589,6 +593,12 @@ class TauriBackend implements Backend {
   }
   onNotice(cb: (message: string) => void): () => void {
     const un = listen<string>("app:notice", (e) => cb(e.payload));
+    return () => {
+      void un.then((f) => f());
+    };
+  }
+  onMigrationProgress(cb: (p: MigrationProgress) => void): () => void {
+    const un = listen<MigrationProgress>("migration:progress", (e) => cb(e.payload));
     return () => {
       void un.then((f) => f());
     };

@@ -83,6 +83,7 @@ export default function App() {
   const toast = useUi((s) => s.toast);
   const pendingSend = useUi((s) => s.pendingSend);
   const syncProgress = useUi((s) => s.syncProgress);
+  const migration = useUi((s) => s.migration);
   const openThreadId = useMail((s) => s.openThreadId);
   const listView = useMail((s) => s.listView);
   const activeSplitId = useMail((s) => s.activeSplitId);
@@ -109,6 +110,12 @@ export default function App() {
   const downloadPct = downloading
     ? Math.min(99, Math.max(1, Math.round((syncProgress.indexed / syncProgress.total) * 100)))
     : 0;
+  // One-time storage split after the per-account-files update: same strip
+  // treatment, cleared by the final `table === "done"` payload.
+  const migrating = !!migration && migration.total > 0;
+  const migrationPct = migrating
+    ? Math.min(99, Math.max(1, Math.round((migration.copied / migration.total) * 100)))
+    : 0;
 
   // Inbox zero (design "Inbox Zero" pattern): the active split is empty, so
   // the daily photo fills the WHOLE app and the chrome goes translucent above
@@ -120,7 +127,7 @@ export default function App() {
     listView === "inbox" &&
     mailLoaded &&
     splitThreads(inboxThreads, activeSplitId).length === 0;
-  const footerVisible = showShortcutBar || downloading;
+  const footerVisible = showShortcutBar || downloading || migrating;
 
   // The attribute must flip BEFORE React re-renders: QuoteFrame (compose)
   // bakes the current token values into its iframe srcDoc during render, and
@@ -163,6 +170,10 @@ export default function App() {
     const unSync = backend.onSyncProgress((p) =>
       useUi.getState().setSyncProgress(p)
     );
+    // one-time per-account storage split → "Optimizing mail storage… N%"
+    const unMigration = backend.onMigrationProgress((p) =>
+      useUi.getState().setMigration(p)
+    );
     // inline images for the open thread resolved in the background — re-read it
     const unImages = backend.onThreadImages((id) => {
       if (useMail.getState().openThreadId === id)
@@ -185,6 +196,7 @@ export default function App() {
       clearTimeout(timer);
       unMail();
       unSync();
+      unMigration();
       unImages();
       unTriage();
       unNotice();
@@ -432,6 +444,15 @@ export default function App() {
               : undefined
           }
         >
+          {migrating && (
+            <span
+              className="flex shrink-0 items-center gap-2 whitespace-nowrap text-ink-2"
+              title={`${migration!.copied.toLocaleString()} of ${migration!.total.toLocaleString()} rows moved for ${migration!.email}`}
+            >
+              <span className="zb-spin inline-block h-3 w-3 rounded-full border-2 border-line-strong border-t-accent" />
+              Optimizing mail storage… {migrationPct}%
+            </span>
+          )}
           {downloading && (
             <span
               className="flex shrink-0 items-center gap-2 whitespace-nowrap text-ink-2"

@@ -21,9 +21,12 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use types::*;
 
 pub struct AppState {
-    /// Arc so the blocking embed beat can own a handle across threads;
-    /// everything else keeps calling state.db.lock() through the deref.
-    db: Arc<Mutex<Connection>>,
+    /// global.db + one file per account. Every handle is an
+    /// Arc<Mutex<Connection>> so blocking beats can own one across threads.
+    dbs: store::registry::DbRegistry,
+    /// True while the legacy fission.db is being split into per-account
+    /// files; the periodic loops sit out until the cutover completes.
+    migrating: AtomicBool,
     http: reqwest::Client,
     /// One live session per connected Gmail account, keyed by email.
     gmail: tokio::sync::Mutex<HashMap<String, GmailSession>>,
@@ -47,6 +50,64 @@ struct DriveUpload {
     account: String,
     sent: i64,
     total: i64,
+}
+
+impl AppState {
+    /// The app-wide db: settings, accounts registry, streaks, kb.
+    fn global(&self) -> Arc<Mutex<Connection>> {
+        self.dbs.global()
+    }
+
+    fn active_email(&self) -> String {
+        store::get_accounts(&self.dbs.global().lock().unwrap()).active
+    }
+
+    /// The active account's db — what most list/mutate commands operate on.
+    fn active_db(&self) -> Result<Arc<Mutex<Connection>>, String> {
+        let email = self.active_email();
+        if email.is_empty() {
+            return Err("no active account".into());
+        }
+        self.dbs.account(&email)
+    }
+
+    fn account_db(&self, email: &str) -> Result<Arc<Mutex<Connection>>, String> {
+        self.dbs.account(email)
+    }
+
+    /// Resolve which account owns a thread: the active account's file almost
+    /// always has it, so probe that first, then the rest of the registry.
+    /// Returns the OWNING email (the row's account_id — during the migration
+    /// window a legacy-conn probe can surface another account's thread).
+    fn thread_db(&self, thread_id: &str) -> Result<(String, Arc<Mutex<Connection>>), String> {
+        let active = self.active_email();
+        let mut emails = vec![];
+        if !active.is_empty() {
+            emails.push(active.clone());
+        }
+        for e in self.dbs.registered_emails() {
+            if e != active {
+                emails.push(e);
+            }
+        }
+        for email in emails {
+            let db = self.dbs.account(&email)?;
+            let owner: Option<String> = {
+                let conn = db.lock().unwrap();
+                conn.query_row(
+                    "SELECT account_id FROM threads WHERE id = ?1",
+                    rusqlite::params![thread_id],
+                    |r| r.get(0),
+                )
+                .ok()
+            };
+            if let Some(owner) = owner {
+                let db = if owner == email { db } else { self.dbs.account(&owner)? };
+                return Ok((owner, db));
+            }
+        }
+        Err("unknown thread".into())
+    }
 }
 
 // A Google OAuth "Desktop app" client baked in at build time (CI secrets), so
@@ -96,16 +157,17 @@ fn valid_id(id: &str) -> Result<(), String> {
 // ---------------------------------------------------------------- accounts
 
 #[tauri::command]
-fn get_accounts(state: State<'_, AppState>) -> AccountsState {
+async fn get_accounts(state: State<'_, AppState>) -> Result<AccountsState, String> {
     // boot breadcrumb: proves the webview⇄core IPC round-trip in dev logs
     #[cfg(debug_assertions)]
     eprintln!("[ipc] get_accounts");
-    store::get_accounts(&state.db.lock().unwrap())
+    Ok(store::get_accounts(&state.global().lock().unwrap()))
 }
 
 #[tauri::command]
-fn switch_account(state: State<'_, AppState>, email: String) -> Result<AccountsState, String> {
-    let conn = state.db.lock().unwrap();
+async fn switch_account(state: State<'_, AppState>, email: String) -> Result<AccountsState, String> {
+    let db = state.global();
+    let conn = db.lock().unwrap();
     let mut accounts = store::get_accounts(&conn);
     if !accounts.accounts.iter().any(|a| a.email == email) {
         return Err("unknown account".into());
@@ -116,8 +178,9 @@ fn switch_account(state: State<'_, AppState>, email: String) -> Result<AccountsS
 }
 
 #[tauri::command]
-fn reorder_accounts(state: State<'_, AppState>, emails: Vec<String>) -> Result<AccountsState, String> {
-    let conn = state.db.lock().unwrap();
+async fn reorder_accounts(state: State<'_, AppState>, emails: Vec<String>) -> Result<AccountsState, String> {
+    let db = state.global();
+    let conn = db.lock().unwrap();
     let mut accounts = store::get_accounts(&conn);
     if emails.len() != accounts.accounts.len() {
         return Err("account list mismatch".into());
@@ -186,7 +249,8 @@ async fn start_oauth(
             .granted_scope
             .clone()
             .unwrap_or_else(|| mail::oauth::requested_scope().to_string());
-        let conn = state.db.lock().unwrap();
+        let db = state.account_db(&email)?;
+        let conn = db.lock().unwrap();
         let _ = store::set_json(&conn, &format!("granted_scopes:{email}"), &scope);
         // A fresh grant never needs the "reconnect for new features" notice.
         let _ = store::set_json(&conn, &format!("scope_notice_shown:{email}"), &true);
@@ -194,19 +258,23 @@ async fn start_oauth(
 
     // Grab the display name + photo while we hold a fresh access token.
     if let Some(prof) = fetch_google_profile(&state.http, &outcome.access_token).await {
-        let conn = state.db.lock().unwrap();
+        let db = state.account_db(&email)?;
+        let conn = db.lock().unwrap();
         let _ = store::set_json(&conn, &format!("profile:{email}"), &prof);
     }
 
     let accounts = {
-        let conn = state.db.lock().unwrap();
-        let mut accounts = store::get_accounts(&conn);
+        // Read under the global lock, purge fixtures outside it —
+        // account_db() itself needs the global lock (migration flags), so
+        // holding the guard across it would self-deadlock.
+        let mut accounts = { store::get_accounts(&state.global().lock().unwrap()) };
         // first real account replaces the demo pair (and their fixture mail)
         if accounts.accounts.iter().all(|a| a.provider == "mock") {
-            for a in &accounts.accounts {
-                store::clear_account_mail(&conn, &a.email)?;
+            for a in accounts.accounts.drain(..) {
+                let mock_db = state.account_db(&a.email)?;
+                let mock_conn = mock_db.lock().unwrap();
+                store::clear_account_mail(&mock_conn, &a.email)?;
             }
-            accounts.accounts.clear();
         }
         if let Some(existing) = accounts.accounts.iter_mut().find(|a| a.email == email) {
             // Re-consent for an account that was marked disconnected (dead
@@ -220,7 +288,7 @@ async fn start_oauth(
             });
         }
         accounts.active = email.clone();
-        store::save_accounts(&conn, &accounts)?;
+        store::save_accounts(&state.global().lock().unwrap(), &accounts)?;
         accounts
     };
 
@@ -272,16 +340,17 @@ fn missing_feature_names(granted: Option<&str>) -> Vec<&'static str> {
 /// get nothing (the browser demo's MockBackend answers for itself); a gmail
 /// account with no recorded grant predates v0.12 → legacy_grant.
 #[tauri::command]
-fn get_capabilities(state: State<'_, AppState>, email: String) -> Capabilities {
-    let conn = state.db.lock().unwrap();
-    let is_gmail = store::get_accounts(&conn)
+async fn get_capabilities(state: State<'_, AppState>, email: String) -> Result<Capabilities, String> {
+    let is_gmail = store::get_accounts(&state.global().lock().unwrap())
         .accounts
         .iter()
         .any(|a| a.email == email && a.provider == "gmail");
     if !is_gmail {
-        return Capabilities::default();
+        return Ok(Capabilities::default());
     }
-    match store::get_json::<String>(&conn, &format!("granted_scopes:{email}")) {
+    let db = state.account_db(&email)?;
+    let conn = db.lock().unwrap();
+    Ok(match store::get_json::<String>(&conn, &format!("granted_scopes:{email}")) {
         None => Capabilities { legacy_grant: true, ..Default::default() },
         Some(g) => Capabilities {
             drive: scope_granted(&g, "https://www.googleapis.com/auth/drive"),
@@ -291,7 +360,7 @@ fn get_capabilities(state: State<'_, AppState>, email: String) -> Capabilities {
             settings_read: scope_granted(&g, "https://www.googleapis.com/auth/gmail.settings.basic"),
             legacy_grant: false,
         },
-    }
+    })
 }
 
 #[tauri::command]
@@ -316,11 +385,12 @@ async fn disconnect_account(
     state.gmail.lock().await.remove(&email);
     // The account leaves the list FIRST (fast, transactional) so the UI
     // updates instantly; the bulky mail purge runs chunked below. If the app
-    // dies mid-purge, the boot orphan sweep finishes the job.
-    let accounts = {
-        let conn = state.db.lock().unwrap();
+    // dies mid-purge, the boot sweep finishes the job.
+    {
         // Drop the recorded grant + synced Google data: the account is gone
         // (or about to reconnect fresh), so stale state must not linger.
+        let db = state.account_db(&email)?;
+        let conn = db.lock().unwrap();
         for key in [
             "granted_scopes",
             "scope_notice_shown",
@@ -338,15 +408,17 @@ async fn disconnect_account(
         conn.execute("DELETE FROM events WHERE account_id = ?1", [email.as_str()]).ok();
         conn.execute("DELETE FROM kv WHERE key LIKE ?1", [format!("cal_sync:{email}:%")]).ok();
         conn.execute("DELETE FROM kv WHERE key LIKE ?1", [format!("cal_anchor:{email}:%")]).ok();
+    }
+    let accounts = {
+        let db = state.global();
+        let conn = db.lock().unwrap();
         let mut accounts = store::get_accounts(&conn);
         accounts.accounts.retain(|a| a.email != email);
         if accounts.accounts.is_empty() {
             // back to demo mode
             store::set_json(&conn, "accounts", &serde_json::Value::Null).ok();
             conn.execute("DELETE FROM kv WHERE key = 'accounts'", []).ok();
-            let accounts = store::get_accounts(&conn);
-            mail::mock::seed_if_empty(&conn)?;
-            accounts
+            store::get_accounts(&conn)
         } else {
             if accounts.active == email {
                 accounts.active = accounts.accounts[0].email.clone();
@@ -355,6 +427,15 @@ async fn disconnect_account(
             accounts
         }
     };
+    // Back in demo mode → each demo account's fixtures seed into its own file
+    // (no-ops per account when rows already exist).
+    if accounts.accounts.iter().all(|a| a.provider == "mock") {
+        for a in &accounts.accounts {
+            let db = state.account_db(&a.email)?;
+            let conn = db.lock().unwrap();
+            mail::mock::seed_account_if_empty(&conn, &a.email)?;
+        }
+    }
     // Token deletion (secrets::delete sweeps the legacy service names too —
     // a surviving legacy copy would be resurrected by chain_get on the next
     // boot as a permanently-failing revoked token).
@@ -368,10 +449,14 @@ async fn disconnect_account(
     {
         // Disconnected the last real account while its rows still existed →
         // the demo fallback above couldn't seed (threads weren't empty yet).
-        let conn = state.db.lock().unwrap();
-        let acc = store::get_accounts(&conn);
+        let acc = store::get_accounts(&state.global().lock().unwrap());
         if acc.accounts.iter().all(|a| a.provider == "mock") {
-            let _ = mail::mock::seed_if_empty(&conn);
+            for a in &acc.accounts {
+                if let Ok(db) = state.account_db(&a.email) {
+                    let conn = db.lock().unwrap();
+                    let _ = mail::mock::seed_account_if_empty(&conn, &a.email);
+                }
+            }
         }
     }
     let _ = app.emit("mail:updated", ());
@@ -382,52 +467,51 @@ async fn disconnect_account(
 /// transactions so every other command interleaves — the app never freezes
 /// behind a disconnect, however large the account.
 async fn clear_account_mail_chunked(state: &AppState, account_id: &str) -> Result<(), String> {
+    let db = state.account_db(account_id)?;
     loop {
-        // ~200 threads ≈ a one-second lock hold on a 5 GB real-world db
-        // (measured) — long enough to make progress, short enough that
-        // interleaved commands never feel stuck.
+        // ~200 threads per batch: bounded lock holds, and (post-split) the
+        // scans only ever touch this one account's file.
         let ids = {
-            let conn = state.db.lock().unwrap();
+            let conn = db.lock().unwrap();
             store::thread_ids_page(&conn, account_id, 200)?
         };
         if ids.is_empty() {
             return Ok(());
         }
         {
-            let conn = state.db.lock().unwrap();
+            let conn = db.lock().unwrap();
             store::delete_threads(&conn, &ids)?;
         }
         tokio::task::yield_now().await;
     }
 }
 
-/// Boot-time self-heal: any thread rows whose account is no longer in the
-/// accounts list (a disconnect that died mid-purge, or the pre-fix frozen
-/// disconnect that got the app killed) drain away in the background.
-fn spawn_orphan_mail_sweep(app: AppHandle) {
+/// Boot-time self-heal: delete any account db file no registered account
+/// derives to (a removal that died mid-flight). Only runs once the legacy
+/// split fully finished — while migration is live the legacy db is the
+/// source of truth and partial files belong to the migrator.
+fn spawn_account_file_sweep(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         let state = app.state::<AppState>();
-        let orphans: Vec<String> = {
-            let conn = state.db.lock().unwrap();
-            let known: Vec<String> = store::get_accounts(&conn)
-                .accounts
-                .iter()
-                .map(|a| a.email.clone())
-                .collect();
-            let mut stmt = match conn.prepare("SELECT DISTINCT account_id FROM threads") {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            let all: Vec<String> = stmt
-                .query_map([], |r| r.get::<_, String>(0))
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                .unwrap_or_default();
-            all.into_iter().filter(|a| !known.contains(a)).collect()
-        };
-        for acct in orphans {
-            eprintln!("[sweep] clearing leftover mail for removed account {acct}");
-            if let Err(e) = clear_account_mail_chunked(&state, &acct).await {
-                eprintln!("[sweep:{acct}] {e}");
+        if state.dbs.legacy().is_some() {
+            return;
+        }
+        let expected: std::collections::HashSet<String> = state
+            .dbs
+            .registered_emails()
+            .iter()
+            .map(|e| store::account_db_filename(e))
+            .collect();
+        let dir = state.dbs.data_dir.join("accounts");
+        let Ok(entries) = std::fs::read_dir(&dir) else { return };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.ends_with(".db") || expected.contains(&name) {
+                continue;
+            }
+            eprintln!("[sweep] deleting unregistered account file {name}");
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(dir.join(format!("{name}{suffix}")));
             }
         }
     });
@@ -476,7 +560,7 @@ const DAY_MS: i64 = 24 * 3_600_000;
 /// background); demo accounts get fixture events so the panel is demoable
 /// with zero credentials.
 #[tauri::command]
-fn list_events(
+async fn list_events(
     state: State<'_, AppState>,
     start_ms: i64,
     end_ms: i64,
@@ -484,13 +568,15 @@ fn list_events(
     if end_ms <= start_ms || end_ms - start_ms > 62 * DAY_MS {
         return Err("invalid time range".into());
     }
-    let conn = state.db.lock().unwrap();
-    let active = store::active_account(&conn);
+    let active = { store::active_account(&state.global().lock().unwrap()) };
     if active.provider != "gmail" {
         let mut events = mail::mock::demo_events(start_ms, end_ms);
-        apply_demo_rsvps(&conn, &mut events);
+        // the RSVP overlay is app-wide demo state, so it lives in global.db
+        apply_demo_rsvps(&state.global().lock().unwrap(), &mut events);
         return Ok(events);
     }
+    let db = state.account_db(&active.email)?;
+    let conn = db.lock().unwrap();
     Ok(store::list_events(&conn, &active.email, start_ms, end_ms))
 }
 
@@ -548,7 +634,8 @@ async fn calendar_full_refetch(
     let (win_start, win_end) = (now - CAL_WINDOW_PAST, now + CAL_WINDOW_FUTURE);
     let (events, next_token) =
         mail::calendar::fetch_window(&state.http, bearer, cal, win_start, win_end).await?;
-    let conn = state.db.lock().unwrap();
+    let db = state.account_db(email)?;
+    let conn = db.lock().unwrap();
     let (clear_start, clear_end) =
         if clear_all { (i64::MIN / 4, i64::MAX / 4) } else { (win_start, win_end) };
     store::replace_calendar_window(&conn, email, &cal.id, clear_start, clear_end, &events)?;
@@ -576,8 +663,9 @@ async fn sync_one_calendar(
     use mail::calendar::SyncError;
     let state = app.state::<AppState>();
     let key = cal_sync_key(email, &cal.id);
+    let db = state.account_db(email)?;
     let (token, anchor): (Option<String>, Option<i64>) = {
-        let conn = state.db.lock().unwrap();
+        let conn = db.lock().unwrap();
         (store::get_json(&conn, &key), store::get_json(&conn, &cal_anchor_key(email, &cal.id)))
     };
     // The syncToken's window is pinned to its initial fetch; roll it forward
@@ -589,8 +677,8 @@ async fn sync_one_calendar(
     match mail::calendar::sync_incremental(&state.http, bearer, cal, &token).await {
         Ok(delta) => {
             // One transaction: a large delta as per-row autocommits would hold
-            // the global DB mutex across thousands of fsyncs (frozen IPC).
-            let conn = state.db.lock().unwrap();
+            // this account's DB mutex across thousands of fsyncs.
+            let conn = db.lock().unwrap();
             let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
             for e in &delta.upserts {
                 store::upsert_event(&tx, email, e)?;
@@ -603,7 +691,7 @@ async fn sync_one_calendar(
         }
         Err(SyncError::TokenExpired) => {
             {
-                let conn = state.db.lock().unwrap();
+                let conn = db.lock().unwrap();
                 conn.execute("DELETE FROM kv WHERE key = ?1", [key.as_str()])
                     .map_err(|e| e.to_string())?;
             }
@@ -629,7 +717,8 @@ async fn calendar_sync(app: &AppHandle, email: &str) -> Result<(), String> {
         (bearer, calendars)
     };
     {
-        let conn = state.db.lock().unwrap();
+        let db = state.account_db(email)?;
+        let conn = db.lock().unwrap();
         let ids: Vec<String> = calendars.iter().map(|c| c.id.clone()).collect();
         store::retain_calendars(&conn, email, &ids)?;
         // Drop syncTokens/anchors for calendars gone from the list too — a
@@ -693,8 +782,9 @@ fn spawn_calendar_sync(app: AppHandle, email: String, force: bool) {
     tauri::async_runtime::spawn(async move {
         let state = app.state::<AppState>();
         let throttle_key = format!("cal_synced_at:{email}");
+        let Ok(db) = state.account_db(&email) else { return };
         if !force {
-            let conn = state.db.lock().unwrap();
+            let conn = db.lock().unwrap();
             if let Some(at) = store::get_json::<i64>(&conn, &throttle_key) {
                 if now_ms() - at < 60_000 {
                     return;
@@ -704,7 +794,7 @@ fn spawn_calendar_sync(app: AppHandle, email: String, force: bool) {
         match calendar_sync(&app, &email).await {
             Ok(()) => {
                 {
-                    let conn = state.db.lock().unwrap();
+                    let conn = db.lock().unwrap();
                     let _ = store::set_json(&conn, &throttle_key, &now_ms());
                 }
                 let _ = app.emit("calendar:updated", Option::<String>::None);
@@ -724,8 +814,9 @@ fn spawn_calendar_range_fetch(app: AppHandle, email: String, start_ms: i64, end_
     tauri::async_runtime::spawn(async move {
         let state = app.state::<AppState>();
         let key = format!("cal_range:{email}");
+        let Ok(db) = state.account_db(&email) else { return };
         {
-            let conn = state.db.lock().unwrap();
+            let conn = db.lock().unwrap();
             if let Some(w) = store::get_json::<serde_json::Value>(&conn, &key) {
                 let covered = w["start"].as_i64().unwrap_or(i64::MAX) <= start_ms
                     && w["end"].as_i64().unwrap_or(0) >= end_ms;
@@ -751,14 +842,14 @@ fn spawn_calendar_range_fetch(app: AppHandle, email: String, start_ms: i64, end_
                 mail::calendar::fetch_window(&state.http, &bearer, cal, fetch_start, fetch_end)
                     .await
             {
-                let conn = state.db.lock().unwrap();
+                let conn = db.lock().unwrap();
                 let _ = store::replace_calendar_window(
                     &conn, &email, &cal.id, fetch_start, fetch_end, &events,
                 );
             }
         }
         {
-            let conn = state.db.lock().unwrap();
+            let conn = db.lock().unwrap();
             let _ = store::set_json(
                 &conn,
                 &key,
@@ -774,7 +865,7 @@ fn spawn_calendar_range_fetch(app: AppHandle, email: String, start_ms: i64, end_
 /// an incremental sync pass; outside it, a one-off range fetch backfills the
 /// navigated dates like the pre-v0.16 windowed refresh did.
 #[tauri::command]
-fn refresh_calendar(
+async fn refresh_calendar(
     app: AppHandle,
     state: State<'_, AppState>,
     start_ms: i64,
@@ -783,10 +874,7 @@ fn refresh_calendar(
     if end_ms <= start_ms || end_ms - start_ms > 62 * DAY_MS {
         return Err("invalid time range".into());
     }
-    let active = {
-        let conn = state.db.lock().unwrap();
-        store::active_account(&conn)
-    };
+    let active = { store::active_account(&state.global().lock().unwrap()) };
     if active.provider != "gmail" {
         return Ok(()); // demo events are synthesized on read
     }
@@ -801,10 +889,7 @@ fn refresh_calendar(
 
 /// The active account's Gmail address, or a calendar-flavored nudge.
 fn active_gmail_cal(state: &State<'_, AppState>) -> Result<String, String> {
-    let active = {
-        let conn = state.db.lock().unwrap();
-        store::active_account(&conn)
-    };
+    let active = { store::active_account(&state.global().lock().unwrap()) };
     if active.provider != "gmail" {
         return Err("Connect a Gmail account to edit Google Calendar events".into());
     }
@@ -860,10 +945,7 @@ fn validate_send_updates(send_updates: &str) -> Result<(), String> {
 /// the UI which are writable). Demo accounts get the fixture calendar.
 #[tauri::command]
 async fn list_calendars(state: State<'_, AppState>) -> Result<Vec<CalendarInfo>, String> {
-    let active = {
-        let conn = state.db.lock().unwrap();
-        store::active_account(&conn)
-    };
+    let active = { store::active_account(&state.global().lock().unwrap()) };
     if active.provider != "gmail" {
         return Ok(vec![CalendarInfo {
             id: "demo".into(),
@@ -932,7 +1014,8 @@ async fn update_event(
     let (bearer, cal) = resolve_calendar(&state, &email, &calendar_id).await?;
     // merge base: preserve existing guests' RSVP state through the overwrite
     let existing = {
-        let conn = state.db.lock().unwrap();
+        let db = state.account_db(&email)?;
+        let conn = db.lock().unwrap();
         store::get_event(&conn, &email, &calendar_id, &event_id)
     };
     let body = mail::calendar::event_body(&draft, existing.as_ref());
@@ -974,7 +1057,8 @@ async fn delete_event(
     match conflict {
         Some(fresh) => {
             {
-                let conn = state.db.lock().unwrap();
+                let db = state.account_db(&email)?;
+                let conn = db.lock().unwrap();
                 store::upsert_event(&conn, &email, &fresh)?;
             }
             // repaint with the fresh copy, matching finish_event_write
@@ -983,7 +1067,8 @@ async fn delete_event(
         }
         None => {
             {
-                let conn = state.db.lock().unwrap();
+                let db = state.account_db(&email)?;
+                let conn = db.lock().unwrap();
                 store::delete_event(&conn, &email, &calendar_id, &event_id)?;
             }
             let _ = app.emit("calendar:updated", Option::<String>::None);
@@ -1010,10 +1095,7 @@ async fn rsvp_event(
     // Demo dispatch keys off the ACCOUNT (like every other calendar command),
     // not the client-supplied calendar id — a connected Gmail account can
     // never be routed into the fixture overlay.
-    let is_demo = {
-        let conn = state.db.lock().unwrap();
-        store::active_account(&conn).provider != "gmail"
-    };
+    let is_demo = { store::active_account(&state.global().lock().unwrap()).provider != "gmail" };
     if is_demo {
         let uid = format!("{event_id}@fission.local");
         let mut ev = mail::mock::demo_event_by_uid(&uid).ok_or("event not found")?;
@@ -1021,7 +1103,9 @@ async fn rsvp_event(
             return Err("You're not on this event's guest list".into());
         }
         {
-            let conn = state.db.lock().unwrap();
+            // the demo RSVP overlay is app-wide demo state → global.db
+            let db = state.global();
+            let conn = db.lock().unwrap();
             let mut overlay: std::collections::HashMap<String, String> =
                 store::get_json(&conn, "demo_rsvp").unwrap_or_default();
             overlay.insert(uid, response.clone());
@@ -1072,8 +1156,9 @@ async fn resolve_invite_event(
         Some(rows.swap_remove(best))
     };
     let miss_key = format!("invite_miss:{email}:{uid}");
+    let db = state.account_db(email).ok()?;
     {
-        let conn = state.db.lock().unwrap();
+        let conn = db.lock().unwrap();
         if let Some(ev) = pick(store::events_by_ical_uid(&conn, email, uid)) {
             return Some(ev);
         }
@@ -1098,13 +1183,13 @@ async fn resolve_invite_event(
             .await
             .unwrap_or_default();
         if let Some(ev) = pick(rows) {
-            let conn = state.db.lock().unwrap();
+            let conn = db.lock().unwrap();
             let _ = store::upsert_event(&conn, email, &ev);
             return Some(ev);
         }
     }
     {
-        let conn = state.db.lock().unwrap();
+        let conn = db.lock().unwrap();
         let _ = store::set_json(&conn, &miss_key, &now_ms());
     }
     None
@@ -1119,17 +1204,14 @@ async fn thread_invite(
     state: State<'_, AppState>,
     thread_id: String,
 ) -> Result<Option<ThreadInvite>, String> {
-    let (raw, account, is_gmail) = {
-        let conn = state.db.lock().unwrap();
-        let Some(account) = store::account_of_thread(&conn, &thread_id) else {
-            return Ok(None);
-        };
-        let is_gmail = store::get_accounts(&conn)
-            .accounts
-            .iter()
-            .any(|a| a.email == account && a.provider == "gmail");
-        (store::thread_ics(&conn, &thread_id), account, is_gmail)
+    let Ok((account, db)) = state.thread_db(&thread_id) else {
+        return Ok(None);
     };
+    let is_gmail = store::get_accounts(&state.global().lock().unwrap())
+        .accounts
+        .iter()
+        .any(|a| a.email == account && a.provider == "gmail");
+    let raw = { store::thread_ics(&db.lock().unwrap(), &thread_id) };
     let Some(raw) = raw else { return Ok(None) };
     let Some(parsed) = mail::ics::parse(&raw) else { return Ok(None) };
     if parsed.method != "REQUEST" && parsed.method != "CANCEL" {
@@ -1141,8 +1223,7 @@ async fn thread_invite(
         resolve_invite_event(&state, &account, &parsed.uid).await
     } else {
         mail::mock::demo_event_by_uid(&parsed.uid).map(|mut ev| {
-            let conn = state.db.lock().unwrap();
-            apply_demo_rsvps(&conn, std::slice::from_mut(&mut ev));
+            apply_demo_rsvps(&state.global().lock().unwrap(), std::slice::from_mut(&mut ev));
             ev
         })
     };
@@ -1168,10 +1249,11 @@ fn finish_event_write(
     outcome: mail::calendar::WriteOutcome,
 ) -> Result<EventWriteResult, String> {
     use mail::calendar::WriteOutcome;
+    let db = state.account_db(email)?;
     match outcome {
         WriteOutcome::Saved(ev) => {
             {
-                let conn = state.db.lock().unwrap();
+                let conn = db.lock().unwrap();
                 store::upsert_event(&conn, email, &ev)?;
             }
             let _ = app.emit("calendar:updated", Option::<String>::None);
@@ -1181,7 +1263,7 @@ fn finish_event_write(
         WriteOutcome::Conflict(fresh) => {
             // cache the fresh copy — the UI shows it in the conflict prompt
             {
-                let conn = state.db.lock().unwrap();
+                let conn = db.lock().unwrap();
                 store::upsert_event(&conn, email, &fresh)?;
             }
             let _ = app.emit("calendar:updated", Option::<String>::None);
@@ -1195,7 +1277,8 @@ fn finish_event_write(
 #[tauri::command]
 async fn get_daily_photo(state: State<'_, AppState>) -> Result<Option<DailyPhoto>, String> {
     let (cached, key) = {
-        let conn = state.db.lock().unwrap();
+        let gdb = state.global();
+        let conn = gdb.lock().unwrap();
         (
             store::get_json::<unsplash::CachedPhoto>(&conn, unsplash::KV_PHOTO),
             unsplash::access_key(),
@@ -1210,14 +1293,16 @@ async fn get_daily_photo(state: State<'_, AppState>) -> Result<Option<DailyPhoto
         return Ok(cached.map(|c| c.photo));
     };
     {
-        let conn = state.db.lock().unwrap();
+        let gdb = state.global();
+        let conn = gdb.lock().unwrap();
         if !unsplash::take_rate_token(&conn, now_ms()) {
             return Ok(cached.map(|c| c.photo));
         }
     }
     match unsplash::fetch_daily(&state.http, &key, now_ms()).await {
         Ok(photo) => {
-            let conn = state.db.lock().unwrap();
+            let db = state.global();
+            let conn = db.lock().unwrap();
             let _ = store::set_json(
                 &conn,
                 unsplash::KV_PHOTO,
@@ -1238,7 +1323,8 @@ async fn get_daily_photo(state: State<'_, AppState>) -> Result<Option<DailyPhoto
 #[tauri::command]
 async fn photo_shown(state: State<'_, AppState>) -> Result<(), String> {
     let (cached, key) = {
-        let conn = state.db.lock().unwrap();
+        let gdb = state.global();
+        let conn = gdb.lock().unwrap();
         (
             store::get_json::<unsplash::CachedPhoto>(&conn, unsplash::KV_PHOTO),
             unsplash::access_key(),
@@ -1253,7 +1339,8 @@ async fn photo_shown(state: State<'_, AppState>) -> Result<(), String> {
     };
     c.download_triggered = true;
     {
-        let conn = state.db.lock().unwrap();
+        let gdb = state.global();
+        let conn = gdb.lock().unwrap();
         let _ = store::set_json(&conn, unsplash::KV_PHOTO, &c);
     }
     let _ = state
@@ -1297,12 +1384,13 @@ fn set_unsplash_key(key: String) -> Result<(), String> {
 /// mail-derived history index merged with the account's Google contacts
 /// (People API, synced into people_contacts).
 #[tauri::command]
-fn search_contacts(state: State<'_, AppState>, query: String) -> Result<Vec<Contact>, String> {
+async fn search_contacts(state: State<'_, AppState>, query: String) -> Result<Vec<Contact>, String> {
     if query.len() > 200 {
         return Ok(vec![]);
     }
-    let conn = state.db.lock().unwrap();
-    let active = store::get_accounts(&conn).active;
+    let active = state.active_email();
+    let db = state.account_db(&active)?;
+    let conn = db.lock().unwrap();
     Ok(store::search_contacts(&conn, &active, &query, 8))
 }
 
@@ -1312,9 +1400,10 @@ fn search_contacts(state: State<'_, AppState>, query: String) -> Result<Vec<Cont
 /// previous rows. Returns how many rows are now synced.
 async fn people_sync(app: &AppHandle, email: &str) -> Result<i64, String> {
     let state = app.state::<AppState>();
+    let db = state.account_db(email)?;
     // Gate on the recorded grant — no contacts scope, no People calls.
     let granted: Option<String> = {
-        let conn = state.db.lock().unwrap();
+        let conn = db.lock().unwrap();
         store::get_json(&conn, &format!("granted_scopes:{email}"))
     };
     let has = |s: &str| granted.as_deref().map(|g| scope_granted(g, s)).unwrap_or(false);
@@ -1355,7 +1444,7 @@ async fn people_sync(app: &AppHandle, email: &str) -> Result<i64, String> {
     }
     let mut total = 0i64;
     {
-        let conn = state.db.lock().unwrap();
+        let conn = db.lock().unwrap();
         for (source, rows) in &results {
             let tuples: Vec<(String, String, Option<String>)> = rows
                 .iter()
@@ -1382,10 +1471,7 @@ fn spawn_people_sync(app: AppHandle, email: String) {
 /// active account; returns the synced row count for the toast.
 #[tauri::command]
 async fn refresh_contacts(app: AppHandle, state: State<'_, AppState>) -> Result<i64, String> {
-    let active = {
-        let conn = state.db.lock().unwrap();
-        store::active_account(&conn)
-    };
+    let active = { store::active_account(&state.global().lock().unwrap()) };
     if active.provider != "gmail" {
         return Err("Connect a Gmail account to sync Google contacts".into());
     }
@@ -1398,8 +1484,9 @@ async fn refresh_contacts(app: AppHandle, state: State<'_, AppState>) -> Result<
 /// and persist them to kv `sendas:{email}`.
 async fn sendas_fetch(app: &AppHandle, email: &str) -> Result<Vec<SendAsAlias>, String> {
     let state = app.state::<AppState>();
+    let db = state.account_db(email)?;
     let granted: Option<String> = {
-        let conn = state.db.lock().unwrap();
+        let conn = db.lock().unwrap();
         store::get_json(&conn, &format!("granted_scopes:{email}"))
     };
     let ok = granted
@@ -1444,7 +1531,7 @@ async fn sendas_fetch(app: &AppHandle, email: &str) -> Result<Vec<SendAsAlias>, 
         })
         .collect();
     {
-        let conn = state.db.lock().unwrap();
+        let conn = db.lock().unwrap();
         let _ = store::set_json(&conn, &format!("sendas:{email}"), &aliases);
     }
     Ok(aliases)
@@ -1464,15 +1551,15 @@ fn spawn_sendas_fetch(app: AppHandle, email: String) {
 #[tauri::command]
 async fn get_send_as(app: AppHandle, state: State<'_, AppState>, email: String) -> Result<Vec<SendAsAlias>, String> {
     let cached: Option<Vec<SendAsAlias>> = {
-        let conn = state.db.lock().unwrap();
+        let db = state.account_db(&email)?;
+        let conn = db.lock().unwrap();
         store::get_json(&conn, &format!("sendas:{email}"))
     };
     if let Some(aliases) = cached {
         return Ok(aliases);
     }
     let is_gmail = {
-        let conn = state.db.lock().unwrap();
-        store::get_accounts(&conn)
+        store::get_accounts(&state.global().lock().unwrap())
             .accounts
             .iter()
             .any(|a| a.email == email && a.provider == "gmail")
@@ -1484,13 +1571,15 @@ async fn get_send_as(app: AppHandle, state: State<'_, AppState>, email: String) 
 }
 
 #[tauri::command]
-fn get_profile(state: State<'_, AppState>, email: String) -> Option<ProfileInfo> {
-    store::get_json(&state.db.lock().unwrap(), &format!("profile:{email}"))
+async fn get_profile(state: State<'_, AppState>, email: String) -> Result<Option<ProfileInfo>, String> {
+    let db = state.account_db(&email)?;
+    let conn = db.lock().unwrap();
+    Ok(store::get_json(&conn, &format!("profile:{email}")))
 }
 
 /// Override (or clear) the header photo. Accepts a data: URI.
 #[tauri::command]
-fn set_profile_photo(
+async fn set_profile_photo(
     state: State<'_, AppState>,
     email: String,
     picture: Option<String>,
@@ -1500,7 +1589,8 @@ fn set_profile_photo(
             return Err("that does not look like a reasonable image".into());
         }
     }
-    let conn = state.db.lock().unwrap();
+    let db = state.account_db(&email)?;
+    let conn = db.lock().unwrap();
     let key = format!("profile:{email}");
     let mut prof: ProfileInfo = store::get_json(&conn, &key).unwrap_or_default();
     prof.picture = picture;
@@ -1511,22 +1601,37 @@ fn set_profile_photo(
 /// watermark. Skipped while the window is focused or when disabled.
 fn notify_new_mail(app: &AppHandle, since_ms: i64) {
     let state = app.state::<AppState>();
-    let (enabled, rows) = {
-        let conn = state.db.lock().unwrap();
+    let (enabled, emails) = {
+        let gdb = state.global();
+        let conn = gdb.lock().unwrap();
         let settings = store::get_settings(&conn);
-        let rows: Vec<(String, String)> = conn
-            .prepare(
-                "SELECT participants, subject FROM threads
-                 WHERE unread = 1 AND in_inbox = 1 AND hidden IS NULL AND last_date > ?1
-                 ORDER BY last_date DESC LIMIT 4",
-            )
-            .and_then(|mut st| {
-                st.query_map([since_ms], |r| Ok((r.get(0)?, r.get(1)?)))
-                    .map(|it| it.filter_map(|r| r.ok()).collect())
-            })
-            .unwrap_or_default();
-        (settings.notifications, rows)
+        let emails: Vec<String> =
+            store::get_accounts(&conn).accounts.iter().map(|a| a.email.clone()).collect();
+        (settings.notifications, emails)
     };
+    // notifications span every account: fan out over the per-account files
+    let mut rows: Vec<(i64, String, String)> = vec![];
+    if enabled {
+        for email in &emails {
+            let Ok(db) = state.account_db(email) else { continue };
+            let conn = db.lock().unwrap();
+            let per: Vec<(i64, String, String)> = conn
+                .prepare(
+                    "SELECT last_date, participants, subject FROM threads
+                     WHERE unread = 1 AND in_inbox = 1 AND hidden IS NULL AND last_date > ?1
+                     ORDER BY last_date DESC LIMIT 4",
+                )
+                .and_then(|mut st| {
+                    st.query_map([since_ms], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                        .map(|it| it.filter_map(|r| r.ok()).collect())
+                })
+                .unwrap_or_default();
+            rows.extend(per);
+        }
+    }
+    rows.sort_by_key(|(d, _, _)| -d);
+    rows.truncate(4);
+    let rows: Vec<(String, String)> = rows.into_iter().map(|(_, p, s)| (p, s)).collect();
     if !enabled || rows.is_empty() {
         return;
     }
@@ -1578,21 +1683,24 @@ struct SyncProgress {
 /// `done`, or when `total` is 0 (threadsTotal not yet known / demo desktop).
 fn emit_sync_progress(app: &AppHandle) {
     let state = app.state::<AppState>();
-    let (indexed, total, done) = {
-        let conn = state.db.lock().unwrap();
-        let accounts = store::get_accounts(&conn);
-        let gmail = accounts.accounts.iter().filter(|a| a.provider == "gmail");
-        let (mut indexed, mut total, mut all_done, mut any) = (0i64, 0i64, true, false);
-        for a in gmail {
-            any = true;
-            indexed += store::count_threads(&conn, &a.email);
-            total += store::get_json::<i64>(&conn, &format!("threads_total:{}", a.email)).unwrap_or(0);
-            let cur: mail::sync::CrawlCursor =
-                store::get_json(&conn, &format!("crawl:{}", a.email)).unwrap_or_default();
-            all_done &= cur.done;
-        }
-        (indexed, total, any && all_done)
-    };
+    let gmail: Vec<String> = store::get_accounts(&state.global().lock().unwrap())
+        .accounts
+        .iter()
+        .filter(|a| a.provider == "gmail")
+        .map(|a| a.email.clone())
+        .collect();
+    let (mut indexed, mut total, mut all_done, mut any) = (0i64, 0i64, true, false);
+    for email in &gmail {
+        let Ok(db) = state.account_db(email) else { continue };
+        let conn = db.lock().unwrap();
+        any = true;
+        indexed += store::count_threads(&conn, email);
+        total += store::get_json::<i64>(&conn, &format!("threads_total:{email}")).unwrap_or(0);
+        let cur: mail::sync::CrawlCursor =
+            store::get_json(&conn, &format!("crawl:{email}")).unwrap_or_default();
+        all_done &= cur.done;
+    }
+    let done = any && all_done;
     let _ = app.emit("sync:progress", SyncProgress { indexed, total, done });
 }
 
@@ -1611,7 +1719,8 @@ fn is_auth_revoked(err: &str) -> bool {
 fn mark_auth_lost(app: &AppHandle, email: &str) {
     let state = app.state::<AppState>();
     let flipped = {
-        let conn = state.db.lock().unwrap();
+        let gdb = state.global();
+        let conn = gdb.lock().unwrap();
         let mut accounts = store::get_accounts(&conn);
         let mut flipped = false;
         for a in accounts.accounts.iter_mut() {
@@ -1648,7 +1757,8 @@ fn sync_in_background(app: AppHandle) {
         let mut lost: Vec<String> = vec![];
         let mut sessions = state.gmail.lock().await;
         for (email, session) in sessions.iter_mut() {
-            match mail::sync::full_sync(&state.http, session, &state.db, email, false, &on_progress).await {
+            let Ok(db) = state.account_db(email) else { continue };
+            match mail::sync::full_sync(&state.http, session, &db, email, false, &on_progress).await {
                 Ok(c) => changed |= c,
                 Err(e) => {
                     eprintln!("[sync:{email}] {e}");
@@ -1721,8 +1831,7 @@ fn spawn_history_crawl(app: AppHandle) {
             return;
         }
         let emails: Vec<String> = {
-            let conn = state.db.lock().unwrap();
-            store::get_accounts(&conn)
+            store::get_accounts(&state.global().lock().unwrap())
                 .accounts
                 .iter()
                 .filter(|a| a.provider == "gmail")
@@ -1730,16 +1839,17 @@ fn spawn_history_crawl(app: AppHandle) {
                 .collect()
         };
         for email in emails {
+            let Ok(db) = state.account_db(&email) else { continue };
             // Only crawl once the account's first reconcile stored its
             // baseline — never race the initial backfill for the same threads.
             let ready = {
-                let conn = state.db.lock().unwrap();
+                let conn = db.lock().unwrap();
                 store::get_json::<String>(&conn, &format!("history:{email}")).is_some()
             };
             if !ready {
                 continue;
             }
-            match mail::sync::crawl_step(&state.http, &state.gmail, &state.db, &email).await {
+            match mail::sync::crawl_step(&state.http, &state.gmail, &db, &email).await {
                 // steady state after the walk finishes: nothing to report
                 Ok(b) if b.done && b.fetched == 0 && b.skipped == 0 && b.failed == 0 => {}
                 Ok(b) => eprintln!(
@@ -1755,23 +1865,25 @@ fn spawn_history_crawl(app: AppHandle) {
             // Semantic indexing: embed whatever the crawl/sync landed. Local
             // model by default; the optional remote provider when configured.
             let embeddings_mode = {
-                let conn = state.db.lock().unwrap();
+                let db = state.global();
+            let conn = db.lock().unwrap();
                 store::get_settings(&conn).embeddings
             };
             if embeddings_mode == "openai" {
                 let remote = {
-                    let conn = state.db.lock().unwrap();
+                    let db = state.global();
+            let conn = db.lock().unwrap();
                     ai::resolve(&store::get_settings(&conn), Some("openai")).ok()
                 };
                 if let Some(p) = remote {
-                    match mail::sync::embed_step_remote(&state.http, &state.db, &email, &p.base_url, &p.key).await {
+                    match mail::sync::embed_step_remote(&state.http, &db, &email, &p.base_url, &p.key).await {
                         Ok(b) if b.embedded > 0 => eprintln!("[embed:{email}] +{} embedded (remote), {} to go", b.embedded, b.remaining),
                         Ok(_) => {}
                         Err(e) => eprintln!("[embed:{email}] {e}"),
                     }
                 }
             } else if let Some(m) = ensure_local_embedder(&state).await {
-                let db = state.db.clone();
+                let db = db.clone();
                 let email2 = email.clone();
                 let beat = tauri::async_runtime::spawn_blocking(move || {
                     mail::sync::embed_step(&db, &email2, embed::LOCAL_TAG, &|texts| {
@@ -1796,9 +1908,11 @@ fn spawn_history_crawl(app: AppHandle) {
 
 #[tauri::command]
 async fn sync_now(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    {
-        let conn = state.db.lock().unwrap();
-        store::wake_due_snoozes(&conn, now_ms())?;
+    for email in state.dbs.registered_emails() {
+        if let Ok(db) = state.account_db(&email) {
+            let conn = db.lock().unwrap();
+            store::wake_due_snoozes(&conn, now_ms())?;
+        }
     }
     let on_progress = || {
         let _ = app.emit("mail:updated", ());
@@ -1806,7 +1920,8 @@ async fn sync_now(app: AppHandle, state: State<'_, AppState>) -> Result<(), Stri
     };
     let mut sessions = state.gmail.lock().await;
     for (email, session) in sessions.iter_mut() {
-        mail::sync::full_sync(&state.http, session, &state.db, email, false, &on_progress).await?;
+        let db = state.account_db(email)?;
+        mail::sync::full_sync(&state.http, session, &db, email, false, &on_progress).await?;
     }
     drop(sessions);
     let _ = app.emit("mail:updated", ());
@@ -1824,12 +1939,11 @@ async fn resync_account(app: AppHandle, state: State<'_, AppState>) -> Result<()
     if emails.is_empty() {
         return Ok(()); // demo mode: nothing to resync
     }
-    {
-        let conn = state.db.lock().unwrap();
-        for email in &emails {
-            conn.execute("DELETE FROM kv WHERE key = ?1", [format!("history:{email}")]).ok();
-            store::reset_history(&conn, email)?;
-        }
+    for email in &emails {
+        let db = state.account_db(email)?;
+        let conn = db.lock().unwrap();
+        conn.execute("DELETE FROM kv WHERE key = ?1", [format!("history:{email}")]).ok();
+        store::reset_history(&conn, email)?;
     }
     let on_progress = || {
         let _ = app.emit("mail:updated", ());
@@ -1838,7 +1952,8 @@ async fn resync_account(app: AppHandle, state: State<'_, AppState>) -> Result<()
     let mut sessions = state.gmail.lock().await;
     for (email, session) in sessions.iter_mut() {
         // force a full reconcile — every thread re-parsed, bodies healed
-        mail::sync::full_sync(&state.http, session, &state.db, email, true, &on_progress).await?;
+        let db = state.account_db(email)?;
+        mail::sync::full_sync(&state.http, session, &db, email, true, &on_progress).await?;
     }
     drop(sessions);
     let _ = app.emit("mail:updated", ());
@@ -1849,22 +1964,22 @@ async fn resync_account(app: AppHandle, state: State<'_, AppState>) -> Result<()
 // ---------------------------------------------------------------- reading
 
 #[tauri::command]
-fn list_threads(state: State<'_, AppState>, view: String) -> Result<Vec<Thread>, String> {
+async fn list_threads(state: State<'_, AppState>, view: String) -> Result<Vec<Thread>, String> {
+    let active = state.active_email();
+    let db = state.account_db(&active)?;
     // "label:<name>" scopes the list to one label; everything else is a
     // fixed view.
     if let Some(label) = view.strip_prefix("label:") {
         if label.is_empty() || label.len() > 100 {
             return Err("invalid label".into());
         }
-        let conn = state.db.lock().unwrap();
-        let active = store::get_accounts(&conn).active;
+        let conn = db.lock().unwrap();
         return store::list_threads_by_label(&conn, label, &active);
     }
     if !matches!(view.as_str(), "inbox" | "done" | "reminders" | "starred" | "trash") {
         return Err("invalid view".into());
     }
-    let conn = state.db.lock().unwrap();
-    let active = store::get_accounts(&conn).active;
+    let conn = db.lock().unwrap();
     store::list_threads(&conn, &view, &active)
 }
 
@@ -1875,11 +1990,12 @@ async fn get_thread(
     thread_id: String,
 ) -> Result<Vec<Message>, String> {
     valid_id(&thread_id)?;
-    let (mut msgs, account) = {
-        let conn = state.db.lock().unwrap();
+    let (account, db) = state.thread_db(&thread_id)?;
+    let mut msgs = {
+        let conn = db.lock().unwrap();
         let msgs = store::get_messages(&conn, &thread_id)?;
         store::set_unread(&conn, &thread_id, false)?;
-        (msgs, store::account_of_thread(&conn, &thread_id))
+        msgs
     };
 
     // First paint is instant: sanitize using ONLY inline images already cached
@@ -1888,20 +2004,20 @@ async fn get_thread(
     // (spawn_thread_backfill), which re-emits so images fill in progressively.
     for m in msgs.iter_mut() {
         let Some(html) = m.body_html.clone() else { continue };
-        let cid_map = cached_cid_map(&state, &m.id, &html);
+        let cid_map = cached_cid_map(&db, &m.id, &html);
         m.body_html = Some(mail::render::sanitize_email_html(&html, &cid_map));
     }
-    spawn_thread_backfill(app, thread_id, account);
+    spawn_thread_backfill(app, thread_id, Some(account));
     Ok(msgs)
 }
 
 /// Build the cid→data: map for a message body from ALREADY-CACHED inline-image
 /// bytes only — no network, so the first paint of a thread is instant.
-fn cached_cid_map(state: &State<'_, AppState>, message_id: &str, html: &str) -> HashMap<String, String> {
+fn cached_cid_map(db: &Mutex<Connection>, message_id: &str, html: &str) -> HashMap<String, String> {
     use base64::Engine;
     let mut cid_map = HashMap::new();
     let inline = {
-        let conn = state.db.lock().unwrap();
+        let conn = db.lock().unwrap();
         store::inline_cids(&conn, message_id)
     };
     for (att_id, content_id, mime, _remote, has_data) in inline {
@@ -1909,7 +2025,7 @@ fn cached_cid_map(state: &State<'_, AppState>, message_id: &str, html: &str) -> 
             continue;
         }
         let bytes = {
-            let conn = state.db.lock().unwrap();
+            let conn = db.lock().unwrap();
             store::attachment_data(&conn, &att_id)
         };
         if let Some(bytes) = bytes {
@@ -1931,6 +2047,7 @@ fn spawn_thread_backfill(app: AppHandle, thread_id: String, account: Option<Stri
     let Some(account) = account else { return };
     tauri::async_runtime::spawn(async move {
         let state = app.state::<AppState>();
+        let Ok(db) = state.account_db(&account) else { return };
         // 1. clear UNREAD on the server (best-effort; local already cleared)
         {
             let mut sessions = state.gmail.lock().await;
@@ -1940,14 +2057,14 @@ fn spawn_thread_backfill(app: AppHandle, thread_id: String, account: Option<Stri
         }
         // 2. fetch inline images still missing their bytes
         let msgs = {
-            let conn = state.db.lock().unwrap();
+            let conn = db.lock().unwrap();
             store::get_messages(&conn, &thread_id).unwrap_or_default()
         };
         let mut fetched_any = false;
         for m in &msgs {
             let Some(html) = &m.body_html else { continue };
             let inline = {
-                let conn = state.db.lock().unwrap();
+                let conn = db.lock().unwrap();
                 store::inline_cids(&conn, &m.id)
             };
             for (att_id, content_id, _mime, remote_id, has_data) in inline {
@@ -1964,7 +2081,7 @@ fn spawn_thread_backfill(app: AppHandle, thread_id: String, account: Option<Stri
                 };
                 if let Ok(b) = bytes {
                     if b.len() <= 2_000_000 {
-                        let conn = state.db.lock().unwrap();
+                        let conn = db.lock().unwrap();
                         let _ = store::set_attachment_data(&conn, &att_id, &b);
                         fetched_any = true;
                     }
@@ -1990,33 +2107,30 @@ async fn refetch_message_body(
     thread_id: String,
 ) -> Result<Vec<Message>, String> {
     valid_id(&thread_id)?;
-    let (has_empty, account) = {
-        let conn = state.db.lock().unwrap();
-        let has_empty: bool = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM messages WHERE thread_id = ?1 AND body_text = '' AND body_html IS NULL)",
-                [thread_id.as_str()],
-                |r| r.get::<_, i64>(0),
-            )
-            .map(|n| n != 0)
-            .unwrap_or(false);
-        (has_empty, store::account_of_thread(&conn, &thread_id))
+    let (account, db) = state.thread_db(&thread_id)?;
+    let has_empty = {
+        let conn = db.lock().unwrap();
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM messages WHERE thread_id = ?1 AND body_text = '' AND body_html IS NULL)",
+            [thread_id.as_str()],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n != 0)
+        .unwrap_or(false)
     };
     if has_empty && !is_mock_id(&thread_id) {
-        if let Some(account) = account {
-            let mut sessions = state.gmail.lock().await;
-            if let Some(sess) = sessions.get_mut(&account) {
-                let _ = mail::sync::refetch_thread(&state.http, sess, &state.db, &account, &thread_id).await;
-            }
+        let mut sessions = state.gmail.lock().await;
+        if let Some(sess) = sessions.get_mut(&account) {
+            let _ = mail::sync::refetch_thread(&state.http, sess, &db, &account, &thread_id).await;
         }
     }
     let mut msgs = {
-        let conn = state.db.lock().unwrap();
+        let conn = db.lock().unwrap();
         store::get_messages(&conn, &thread_id)?
     };
     for m in msgs.iter_mut() {
         let Some(html) = m.body_html.clone() else { continue };
-        let cid_map = cached_cid_map(&state, &m.id, &html);
+        let cid_map = cached_cid_map(&db, &m.id, &html);
         m.body_html = Some(mail::render::sanitize_email_html(&html, &cid_map));
     }
     Ok(msgs)
@@ -2025,19 +2139,50 @@ async fn refetch_message_body(
 // ---------------------------------------------------------------- attachments
 
 /// Attachment bytes from cache, demo fixture text, or Gmail (cached after).
+/// Bare attachment ids carry no account, so probe the active account's file
+/// first, then the rest of the registry.
 async fn attachment_bytes(
     state: &State<'_, AppState>,
     attachment_id: &str,
 ) -> Result<(store::AttachmentRow, Vec<u8>), String> {
-    let row = {
-        let conn = state.db.lock().unwrap();
-        store::get_attachment(&conn, attachment_id).ok_or("unknown attachment")?
+    let (row, account, db) = {
+        let active = state.active_email();
+        let mut emails = vec![];
+        if !active.is_empty() {
+            emails.push(active.clone());
+        }
+        for e in state.dbs.registered_emails() {
+            if e != active {
+                emails.push(e);
+            }
+        }
+        let mut found = None;
+        for email in emails {
+            let db = state.account_db(&email)?;
+            let hit = { store::get_attachment(&db.lock().unwrap(), attachment_id) };
+            if let Some(row) = hit {
+                // the true owner comes from the row's thread, not probe order
+                // (during migration the legacy conn serves several accounts)
+                let owner: Option<String> = {
+                    let conn = db.lock().unwrap();
+                    conn.query_row(
+                        "SELECT account_id FROM threads WHERE id = (SELECT thread_id FROM messages WHERE id = ?1)",
+                        [row.message_id.as_str()],
+                        |r| r.get(0),
+                    )
+                    .ok()
+                };
+                found = Some((row, owner.unwrap_or(email), db));
+                break;
+            }
+        }
+        found.ok_or("unknown attachment")?
     };
     if let Some(data) = row.data.clone() {
         return Ok((row, data));
     }
     let fixture_text: Option<String> = {
-        let conn = state.db.lock().unwrap();
+        let conn = db.lock().unwrap();
         conn.query_row(
             "SELECT text_content FROM attachments WHERE id = ?1",
             [attachment_id],
@@ -2052,16 +2197,6 @@ async fn attachment_bytes(
         }
         return Err("this demo attachment has no file contents".into());
     }
-    let account: Option<String> = {
-        let conn = state.db.lock().unwrap();
-        conn.query_row(
-            "SELECT account_id FROM threads WHERE id = (SELECT thread_id FROM messages WHERE id = ?1)",
-            [row.message_id.as_str()],
-            |r| r.get(0),
-        )
-        .ok()
-    };
-    let account = account.ok_or("the attachment's account is gone")?;
     let remote = row.remote_id.clone().unwrap();
     let mut sessions = state.gmail.lock().await;
     let s = sessions
@@ -2069,7 +2204,7 @@ async fn attachment_bytes(
         .ok_or("account not connected — reconnect Gmail to download")?;
     let bytes = s.get_attachment_bytes(&state.http, &row.message_id, &remote).await?;
     if bytes.len() <= 25_000_000 {
-        let conn = state.db.lock().unwrap();
+        let conn = db.lock().unwrap();
         let _ = store::set_attachment_data(&conn, attachment_id, &bytes);
     }
     Ok((row, bytes))
@@ -2124,10 +2259,7 @@ async fn open_attachment(
 /// The active account's email if it's a connected Gmail account, else a
 /// friendly error — every Drive command starts here.
 fn active_gmail(state: &State<'_, AppState>) -> Result<String, String> {
-    let active = {
-        let conn = state.db.lock().unwrap();
-        store::active_account(&conn)
-    };
+    let active = { store::active_account(&state.global().lock().unwrap()) };
     if active.provider != "gmail" {
         return Err("Connect a Gmail account to use Google Drive".into());
     }
@@ -2177,10 +2309,8 @@ async fn drive_app_folder(
     session: &mut GmailSession,
 ) -> Result<String, String> {
     let kv_key = format!("drive_folder:{email}");
-    let cached: Option<String> = {
-        let conn = state.db.lock().unwrap();
-        store::get_json(&conn, &kv_key)
-    };
+    let db = state.account_db(email)?;
+    let cached: Option<String> = { store::get_json(&db.lock().unwrap(), &kv_key) };
     if let Some(id) = cached {
         if mail::drive::folder_alive(&state.http, session, &id).await {
             return Ok(id);
@@ -2188,7 +2318,7 @@ async fn drive_app_folder(
     }
     let id = mail::drive::find_or_create_app_folder(&state.http, session).await?;
     {
-        let conn = state.db.lock().unwrap();
+        let conn = db.lock().unwrap();
         let _ = store::set_json(&conn, &kv_key, &id);
     }
     Ok(id)
@@ -2337,7 +2467,7 @@ async fn drive_share(
 // ---------------------------------------------------------------- drafts
 
 #[tauri::command]
-fn save_draft(
+async fn save_draft(
     state: State<'_, AppState>,
     draft_id: Option<i64>,
     payload: String,
@@ -2345,33 +2475,59 @@ fn save_draft(
     if payload.len() > 40_000_000 {
         return Err("draft is too large".into());
     }
-    let conn = state.db.lock().unwrap();
-    let account = store::get_accounts(&conn).active;
+    let account = state.active_email();
+    let db = state.account_db(&account)?;
+    let conn = db.lock().unwrap();
     store::draft_save(&conn, draft_id, &account, &payload, now_ms())
 }
 
 #[tauri::command]
-fn list_drafts(state: State<'_, AppState>) -> Vec<DraftEntry> {
-    let conn = state.db.lock().unwrap();
-    let account = store::get_accounts(&conn).active;
-    store::draft_list(&conn, &account)
+async fn list_drafts(state: State<'_, AppState>) -> Result<Vec<DraftEntry>, String> {
+    let account = state.active_email();
+    let db = state.account_db(&account)?;
+    let conn = db.lock().unwrap();
+    Ok(store::draft_list(&conn, &account)
         .into_iter()
         .map(|(id, payload, updated_at)| DraftEntry { id, payload, updated_at })
-        .collect()
+        .collect())
 }
 
 #[tauri::command]
-fn delete_draft(state: State<'_, AppState>, draft_id: i64) {
-    store::draft_delete(&state.db.lock().unwrap(), draft_id);
+async fn delete_draft(state: State<'_, AppState>, draft_id: i64) -> Result<(), String> {
+    // draft ids are per-file; the active account wrote it in practice, but
+    // sweep the registry so a stale id can't strand a row after a switch
+    let active = state.active_email();
+    let mut emails = vec![];
+    if !active.is_empty() {
+        emails.push(active.clone());
+    }
+    for e in state.dbs.registered_emails() {
+        if e != active {
+            emails.push(e);
+        }
+    }
+    for email in emails {
+        let db = state.account_db(&email)?;
+        let conn = db.lock().unwrap();
+        let hit: bool = conn
+            .query_row("SELECT 1 FROM drafts WHERE id = ?1", [draft_id], |_| Ok(true))
+            .unwrap_or(false);
+        if hit {
+            store::draft_delete(&conn, draft_id);
+            return Ok(());
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
-fn search_threads(state: State<'_, AppState>, query: String) -> Result<Vec<SearchResult>, String> {
+async fn search_threads(state: State<'_, AppState>, query: String) -> Result<Vec<SearchResult>, String> {
     if query.len() > 200 {
         return Err("query too long".into());
     }
-    let conn = state.db.lock().unwrap();
-    let active = store::get_accounts(&conn).active;
+    let active = state.active_email();
+    let db = state.account_db(&active)?;
+    let conn = db.lock().unwrap();
     store::search(&conn, &query, &active)
 }
 
@@ -2381,15 +2537,16 @@ fn search_threads(state: State<'_, AppState>, query: String) -> Result<Vec<Searc
 /// every message that mentions their name. The UI drops the open thread and
 /// shows the top 5.
 #[tauri::command]
-fn threads_with_contact(
+async fn threads_with_contact(
     state: State<'_, AppState>,
     email: String,
 ) -> Result<Vec<SearchResult>, String> {
     if email.len() > 254 {
         return Err("email too long".into());
     }
-    let conn = state.db.lock().unwrap();
-    let active = store::get_accounts(&conn).active;
+    let active = state.active_email();
+    let db = state.account_db(&active)?;
+    let conn = db.lock().unwrap();
     store::threads_with_contact(&conn, &email, &active, 20)
 }
 
@@ -2398,7 +2555,8 @@ fn threads_with_contact(
 /// search never waits on any of that).
 async fn query_vector(state: &State<'_, AppState>, text: &str) -> Option<Vec<f32>> {
     let (mode, remote) = {
-        let conn = state.db.lock().unwrap();
+        let gdb = state.global();
+        let conn = gdb.lock().unwrap();
         let settings = store::get_settings(&conn);
         let remote = if settings.embeddings == "openai" {
             ai::resolve(&settings, Some("openai")).ok()
@@ -2448,7 +2606,8 @@ async fn search_all(
         return Ok(vec![]);
     }
     let (active, is_gmail, provider) = {
-        let conn = state.db.lock().unwrap();
+        let gdb = state.global();
+        let conn = gdb.lock().unwrap();
         let acct = store::active_account(&conn);
         // AI planning only pays off for natural-language phrasings; a
         // missing/unkeyed provider silently means deterministic.
@@ -2459,6 +2618,7 @@ async fn search_all(
         };
         (acct.email.clone(), acct.provider == "gmail", provider)
     };
+    let db = state.account_db(&active)?;
     // The parse call is capped well under the http client's 120s timeout —
     // a slow provider must degrade to the deterministic plan, not stall the
     // whole search pass.
@@ -2489,7 +2649,7 @@ async fn search_all(
         query_vector(&state, &plan.terms.join(" ")).await
     };
     let local = {
-        let conn = state.db.lock().unwrap();
+        let conn = db.lock().unwrap();
         store::search_planned(&conn, &plan, &active, qvec.as_deref())?
     };
     if !is_gmail {
@@ -2524,13 +2684,12 @@ async fn search_all(
                     continue;
                 }
                 // fetch+index the thread if we don't have it, then fold it in
-                let have = { store::get_thread(&state.db.lock().unwrap(), &id).is_some() };
+                let have = { store::get_thread(&db.lock().unwrap(), &id).is_some() };
                 if !have {
-                    let _ =
-                        mail::sync::refetch_thread(&state.http, session, &state.db, &active, &id)
-                            .await;
+                    let _ = mail::sync::refetch_thread(&state.http, session, &db, &active, &id)
+                        .await;
                 }
-                if let Some(r) = store::get_search_result(&state.db.lock().unwrap(), &id) {
+                if let Some(r) = store::get_search_result(&db.lock().unwrap(), &id) {
                     seen.insert(id);
                     results.push(r);
                 }
@@ -2558,11 +2717,12 @@ async fn load_older(
         // inbox is fully backfilled; reminders/labels don't page here
         _ => return Ok(0),
     };
+    let active_acct = { store::active_account(&state.global().lock().unwrap()) };
+    let db = state.account_db(&active_acct.email)?;
     let (active, is_gmail, oldest) = {
-        let conn = state.db.lock().unwrap();
-        let acct = store::active_account(&conn);
-        let oldest = store::oldest_thread_date(&conn, &view, &acct.email);
-        (acct.email.clone(), acct.provider == "gmail", oldest)
+        let conn = db.lock().unwrap();
+        let oldest = store::oldest_thread_date(&conn, &view, &active_acct.email);
+        (active_acct.email.clone(), active_acct.provider == "gmail", oldest)
     };
     let Some(oldest_ms) = oldest else { return Ok(0) };
     if !is_gmail {
@@ -2589,11 +2749,11 @@ async fn load_older(
         let mut sessions = state.gmail.lock().await;
         if let Some(session) = sessions.get_mut(&active) {
             for id in ids {
-                let have = { store::get_thread(&state.db.lock().unwrap(), &id).is_some() };
+                let have = { store::get_thread(&db.lock().unwrap(), &id).is_some() };
                 if have {
                     continue;
                 }
-                if mail::sync::refetch_thread(&state.http, session, &state.db, &active, &id)
+                if mail::sync::refetch_thread(&state.http, session, &db, &active, &id)
                     .await
                     .is_ok()
                 {
@@ -2609,8 +2769,13 @@ async fn load_older(
 }
 
 #[tauri::command]
-fn list_labels(state: State<'_, AppState>) -> Result<Vec<String>, String> {
-    store::list_labels(&state.db.lock().unwrap())
+async fn list_labels(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    // Per-account by construction now: the active account's file only holds
+    // its own threads. (The old single-db query unioned every account's
+    // labels into every picker — that leak ends here.)
+    let db = state.active_db()?;
+    let labels = store::list_labels(&db.lock().unwrap());
+    labels
 }
 
 // ---------------------------------------------------------------- triage
@@ -2635,17 +2800,12 @@ fn s(v: &str) -> String {
 /// silently diverge from Gmail. Uses try_lock so a sync holding the gmail mutex
 /// never stalls triage — if we can't peek instantly we assume connected and let
 /// the background op surface any failure. (BUG 3a)
-fn ensure_remote_capable(state: &State<'_, AppState>, thread_id: &str) -> Result<(), String> {
+fn ensure_remote_capable(state: &State<'_, AppState>, thread_id: &str, account: &str) -> Result<(), String> {
     if is_mock_id(thread_id) {
         return Ok(());
     }
-    let account = {
-        let conn = state.db.lock().unwrap();
-        store::account_of_thread(&conn, thread_id)
-    };
-    let Some(account) = account else { return Ok(()) };
     if let Ok(sessions) = state.gmail.try_lock() {
-        if !sessions.contains_key(&account) {
+        if !sessions.contains_key(account) {
             return Err("account not connected — reconnect Gmail in Settings → Account, then try again".into());
         }
     }
@@ -2662,11 +2822,7 @@ fn spawn_remote(app: AppHandle, thread_id: String, op: RemoteTriage) {
     }
     tauri::async_runtime::spawn(async move {
         let state = app.state::<AppState>();
-        let account = {
-            let conn = state.db.lock().unwrap();
-            store::account_of_thread(&conn, &thread_id)
-        };
-        let Some(account) = account else { return };
+        let Ok((account, db)) = state.thread_db(&thread_id) else { return };
         let result: Result<(), String> = async {
             let mut sessions = state.gmail.lock().await;
             let sess = sessions
@@ -2705,7 +2861,7 @@ fn spawn_remote(app: AppHandle, thread_id: String, op: RemoteTriage) {
             // reconcile the thread so local state matches the server
             let mut sessions = state.gmail.lock().await;
             if let Some(sess) = sessions.get_mut(&account) {
-                let _ = mail::sync::refetch_thread(&state.http, sess, &state.db, &account, &thread_id).await;
+                let _ = mail::sync::refetch_thread(&state.http, sess, &db, &account, &thread_id).await;
             }
             drop(sessions);
             let _ = app.emit("mail:updated", ());
@@ -2716,8 +2872,9 @@ fn spawn_remote(app: AppHandle, thread_id: String, op: RemoteTriage) {
 #[tauri::command]
 async fn archive_thread(app: AppHandle, state: State<'_, AppState>, thread_id: String) -> Result<(), String> {
     valid_id(&thread_id)?;
-    ensure_remote_capable(&state, &thread_id)?;
-    store::set_in_inbox(&state.db.lock().unwrap(), &thread_id, false)?;
+    let (account, db) = state.thread_db(&thread_id)?;
+    ensure_remote_capable(&state, &thread_id, &account)?;
+    store::set_in_inbox(&db.lock().unwrap(), &thread_id, false)?;
     spawn_remote(app, thread_id, RemoteTriage::Modify { add: vec![], remove: vec![s("INBOX")] });
     Ok(())
 }
@@ -2725,8 +2882,9 @@ async fn archive_thread(app: AppHandle, state: State<'_, AppState>, thread_id: S
 #[tauri::command]
 async fn move_to_inbox(app: AppHandle, state: State<'_, AppState>, thread_id: String) -> Result<(), String> {
     valid_id(&thread_id)?;
-    ensure_remote_capable(&state, &thread_id)?;
-    store::set_in_inbox(&state.db.lock().unwrap(), &thread_id, true)?;
+    let (account, db) = state.thread_db(&thread_id)?;
+    ensure_remote_capable(&state, &thread_id, &account)?;
+    store::set_in_inbox(&db.lock().unwrap(), &thread_id, true)?;
     spawn_remote(app, thread_id, RemoteTriage::Modify { add: vec![s("INBOX")], remove: vec![] });
     Ok(())
 }
@@ -2744,8 +2902,9 @@ async fn hide_thread(
     if !matches!(reason.as_str(), "trash" | "spam") {
         return Err("invalid reason".into());
     }
-    ensure_remote_capable(&state, &thread_id)?;
-    store::set_hidden(&state.db.lock().unwrap(), &thread_id, Some(&reason))?;
+    let (account, db) = state.thread_db(&thread_id)?;
+    ensure_remote_capable(&state, &thread_id, &account)?;
+    store::set_hidden(&db.lock().unwrap(), &thread_id, Some(&reason))?;
     let op = if reason == "trash" {
         RemoteTriage::Trash
     } else {
@@ -2759,9 +2918,10 @@ async fn hide_thread(
 #[tauri::command]
 async fn restore_thread(app: AppHandle, state: State<'_, AppState>, thread_id: String) -> Result<(), String> {
     valid_id(&thread_id)?;
-    let reason = store::hidden_reason(&state.db.lock().unwrap(), &thread_id);
-    ensure_remote_capable(&state, &thread_id)?;
-    store::set_hidden(&state.db.lock().unwrap(), &thread_id, None)?;
+    let (account, db) = state.thread_db(&thread_id)?;
+    let reason = store::hidden_reason(&db.lock().unwrap(), &thread_id);
+    ensure_remote_capable(&state, &thread_id, &account)?;
+    store::set_hidden(&db.lock().unwrap(), &thread_id, None)?;
     match reason.as_deref() {
         Some("trash") => spawn_remote(app, thread_id, RemoteTriage::UntrashAdd(vec![s("INBOX")])),
         Some("spam") => spawn_remote(
@@ -2778,9 +2938,10 @@ async fn restore_thread(app: AppHandle, state: State<'_, AppState>, thread_id: S
 #[tauri::command]
 async fn mute_thread(app: AppHandle, state: State<'_, AppState>, thread_id: String) -> Result<(), String> {
     valid_id(&thread_id)?;
-    ensure_remote_capable(&state, &thread_id)?;
+    let (account, db) = state.thread_db(&thread_id)?;
+    ensure_remote_capable(&state, &thread_id, &account)?;
     let already_muted = {
-        let conn = state.db.lock().unwrap();
+        let conn = db.lock().unwrap();
         let muted = store::get_thread(&conn, &thread_id)
             .map(|t| t.labels.iter().any(|l| l == "Muted"))
             .unwrap_or(false);
@@ -2798,9 +2959,10 @@ async fn mute_thread(app: AppHandle, state: State<'_, AppState>, thread_id: Stri
 #[tauri::command]
 async fn unmute_thread(app: AppHandle, state: State<'_, AppState>, thread_id: String) -> Result<(), String> {
     valid_id(&thread_id)?;
-    ensure_remote_capable(&state, &thread_id)?;
+    let (account, db) = state.thread_db(&thread_id)?;
+    ensure_remote_capable(&state, &thread_id, &account)?;
     let was_muted = {
-        let conn = state.db.lock().unwrap();
+        let conn = db.lock().unwrap();
         let muted = store::get_thread(&conn, &thread_id)
             .map(|t| t.labels.iter().any(|l| l == "Muted"))
             .unwrap_or(false);
@@ -2816,13 +2978,14 @@ async fn unmute_thread(app: AppHandle, state: State<'_, AppState>, thread_id: St
 }
 
 #[tauri::command]
-fn unsubscribe_thread(
+async fn unsubscribe_thread(
     app: AppHandle,
     state: State<'_, AppState>,
     thread_id: String,
 ) -> Result<UnsubResult, String> {
     valid_id(&thread_id)?;
-    let header = store::unsubscribe_header(&state.db.lock().unwrap(), &thread_id);
+    let (_, db) = state.thread_db(&thread_id)?;
+    let header = store::unsubscribe_header(&db.lock().unwrap(), &thread_id);
     let Some(header) = header else {
         return Ok(UnsubResult { kind: "none".into(), target: None });
     };
@@ -2841,9 +3004,10 @@ fn unsubscribe_thread(
 #[tauri::command]
 async fn toggle_star(app: AppHandle, state: State<'_, AppState>, thread_id: String) -> Result<bool, String> {
     valid_id(&thread_id)?;
-    ensure_remote_capable(&state, &thread_id)?;
+    let (account, db) = state.thread_db(&thread_id)?;
+    ensure_remote_capable(&state, &thread_id, &account)?;
     let starred = {
-        let conn = state.db.lock().unwrap();
+        let conn = db.lock().unwrap();
         let t = store::get_thread(&conn, &thread_id).ok_or("unknown thread")?;
         let starred = !t.starred;
         store::set_starred(&conn, &thread_id, starred)?;
@@ -2869,8 +3033,9 @@ async fn snooze_thread(
     if until_ms <= now_ms() {
         return Err("snooze time must be in the future".into());
     }
-    ensure_remote_capable(&state, &thread_id)?;
-    store::set_snoozed(&state.db.lock().unwrap(), &thread_id, until_ms)?;
+    let (account, db) = state.thread_db(&thread_id)?;
+    ensure_remote_capable(&state, &thread_id, &account)?;
+    store::set_snoozed(&db.lock().unwrap(), &thread_id, until_ms)?;
     spawn_remote(app, thread_id, RemoteTriage::Modify { add: vec![], remove: vec![s("INBOX")] });
     Ok(())
 }
@@ -2878,8 +3043,9 @@ async fn snooze_thread(
 #[tauri::command]
 async fn mark_unread(app: AppHandle, state: State<'_, AppState>, thread_id: String) -> Result<(), String> {
     valid_id(&thread_id)?;
-    ensure_remote_capable(&state, &thread_id)?;
-    store::set_unread(&state.db.lock().unwrap(), &thread_id, true)?;
+    let (account, db) = state.thread_db(&thread_id)?;
+    ensure_remote_capable(&state, &thread_id, &account)?;
+    store::set_unread(&db.lock().unwrap(), &thread_id, true)?;
     spawn_remote(app, thread_id, RemoteTriage::Modify { add: vec![s("UNREAD")], remove: vec![] });
     Ok(())
 }
@@ -2887,8 +3053,9 @@ async fn mark_unread(app: AppHandle, state: State<'_, AppState>, thread_id: Stri
 #[tauri::command]
 async fn mark_read(app: AppHandle, state: State<'_, AppState>, thread_id: String) -> Result<(), String> {
     valid_id(&thread_id)?;
-    ensure_remote_capable(&state, &thread_id)?;
-    store::set_unread(&state.db.lock().unwrap(), &thread_id, false)?;
+    let (account, db) = state.thread_db(&thread_id)?;
+    ensure_remote_capable(&state, &thread_id, &account)?;
+    store::set_unread(&db.lock().unwrap(), &thread_id, false)?;
     spawn_remote(app, thread_id, RemoteTriage::Modify { add: vec![], remove: vec![s("UNREAD")] });
     Ok(())
 }
@@ -2904,9 +3071,10 @@ async fn move_label(
     if label.is_empty() || label.len() > 100 {
         return Err("invalid label".into());
     }
-    ensure_remote_capable(&state, &thread_id)?;
+    let (account, db) = state.thread_db(&thread_id)?;
+    ensure_remote_capable(&state, &thread_id, &account)?;
     let added = {
-        let conn = state.db.lock().unwrap();
+        let conn = db.lock().unwrap();
         store::toggle_label(&conn, &thread_id, &label)?
     };
     let op = if added {
@@ -2924,11 +3092,9 @@ async fn bulk_archive(
     state: State<'_, AppState>,
     opts: BulkArchiveOpts,
 ) -> Result<i64, String> {
-    let (targets, active) = {
-        let conn = state.db.lock().unwrap();
-        let active = store::get_accounts(&conn).active;
-        (store::inbox_threads_for_sweep(&conn, &active)?, active)
-    };
+    let active = state.active_email();
+    let db = state.account_db(&active)?;
+    let targets = { store::inbox_threads_for_sweep(&db.lock().unwrap(), &active)? };
     let cutoff = now_ms() - opts.older_than_days * 24 * 3_600_000;
     let mut ids: Vec<String> = vec![];
     for t in targets {
@@ -2952,7 +3118,7 @@ async fn bulk_archive(
     }
     // Local writes are synchronous (instant); archive on Gmail in the background.
     {
-        let conn = state.db.lock().unwrap();
+        let conn = db.lock().unwrap();
         for id in &ids {
             store::set_in_inbox(&conn, id, false)?;
         }
@@ -2984,27 +3150,31 @@ async fn bulk_archive(
 fn spawn_reclassify(app: AppHandle, only_missing: bool) {
     tauri::async_runtime::spawn(async move {
         let state = app.state::<AppState>();
-        let mut after = 0i64;
         let mut moved = 0usize;
-        loop {
-            let step = {
-                let conn = state.db.lock().unwrap();
-                store::reclassify_page(&conn, after, 500, only_missing)
-            };
-            match step {
-                Ok((updated, last, done)) => {
-                    moved += updated;
-                    after = last;
-                    if done {
+        // one pass per account file — the rowid walk is per-db now
+        for email in state.dbs.registered_emails() {
+            let Ok(db) = state.account_db(&email) else { continue };
+            let mut after = 0i64;
+            loop {
+                let step = {
+                    let conn = db.lock().unwrap();
+                    store::reclassify_page(&conn, after, 500, only_missing)
+                };
+                match step {
+                    Ok((updated, last, done)) => {
+                        moved += updated;
+                        after = last;
+                        if done {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[splits:{email}] reclassify failed: {e}");
                         break;
                     }
                 }
-                Err(e) => {
-                    eprintln!("[splits] reclassify failed: {e}");
-                    break;
-                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
         }
         if moved > 0 {
             let _ = app.emit("mail:updated", ());
@@ -3041,18 +3211,18 @@ fn validate_mail(mail: &OutgoingMail) -> Result<(), String> {
 async fn deliver_mail(app: &AppHandle, account_email: &str, mail: &OutgoingMail) -> Result<(), String> {
     let state = app.state::<AppState>();
     let provider = {
-        let conn = state.db.lock().unwrap();
-        store::get_accounts(&conn)
+        store::get_accounts(&state.global().lock().unwrap())
             .accounts
             .iter()
             .find(|a| a.email == account_email)
             .map(|a| a.provider.clone())
             .unwrap_or_else(|| "mock".into())
     };
+    let db = state.account_db(account_email)?;
 
     if provider == "gmail" && !mail.thread_id.as_deref().map(is_mock_id).unwrap_or(false) {
         let in_reply_to: Option<String> = mail.thread_id.as_ref().and_then(|tid| {
-            let conn = state.db.lock().unwrap();
+            let conn = db.lock().unwrap();
             conn.query_row(
                 "SELECT rfc_message_id FROM messages WHERE thread_id = ?1 AND rfc_message_id IS NOT NULL ORDER BY date DESC LIMIT 1",
                 [tid.as_str()],
@@ -3072,7 +3242,7 @@ async fn deliver_mail(app: &AppHandle, account_email: &str, mail: &OutgoingMail)
     }
 
     // mock mode: append locally so the flow is fully demoable
-    let conn = state.db.lock().unwrap();
+    let conn = db.lock().unwrap();
     let now = now_ms();
     let (tid, subject) = match &mail.thread_id {
         Some(tid) => (tid.clone(), mail.subject.clone()),
@@ -3126,21 +3296,50 @@ async fn deliver_mail(app: &AppHandle, account_email: &str, mail: &OutgoingMail)
 /// Queue a message. delay_ms ≈ 10s gives the Undo Send window; larger values
 /// are Send Later. The outbox survives app restarts.
 #[tauri::command]
-fn queue_mail(state: State<'_, AppState>, mail: OutgoingMail, delay_ms: i64) -> Result<i64, String> {
+async fn queue_mail(state: State<'_, AppState>, mail: OutgoingMail, delay_ms: i64) -> Result<i64, String> {
     validate_mail(&mail)?;
     if !(0..=90 * 24 * 3_600_000).contains(&delay_ms) {
         return Err("invalid send delay".into());
     }
-    let conn = state.db.lock().unwrap();
-    let account = store::get_accounts(&conn).active;
+    let account = state.active_email();
+    let db = state.account_db(&account)?;
+    let conn = db.lock().unwrap();
     store::outbox_add(&conn, &account, &mail, now_ms() + delay_ms)
+}
+
+/// Which account file holds this outbox row. Active first — undo/accelerate
+/// always fire from the account that queued moments ago.
+fn outbox_db(state: &AppState, outbox_id: i64) -> Result<(String, Arc<Mutex<Connection>>), String> {
+    let active = state.active_email();
+    let mut emails = vec![];
+    if !active.is_empty() {
+        emails.push(active.clone());
+    }
+    for e in state.dbs.registered_emails() {
+        if e != active {
+            emails.push(e);
+        }
+    }
+    for email in emails {
+        let db = state.account_db(&email)?;
+        let hit: bool = {
+            let conn = db.lock().unwrap();
+            conn.query_row("SELECT 1 FROM outbox WHERE id = ?1", [outbox_id], |_| Ok(true))
+                .unwrap_or(false)
+        };
+        if hit {
+            return Ok((email, db));
+        }
+    }
+    Err("already sent".into())
 }
 
 /// Undo Send: pull a message back before the outbox flushes it.
 #[tauri::command]
-fn cancel_outbox(state: State<'_, AppState>, outbox_id: i64) -> Result<OutgoingMail, String> {
-    store::outbox_cancel(&state.db.lock().unwrap(), outbox_id)
-        .ok_or("already sent".to_string())
+async fn cancel_outbox(state: State<'_, AppState>, outbox_id: i64) -> Result<OutgoingMail, String> {
+    let (_, db) = outbox_db(&state, outbox_id)?;
+    let cancelled = store::outbox_cancel(&db.lock().unwrap(), outbox_id);
+    cancelled.ok_or("already sent".to_string())
 }
 
 /// Send a message immediately, bypassing the outbox — used when Undo Send is
@@ -3151,8 +3350,8 @@ async fn send_mail_now(app: AppHandle, mail: OutgoingMail) -> Result<(), String>
     validate_mail(&mail)?;
     let account = {
         let state = app.state::<AppState>();
-        let conn = state.db.lock().unwrap();
-        store::get_accounts(&conn).active
+        let email = state.active_email();
+        email
     };
     deliver_mail(&app, &account, &mail).await?;
     let _ = app.emit("mail:updated", ());
@@ -3168,9 +3367,12 @@ async fn send_outbox_now(app: AppHandle, outbox_id: i64) -> Result<(), String> {
     // Claim the row before the (async) network send so the 3s outbox processor
     // can never also deliver it. The claim + read run under one lock, so they're
     // atomic; a claimed row is invisible to outbox_due and to cancel_outbox.
-    let (account, mail) = {
+    let db = {
         let state = app.state::<AppState>();
-        let conn = state.db.lock().unwrap();
+        outbox_db(&state, outbox_id)?.1
+    };
+    let (account, mail) = {
+        let conn = db.lock().unwrap();
         if !store::outbox_claim(&conn, outbox_id) {
             return Err("already sent".into());
         }
@@ -3179,16 +3381,15 @@ async fn send_outbox_now(app: AppHandle, outbox_id: i64) -> Result<(), String> {
     .ok_or_else(|| "already sent".to_string())?;
     match deliver_mail(&app, &account, &mail).await {
         Ok(()) => {
-            let state = app.state::<AppState>();
-            let conn = state.db.lock().unwrap();
+            let conn = db.lock().unwrap();
             store::outbox_delete(&conn, outbox_id);
+            drop(conn);
             let _ = app.emit("mail:updated", ());
             Ok(())
         }
         Err(e) => {
             // Delivery failed — release the claim so the processor retries it.
-            let state = app.state::<AppState>();
-            let conn = state.db.lock().unwrap();
+            let conn = db.lock().unwrap();
             store::outbox_unclaim(&conn, outbox_id);
             Err(e)
         }
@@ -3198,12 +3399,12 @@ async fn send_outbox_now(app: AppHandle, outbox_id: i64) -> Result<(), String> {
 // ---------------------------------------------------------------- settings
 
 #[tauri::command]
-fn get_settings(state: State<'_, AppState>) -> Settings {
-    store::get_settings(&state.db.lock().unwrap())
+async fn get_settings(state: State<'_, AppState>) -> Result<Settings, String> {
+    Ok(store::get_settings(&state.global().lock().unwrap()))
 }
 
 #[tauri::command]
-fn save_settings(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> Result<(), String> {
+async fn save_settings(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> Result<(), String> {
     if settings.splits.len() > 24 {
         return Err("too many splits".into());
     }
@@ -3222,7 +3423,8 @@ fn save_settings(app: AppHandle, state: State<'_, AppState>, settings: Settings)
         }
     }
     let splits_changed = {
-        let conn = state.db.lock().unwrap();
+        let gdb = state.global();
+        let conn = gdb.lock().unwrap();
         let before = serde_json::to_value(store::split_config(&conn)).unwrap_or_default();
         store::set_json(&conn, "settings", &settings)?;
         before != serde_json::to_value(&settings.splits).unwrap_or_default()
@@ -3238,9 +3440,10 @@ fn save_settings(app: AppHandle, state: State<'_, AppState>, settings: Settings)
 /// Inbox conversation count per split (active account) — SQL over the whole
 /// mailbox, so tab counts don't stop at the 500-row display window.
 #[tauri::command]
-fn split_counts(state: State<'_, AppState>) -> Result<std::collections::HashMap<String, i64>, String> {
-    let conn = state.db.lock().unwrap();
-    let active = store::get_accounts(&conn).active;
+async fn split_counts(state: State<'_, AppState>) -> Result<std::collections::HashMap<String, i64>, String> {
+    let active = state.active_email();
+    let db = state.account_db(&active)?;
+    let conn = db.lock().unwrap();
     store::split_counts(&conn, &active)
 }
 
@@ -3256,7 +3459,7 @@ struct SplitPreview {
 /// Live validation + match preview for the split editor. Counts over the
 /// recent inbox window (500) — a hint, not the classifier.
 #[tauri::command]
-fn preview_split(state: State<'_, AppState>, query: String) -> Result<SplitPreview, String> {
+async fn preview_split(state: State<'_, AppState>, query: String) -> Result<SplitPreview, String> {
     if query.len() > 500 {
         return Ok(SplitPreview { ok: false, error: Some("query is too long".into()), count: 0 });
     }
@@ -3271,8 +3474,9 @@ fn preview_split(state: State<'_, AppState>, query: String) -> Result<SplitPrevi
         }
         Ok(Some(n)) => n,
     };
-    let conn = state.db.lock().unwrap();
-    let active = store::get_accounts(&conn).active;
+    let active = state.active_email();
+    let db = state.account_db(&active)?;
+    let conn = db.lock().unwrap();
     let threads = store::list_threads(&conn, "inbox", &active)?;
     let count = threads
         .iter()
@@ -3292,22 +3496,22 @@ fn preview_split(state: State<'_, AppState>, query: String) -> Result<SplitPrevi
 }
 
 #[tauri::command]
-fn get_knowledge_base(state: State<'_, AppState>) -> KnowledgeBase {
-    store::get_kb(&state.db.lock().unwrap())
+async fn get_knowledge_base(state: State<'_, AppState>) -> Result<KnowledgeBase, String> {
+    Ok(store::get_kb(&state.global().lock().unwrap()))
 }
 
 #[tauri::command]
-fn save_knowledge_base(state: State<'_, AppState>, kb: KnowledgeBase) -> Result<(), String> {
+async fn save_knowledge_base(state: State<'_, AppState>, kb: KnowledgeBase) -> Result<(), String> {
     if kb.instructions.len() > 50_000 {
         return Err("instructions are too long".into());
     }
-    store::set_json(&state.db.lock().unwrap(), "kb", &kb)
+    store::set_json(&state.global().lock().unwrap(), "kb", &kb)
 }
 
 // ---------------------------------------------------------------- AI
 
 #[tauri::command]
-fn set_ai_key(state: State<'_, AppState>, provider: String, key: String) -> Result<(), String> {
+async fn set_ai_key(state: State<'_, AppState>, provider: String, key: String) -> Result<(), String> {
     let entry = secrets::ai_key_entry(&provider).ok_or("unknown AI provider")?;
     let key = key.trim();
     if key.is_empty() {
@@ -3318,7 +3522,8 @@ fn set_ai_key(state: State<'_, AppState>, provider: String, key: String) -> Resu
         }
         secrets::set(entry, key)?;
     }
-    let conn = state.db.lock().unwrap();
+    let gdb = state.global();
+    let conn = gdb.lock().unwrap();
     let mut settings = store::get_settings(&conn);
     for p in settings.providers.iter_mut() {
         if p.id == provider {
@@ -3330,7 +3535,7 @@ fn set_ai_key(state: State<'_, AppState>, provider: String, key: String) -> Resu
 
 #[tauri::command]
 async fn test_ai_provider(state: State<'_, AppState>, provider: String) -> Result<TestResult, String> {
-    let settings = store::get_settings(&state.db.lock().unwrap());
+    let settings = store::get_settings(&state.global().lock().unwrap());
     let resolved = match ai::resolve(&settings, Some(&provider)) {
         Ok(r) => r,
         Err(message) => return Ok(TestResult { ok: false, message }),
@@ -3354,14 +3559,20 @@ async fn ai_draft(
     if let Some(tid) = &req.thread_id {
         valid_id(tid)?;
     }
-    let settings = store::get_settings(&state.db.lock().unwrap());
+    let settings = store::get_settings(&state.global().lock().unwrap());
     let resolved = ai::resolve(&settings, req.provider_id.as_deref())?;
 
     let cancel = Arc::new(AtomicBool::new(false));
     state.cancels.lock().unwrap().insert(request_id, cancel.clone());
 
+    let db = match &req.thread_id {
+        Some(tid) => state.thread_db(tid)?.1,
+        None => state.active_db()?,
+    };
+    let global = state.global();
     let ctx = ai::context::assemble(
-        &state.db,
+        &global,
+        &db,
         &state.http,
         &state.gmail,
         &req,
@@ -3397,8 +3608,9 @@ async fn ai_suggest_replies(
     thread_id: String,
 ) -> Result<Vec<String>, String> {
     valid_id(&thread_id)?;
-    let settings = store::get_settings(&state.db.lock().unwrap());
+    let settings = store::get_settings(&state.global().lock().unwrap());
     let resolved = ai::resolve(&settings, None)?; // errs (and hides UI) when no key
+    let db = state.thread_db(&thread_id)?.1;
     let req = DraftRequest {
         thread_id: Some(thread_id),
         instruction: "Suggest up to 3 short, distinct replies the user might send to the latest message. \
@@ -3408,7 +3620,8 @@ async fn ai_suggest_replies(
         existing_text: None,
         provider_id: None,
     };
-    let ctx = ai::context::assemble(&state.db, &state.http, &state.gmail, &req, false).await?;
+    let global = state.global();
+    let ctx = ai::context::assemble(&global, &db, &state.http, &state.gmail, &req, false).await?;
     let raw = ai::complete(&state.http, &resolved, &ctx.system, &ctx.user_text).await?;
     Ok(ai::parse_suggestions(&raw))
 }
@@ -3416,8 +3629,8 @@ async fn ai_suggest_replies(
 // ---------------------------------------------------------------- inbox zero
 
 #[tauri::command]
-fn get_streaks(state: State<'_, AppState>) -> Streaks {
-    store::get_streaks(&state.db.lock().unwrap())
+async fn get_streaks(state: State<'_, AppState>) -> Result<Streaks, String> {
+    Ok(store::get_streaks(&state.global().lock().unwrap()))
 }
 
 fn celebration_pool(app: &AppHandle, settings: &Settings) -> Vec<String> {
@@ -3445,8 +3658,9 @@ fn celebration_pool(app: &AppHandle, settings: &Settings) -> Vec<String> {
 }
 
 #[tauri::command]
-fn record_zero(app: AppHandle, state: State<'_, AppState>, split_id: String) -> Result<Option<ZeroEvent>, String> {
-    let conn = state.db.lock().unwrap();
+async fn record_zero(app: AppHandle, state: State<'_, AppState>, split_id: String) -> Result<Option<ZeroEvent>, String> {
+    let db = state.global();
+    let conn = db.lock().unwrap();
     let mut s = store::get_streaks(&conn);
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     if s.last_zero_day.as_deref() != Some(today.as_str()) {
@@ -3471,9 +3685,9 @@ fn record_zero(app: AppHandle, state: State<'_, AppState>, split_id: String) -> 
 }
 
 #[tauri::command]
-fn list_celebration_images(app: AppHandle, state: State<'_, AppState>) -> Vec<String> {
-    let settings = store::get_settings(&state.db.lock().unwrap());
-    celebration_pool(&app, &settings)
+async fn list_celebration_images(app: AppHandle, state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    let settings = store::get_settings(&state.global().lock().unwrap());
+    Ok(celebration_pool(&app, &settings))
 }
 
 // ---------------------------------------------------------------- bootstrap
@@ -3495,35 +3709,31 @@ pub fn run() {
             // cached mail carry over. Keychain secrets migrate lazily in
             // secrets::get.
             migrate_legacy_db(&data_dir);
-            let db_path = data_dir.join("fission.db");
-            let conn = store::open(&db_path).map_err(std::io::Error::other)?;
+            // global.db + per-account files; a legacy fission.db keeps serving
+            // account reads until the backgrounded split migration verifies.
+            let dbs = store::registry::DbRegistry::open(&data_dir).map_err(std::io::Error::other)?;
 
-            let accounts = store::get_accounts(&conn);
+            let accounts = { store::get_accounts(&dbs.global().lock().unwrap()) };
             let mut sessions = HashMap::new();
             let mut lost_accounts = vec![];
             for a in &accounts.accounts {
-                match a.provider.as_str() {
-                    "gmail" => match GmailSession::from_keychain(a.email.clone()) {
+                if a.provider == "gmail" {
+                    match GmailSession::from_keychain(a.email.clone()) {
                         Some(s) => {
                             sessions.insert(a.email.clone(), s);
                         }
                         None => lost_accounts.push(a.email.clone()),
-                    },
-                    _ => {
-                        mail::mock::seed_if_empty(&conn).map_err(std::io::Error::other)?;
-                        // demo DBs seeded before v0.16 predate ics_data —
-                        // patch the invitation fixtures so their RSVP bar works
-                        mail::mock::heal_demo_ics(&conn);
                     }
                 }
             }
             // tokens removed out-of-band: drop those accounts gracefully
             if !lost_accounts.is_empty() {
+                let g = dbs.global();
+                let conn = g.lock().unwrap();
                 let mut acc = accounts.clone();
                 acc.accounts.retain(|a| !lost_accounts.contains(&a.email));
                 if acc.accounts.is_empty() {
                     conn.execute("DELETE FROM kv WHERE key = 'accounts'", []).ok();
-                    let _ = mail::mock::seed_if_empty(&conn);
                 } else {
                     if !acc.accounts.iter().any(|a| a.email == acc.active) {
                         acc.active = acc.accounts[0].email.clone();
@@ -3531,10 +3741,21 @@ pub fn run() {
                     let _ = store::save_accounts(&conn, &acc);
                 }
             }
-            // Semantic stand-in vectors for the demo fixtures — idempotent,
-            // covers fresh seeds and demo DBs that predate the vector tier;
-            // no-op when no demo messages exist.
-            mail::mock::ensure_demo_vectors(&conn).map_err(std::io::Error::other)?;
+            // Demo fixtures: each mock account seeds into its own file
+            // (re-read — the lost-token path may have fallen back to the
+            // demo pair). Idempotent per account; heal + stand-in vectors
+            // cover demo dbs from older builds.
+            let accounts = { store::get_accounts(&dbs.global().lock().unwrap()) };
+            for a in &accounts.accounts {
+                if a.provider == "gmail" {
+                    continue;
+                }
+                let db = dbs.account(&a.email).map_err(std::io::Error::other)?;
+                let conn = db.lock().unwrap();
+                mail::mock::seed_account_if_empty(&conn, &a.email).map_err(std::io::Error::other)?;
+                mail::mock::heal_demo_ics(&conn);
+                mail::mock::ensure_demo_vectors(&conn).map_err(std::io::Error::other)?;
+            }
 
             // One-time notice for accounts whose grant predates the v0.12
             // scope expansion (no recorded granted_scopes): they need a single
@@ -3545,6 +3766,8 @@ pub fn run() {
                 if a.provider != "gmail" {
                     continue;
                 }
+                let db = dbs.account(&a.email).map_err(std::io::Error::other)?;
+                let conn = db.lock().unwrap();
                 let has_grant =
                     store::get_json::<String>(&conn, &format!("granted_scopes:{}", a.email))
                         .is_some();
@@ -3571,7 +3794,7 @@ pub fn run() {
             }
 
             // allow a previously-configured celebration folder
-            let settings = store::get_settings(&conn);
+            let settings = { store::get_settings(&dbs.global().lock().unwrap()) };
             if let Some(dir) = &settings.celebration_dir {
                 let p = std::path::Path::new(dir);
                 if p.is_dir() {
@@ -3585,7 +3808,8 @@ pub fn run() {
                 .expect("http client");
 
             app.manage(AppState {
-                db: Arc::new(Mutex::new(conn)),
+                dbs,
+                migrating: AtomicBool::new(false),
                 http,
                 gmail: tokio::sync::Mutex::new(sessions),
                 cancels: Mutex::new(HashMap::new()),
@@ -3595,21 +3819,6 @@ pub fn run() {
                 data_dir: data_dir.clone(),
                 embedder: tokio::sync::Mutex::new(embed::Slot::Idle),
             });
-
-            // Drain any mail left behind by a disconnect that never finished.
-            spawn_orphan_mail_sweep(app.handle().clone());
-
-            // v0.23 backfill: rows from before split materialization classify
-            // in the background; the UI files them under the catch-all until
-            // the pass lands (it emits mail:updated when threads moved).
-            let needs_backfill = {
-                let state = app.state::<AppState>();
-                let conn = state.db.lock().unwrap();
-                store::has_unclassified_threads(&conn)
-            };
-            if needs_backfill {
-                spawn_reclassify(app.handle().clone(), true);
-            }
 
             // Dev-only: SNAIL_AI_SMOKE=1 (legacy FISSION_AI_SMOKE) streams one
             // real draft at startup and logs the result — end-to-end proof of
@@ -3623,7 +3832,7 @@ pub fn run() {
                 let handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     let state = handle.state::<AppState>();
-                    let settings = store::get_settings(&state.db.lock().unwrap());
+                    let settings = store::get_settings(&state.global().lock().unwrap());
                     let p = match ai::resolve(&settings, None) {
                         Ok(p) => p,
                         Err(e) => return eprintln!("[ai-smoke] resolve: {e}"),
@@ -3634,7 +3843,11 @@ pub fn run() {
                         existing_text: None,
                         provider_id: None,
                     };
-                    let ctx = match ai::context::assemble(&state.db, &state.http, &state.gmail, &req, false).await {
+                    let Ok((_, db)) = state.thread_db("t-term-sheet") else {
+                        return eprintln!("[ai-smoke] demo thread not found");
+                    };
+                    let global = state.global();
+                    let ctx = match ai::context::assemble(&global, &db, &state.http, &state.gmail, &req, false).await {
                         Ok(c) => c,
                         Err(e) => return eprintln!("[ai-smoke] assemble: {e}"),
                     };
@@ -3667,33 +3880,44 @@ pub fn run() {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                     let state = outbox_handle.state::<AppState>();
-                    let due = {
-                        let conn = state.db.lock().unwrap();
-                        store::outbox_due(&conn, now_ms())
-                    };
+                    if state.migrating.load(Ordering::SeqCst) {
+                        continue; // sends resume the moment the split finishes
+                    }
                     let mut sent_any = false;
-                    for (id, account, mail) in due {
-                        // Claim before the async send so a concurrent Send-now
-                        // (accelerate) can't also deliver this row; skip if it
-                        // already won the claim.
-                        let won = {
-                            let conn = state.db.lock().unwrap();
-                            store::outbox_claim(&conn, id)
+                    for email in state.dbs.registered_emails() {
+                        let Ok(db) = state.account_db(&email) else { continue };
+                        let due = {
+                            let conn = db.lock().unwrap();
+                            store::outbox_due(&conn, now_ms())
                         };
-                        if !won {
-                            continue;
-                        }
-                        match deliver_mail(&outbox_handle, &account, &mail).await {
-                            Ok(()) => {
-                                let conn = state.db.lock().unwrap();
-                                store::outbox_delete(&conn, id);
-                                sent_any = true;
+                        for (id, account, mail) in due {
+                            // While the legacy db still serves several accounts
+                            // this loop sees every row once per email — only the
+                            // owning pass may act.
+                            if account != email {
+                                continue;
                             }
-                            Err(e) => {
-                                eprintln!("[outbox] send failed (will retry): {e}");
-                                let conn = state.db.lock().unwrap();
-                                store::outbox_unclaim(&conn, id);
-                                store::outbox_bump_attempts(&conn, id);
+                            // Claim before the async send so a concurrent
+                            // Send-now (accelerate) can't also deliver this row.
+                            let won = {
+                                let conn = db.lock().unwrap();
+                                store::outbox_claim(&conn, id)
+                            };
+                            if !won {
+                                continue;
+                            }
+                            match deliver_mail(&outbox_handle, &account, &mail).await {
+                                Ok(()) => {
+                                    let conn = db.lock().unwrap();
+                                    store::outbox_delete(&conn, id);
+                                    sent_any = true;
+                                }
+                                Err(e) => {
+                                    eprintln!("[outbox] send failed (will retry): {e}");
+                                    let conn = db.lock().unwrap();
+                                    store::outbox_unclaim(&conn, id);
+                                    store::outbox_bump_attempts(&conn, id);
+                                }
                             }
                         }
                     }
@@ -3703,13 +3927,68 @@ pub fn run() {
                 }
             });
 
-            // one forced reconcile at startup: refreshes the inbox immediately on
-            // launch and sweeps any server-side removals missed while closed
+            // Split the legacy db first (progress-visible, resumable), then the
+            // forced boot reconcile — the split never races live sync writes.
             let boot = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let state = boot.state::<AppState>();
-                // Stream the inbox in + climb the download bar as the boot
-                // reconcile fetches, so a returning user sees mail immediately.
+                let needs = {
+                    let g = state.dbs.global();
+                    let needs = {
+                        let conn = g.lock().unwrap();
+                        store::migrate::needs_migration(&conn, &state.dbs.data_dir)
+                    };
+                    needs
+                };
+                if needs {
+                    state.migrating.store(true, Ordering::SeqCst);
+                    let mig_handle = boot.clone();
+                    let res = tauri::async_runtime::spawn_blocking(move || {
+                        let state = mig_handle.state::<AppState>();
+                        store::migrate::migrate_all(
+                            &state.dbs,
+                            &store::migrate::MigrateOpts::default(),
+                            &mut |p| {
+                                let _ = mig_handle.emit("migration:progress", &p);
+                            },
+                        )
+                    })
+                    .await;
+                    match res {
+                        Ok(Ok(true)) => eprintln!("[migrate] legacy db split complete"),
+                        Ok(Ok(false)) => eprintln!("[migrate] incomplete — resumes next boot"),
+                        Ok(Err(e)) => eprintln!("[migrate] {e} — will retry next boot"),
+                        Err(e) => eprintln!("[migrate] task: {e}"),
+                    }
+                    state.migrating.store(false, Ordering::SeqCst);
+                    let _ = boot.emit(
+                        "migration:progress",
+                        store::migrate::MigrateProgress {
+                            email: String::new(),
+                            table: "done".into(),
+                            copied: 1,
+                            total: 1,
+                        },
+                    );
+                    let _ = boot.emit("mail:updated", ());
+                } else {
+                    store::migrate::delete_bak_if_verified(&state.dbs);
+                }
+                // Remove account files no registered account derives to.
+                spawn_account_file_sweep(boot.clone());
+                // v0.23 backfill: pre-split-materialization rows classify in
+                // the background (after the split so the two never compete).
+                let needs_backfill = state.dbs.registered_emails().iter().any(|email| {
+                    state
+                        .account_db(email)
+                        .map(|db| store::has_unclassified_threads(&db.lock().unwrap()))
+                        .unwrap_or(false)
+                });
+                if needs_backfill {
+                    spawn_reclassify(boot.clone(), true);
+                }
+                // One forced reconcile: refreshes the inbox immediately on
+                // launch and sweeps server-side removals missed while closed.
                 let on_progress = || {
                     let _ = boot.emit("mail:updated", ());
                     emit_sync_progress(&boot);
@@ -3718,8 +3997,9 @@ pub fn run() {
                 {
                     let mut sessions = state.gmail.lock().await;
                     for (email, session) in sessions.iter_mut() {
+                        let Ok(db) = state.account_db(email) else { continue };
                         if let Ok(c) =
-                            mail::sync::full_sync(&state.http, session, &state.db, email, true, &on_progress).await
+                            mail::sync::full_sync(&state.http, session, &db, email, true, &on_progress).await
                         {
                             changed |= c;
                         }
@@ -3742,28 +4022,34 @@ pub fn run() {
                     tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                     tick += 1;
                     let state = handle.state::<AppState>();
-                    let woke: Vec<String> = {
-                        let conn = state.db.lock().unwrap();
-                        store::wake_due_snoozes(&conn, now_ms()).unwrap_or_default()
-                    };
+                    if state.migrating.load(Ordering::SeqCst) {
+                        continue; // the split owns the db this beat
+                    }
+                    // snooze wake-ups fan out per account file
+                    let mut woke: Vec<(String, String)> = vec![];
+                    for email in state.dbs.registered_emails() {
+                        let Ok(db) = state.account_db(&email) else { continue };
+                        let conn = db.lock().unwrap();
+                        for id in store::wake_due_snoozes(&conn, now_ms()).unwrap_or_default() {
+                            let owner = store::account_of_thread(&conn, &id).unwrap_or_else(|| email.clone());
+                            if owner == email || !woke.iter().any(|(_, w)| w == &id) {
+                                woke.push((owner, id));
+                            }
+                        }
+                    }
+                    woke.dedup_by(|a, b| a.1 == b.1);
                     let mut changed = !woke.is_empty();
                     let mut lost: Vec<String> = vec![];
                     {
                         let mut sessions = state.gmail.lock().await;
-                        for id in &woke {
+                        for (account, id) in &woke {
                             if is_mock_id(id) {
                                 continue;
                             }
-                            let account = {
-                                let conn = state.db.lock().unwrap();
-                                store::account_of_thread(&conn, id)
-                            };
-                            if let Some(account) = account {
-                                if let Some(session) = sessions.get_mut(&account) {
-                                    let _ = session
-                                        .modify_thread(&state.http, id, &["INBOX", "UNREAD"], &[])
-                                        .await;
-                                }
+                            if let Some(session) = sessions.get_mut(account) {
+                                let _ = session
+                                    .modify_thread(&state.http, id, &["INBOX", "UNREAD"], &[])
+                                    .await;
                             }
                         }
                         // Sync every tick (30s) for responsive two-way sync; a
@@ -3777,7 +4063,8 @@ pub fn run() {
                             emit_sync_progress(&handle);
                         };
                         for (email, session) in sessions.iter_mut() {
-                            match mail::sync::full_sync(&state.http, session, &state.db, email, force, &on_progress).await
+                            let Ok(db) = state.account_db(email) else { continue };
+                            match mail::sync::full_sync(&state.http, session, &db, email, force, &on_progress).await
                             {
                                 Ok(c) => changed |= c,
                                 // Errors were silently discarded here — a dead
@@ -3811,8 +4098,7 @@ pub fn run() {
                     // account's Google contacts are >24h stale.
                     if tick % 10 == 1 {
                         let emails: Vec<String> = {
-                            let conn = state.db.lock().unwrap();
-                            store::get_accounts(&conn)
+                            store::get_accounts(&state.global().lock().unwrap())
                                 .accounts
                                 .iter()
                                 .filter(|a| a.provider == "gmail")
@@ -3820,8 +4106,9 @@ pub fn run() {
                                 .collect()
                         };
                         for email in &emails {
+                            let Ok(db) = state.account_db(email) else { continue };
                             let (stale, has_contacts_scope) = {
-                                let conn = state.db.lock().unwrap();
+                                let conn = db.lock().unwrap();
                                 let stale = store::get_json::<i64>(
                                     &conn,
                                     &format!("people_synced:{email}"),

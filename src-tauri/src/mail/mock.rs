@@ -185,10 +185,28 @@ const ME: &str = "you@fission.local";
 const A1: &str = crate::store::DEMO_ACCOUNT;
 const A2: &str = crate::store::DEMO_ACCOUNT_2;
 
+#[allow(dead_code)] // production seeds per-account files now; tests still use the combined form
 pub fn seed_if_empty(conn: &Connection) -> Result<(), String> {
-    let count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM threads", [], |r| r.get(0))
-        .map_err(|e| e.to_string())?;
+    seed_filtered(conn, None)
+}
+
+/// Per-account db files hold exactly their own mail, so demo seeding must be
+/// able to plant a single account's fixtures. No-ops when that account
+/// already has threads in this file.
+pub fn seed_account_if_empty(conn: &Connection, account: &str) -> Result<(), String> {
+    seed_filtered(conn, Some(account))
+}
+
+fn seed_filtered(conn: &Connection, only: Option<&str>) -> Result<(), String> {
+    let count: i64 = match only {
+        None => conn.query_row("SELECT COUNT(*) FROM threads", [], |r| r.get(0)),
+        Some(a) => conn.query_row(
+            "SELECT COUNT(*) FROM threads WHERE account_id = ?1",
+            rusqlite::params![a],
+            |r| r.get(0),
+        ),
+    }
+    .map_err(|e| e.to_string())?;
     if count > 0 {
         return Ok(());
     }
@@ -535,6 +553,9 @@ pub fn seed_if_empty(conn: &Connection) -> Result<(), String> {
     ];
 
     for s in seeds {
+        if only.is_some_and(|o| o != s.account) {
+            continue;
+        }
         let mut participants: Vec<String> = vec![];
         let mut msgs = vec![];
         let mut unread = false;

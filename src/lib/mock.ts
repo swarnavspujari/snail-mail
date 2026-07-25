@@ -1731,6 +1731,10 @@ export class MockBackend implements Backend {
   onNotice(): () => void {
     return () => {};
   }
+  // The storage split is a desktop-only, one-time event; the demo never migrates.
+  onMigrationProgress(): () => void {
+    return () => {};
+  }
 }
 
 // assignSplit is gone (v0.23): split membership is materialized on Thread

@@ -375,3 +375,12 @@ export interface SyncProgress {
   total: number;
   done: boolean;
 }
+
+/** One-time per-account storage split (desktop). A payload with
+ *  table === "done" means the split finished and the strip hides. */
+export interface MigrationProgress {
+  email: string;
+  table: string;
+  copied: number;
+  total: number;
+}
