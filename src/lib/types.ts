@@ -414,6 +414,20 @@ export interface SyncActivity {
   total: number;
 }
 
+/** What "Erase all local data" actually removed. Mirrors `purge::PurgeReport`
+ *  in Rust. The lists are shown verbatim so the receipt is the truth about this
+ *  machine, not a reassuring summary — `credentials` in particular is the only
+ *  proof a user gets that the OS keychain entries are really gone. */
+export interface PurgeReport {
+  /** `"<service>/<entry>"`, e.g. `"SnailMail/gmail:refresh_token:me@x.com"`. */
+  credentials: string[];
+  paths: string[];
+  /** Refresh tokens Google accepted a revocation for. */
+  revoked: number;
+  errors: string[];
+  dryRun: boolean;
+}
+
 /** One-time per-account storage split (desktop). A payload with
  *  table === "done" means the split finished and the strip hides. */
 export interface MigrationProgress {

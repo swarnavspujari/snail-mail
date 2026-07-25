@@ -3,10 +3,11 @@ import { Button } from "@/components/Button";
 import { Pill } from "@/components/Pill";
 import { RowGroup, SettingRow, WideRow } from "@/components/SettingRow";
 import { backend, isTauri } from "@/lib/ipc";
+import { clearMailCaches, useMail } from "@/stores/mail";
 import { useSettings } from "@/stores/settings";
 import { useUi } from "@/stores/ui";
 import { useReceipt } from "../receipt";
-import type { AiProviderId } from "@/lib/types";
+import type { AiProviderId, PurgeReport } from "@/lib/types";
 
 const inputCls =
   "w-full rounded-md border border-line-strong bg-raised px-3 py-2 text-[13px] text-ink outline-none placeholder:text-ink-3 focus:border-accent";
@@ -244,7 +245,7 @@ function MachineSection() {
     <RowGroup title="On this machine">
       <SettingRow
         label="Local mail cache"
-        help={`%APPDATA%\\snail-mail · one SQLite database per account · ${accounts.length} ${
+        help={`%APPDATA%\\com.snail.mail · one SQLite database per account · ${accounts.length} ${
           accounts.length === 1 ? "account" : "accounts"
         }`}
         tag={<Pill tone="neutral">read-only</Pill>}
@@ -297,7 +298,151 @@ function MachineSection() {
           Copy
         </Button>
       </SettingRow>
+      <EraseAllRow />
     </RowGroup>
+  );
+}
+
+/** The nuclear option, and the only thing in the app that can empty the OS
+ *  keychain.
+ *
+ *  Uninstalling does NOT remove your Google refresh token, OAuth client secret
+ *  or AI keys — Windows Credential Manager is out of an NSIS uninstaller's
+ *  reach, so those entries have always survived "full uninstall". The
+ *  uninstaller now shells out to the app for exactly this routine, and this row
+ *  exposes the same thing to someone who just wants the machine clean.
+ *
+ *  Three steps to fire it (arm → type ERASE → confirm), because it is
+ *  irreversible and there is no undo receipt for a deleted credential. The
+ *  result is shown as a literal list of what went, not a "done!" — for a
+ *  security action the receipt IS the feature. */
+function EraseAllRow() {
+  const [armed, setArmed] = useState(false);
+  const [typed, setTyped] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [report, setReport] = useState<PurgeReport | null>(null);
+
+  const reset = () => {
+    setArmed(false);
+    setTyped("");
+  };
+
+  const erase = () => {
+    setBusy(true);
+    setReport(null);
+    void backend
+      .eraseAllLocalData()
+      .then(async (r) => {
+        setReport(r);
+        reset();
+        clearMailCaches();
+        await useSettings.getState().refreshAccounts();
+        await useMail.getState().refresh();
+        useReceipt.getState().note("All local data erased");
+      })
+      .catch((e) => useUi.getState().showToast(String(e)))
+      .finally(() => setBusy(false));
+  };
+
+  return (
+    <>
+      <SettingRow
+        label="Erase all local data"
+        tone="danger"
+        help="Deletes every account's local mail, the search model, cached attachments — and every saved credential in the Windows Credential Manager, which uninstalling leaves behind. Your mail stays in Gmail."
+      >
+        <Button variant="danger" size="sm" disabled={busy} onClick={() => (armed ? reset() : setArmed(true))}>
+          {armed ? "Cancel" : "Erase everything"}
+        </Button>
+      </SettingRow>
+
+      {armed && (
+        <WideRow>
+          <div className="space-y-2.5 rounded-md border border-warn/40 bg-warn/10 px-3 py-2.5">
+            <p className="text-[12px] leading-relaxed text-ink-2">
+              This revokes every Google grant, deletes the saved tokens and API keys
+              from the Windows Credential Manager, and removes all locally synced
+              mail. It cannot be undone, and the app will be back at the connect
+              screen. Type <span className="font-semibold text-ink">ERASE</span> to
+              confirm.
+            </p>
+            <div className="flex items-center gap-2">
+              <input
+                className={inputCls}
+                autoFocus
+                placeholder="ERASE"
+                value={typed}
+                onKeyDown={(e) => {
+                  e.stopPropagation();
+                  if (e.key === "Enter" && typed === "ERASE") erase();
+                  if (e.key === "Escape") reset();
+                }}
+                onChange={(e) => setTyped(e.target.value)}
+              />
+              {/* Not isTauri-gated: unlike OAuth, this has a real browser
+                  meaning (drop the demo's localStorage), and gating it would
+                  leave the confirm flow and the receipt untestable in the demo. */}
+              <Button
+                variant="danger"
+                size="sm"
+                disabled={busy || typed !== "ERASE"}
+                onClick={erase}
+              >
+                {busy ? "Erasing…" : "Erase everything"}
+              </Button>
+            </div>
+            {!isTauri && (
+              <p className="text-[12px] text-warn">
+                In the browser demo this only clears this site's local storage —
+                there is no keychain and no mail database to erase.
+              </p>
+            )}
+          </div>
+        </WideRow>
+      )}
+
+      {report && (
+        <WideRow>
+          <div className="rounded-md border border-line bg-raised px-3 py-2.5">
+            <div className="mb-1.5 flex items-baseline gap-2">
+              <span className="text-[12.5px] font-semibold text-ink">
+                Erased {report.credentials.length + report.paths.length} item
+                {report.credentials.length + report.paths.length === 1 ? "" : "s"}
+              </span>
+              {report.revoked > 0 && (
+                <span className="text-[11.5px] text-ink-3">
+                  · {report.revoked} Google grant
+                  {report.revoked === 1 ? "" : "s"} revoked
+                </span>
+              )}
+            </div>
+            <ul className="max-h-56 overflow-y-auto font-mono text-[11px] leading-[1.7] text-ink-2">
+              {report.credentials.map((c) => (
+                <li key={`c-${c}`} className="truncate" title={c}>
+                  <span className="text-ok">keychain</span> {c}
+                </li>
+              ))}
+              {report.paths.map((p) => (
+                <li key={`p-${p}`} className="truncate" title={p}>
+                  <span className="text-ink-3">file</span> {p}
+                </li>
+              ))}
+              {report.errors.map((e) => (
+                <li key={`e-${e}`} className="text-warn" title={e}>
+                  could not remove: {e}
+                </li>
+              ))}
+            </ul>
+            {report.errors.length > 0 && (
+              <p className="mt-1.5 text-[11.5px] text-ink-3">
+                Anything left above was locked by another process; it is removed on
+                the next launch.
+              </p>
+            )}
+          </div>
+        </WideRow>
+      )}
+    </>
   );
 }
 

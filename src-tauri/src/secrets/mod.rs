@@ -18,6 +18,26 @@ pub const UNSPLASH_ACCESS_KEY: &str = "unsplash:access_key";
 /// v0.1 single-account name; kept as a read fallback.
 pub const GMAIL_REFRESH_TOKEN_LEGACY: &str = "gmail:refresh_token";
 
+/// Every entry name that is NOT derived from an account address. `purge` walks
+/// this list, so a new secret is only ever one edit away from being erasable —
+/// and forgetting to add one here is the difference between "uninstalled" and
+/// "your API key is still in Credential Manager".
+pub const ALL_FIXED_ENTRIES: [&str; 7] = [
+    AI_CLAUDE,
+    AI_OPENAI,
+    AI_NIM,
+    GMAIL_CLIENT_ID,
+    GMAIL_CLIENT_SECRET,
+    UNSPLASH_ACCESS_KEY,
+    GMAIL_REFRESH_TOKEN_LEGACY,
+];
+
+/// The primary service plus every legacy one, i.e. every place on this machine
+/// a Snail Mail secret can be hiding.
+pub fn all_services() -> Vec<&'static str> {
+    std::iter::once(SERVICE).chain(LEGACY_SERVICES).collect()
+}
+
 pub fn gmail_refresh_entry(email: &str) -> String {
     format!("gmail:refresh_token:{email}")
 }
@@ -47,6 +67,25 @@ pub fn get(name: &str) -> Option<String> {
 
 pub fn delete(name: &str) {
     chain_delete(SERVICE, &LEGACY_SERVICES, name);
+}
+
+/// Delete `name` everywhere and report which services actually held it.
+/// Unlike `delete`, this probes first, so an erase/uninstall can tell the user
+/// what was really in Credential Manager instead of what it tried. `dry_run`
+/// probes only — the answer is identical, nothing is removed.
+pub fn purge_entry(name: &str, dry_run: bool) -> Vec<&'static str> {
+    let mut hit = vec![];
+    for svc in all_services() {
+        let Ok(e) = keyring::Entry::new(svc, name) else { continue };
+        if e.get_password().is_err() {
+            continue;
+        }
+        hit.push(svc);
+        if !dry_run {
+            let _ = e.delete_credential();
+        }
+    }
+    hit
 }
 
 /// Delete `name` from the primary AND every legacy service. Deleting only the

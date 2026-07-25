@@ -24,6 +24,7 @@ import type {
   RsvpResponse,
   SendUpdates,
   ProfileInfo,
+  PurgeReport,
   KnowledgeBase,
   Message,
   OutgoingMail,
@@ -76,6 +77,11 @@ export interface Backend {
   /** Blank strings reuse the OAuth client already in the keychain. */
   startOauth(clientId: string, clientSecret: string): Promise<AccountsState>;
   disconnect(email: string): Promise<AccountsState>;
+  /** Erase everything this app keeps on this machine — mail, models, caches,
+   *  and every OS-keychain entry across the current and both legacy service
+   *  names — and come back up with no accounts. The keychain is the point: an
+   *  NSIS uninstaller cannot reach it, so this is the only in-app route. */
+  eraseAllLocalData(): Promise<PurgeReport>;
   syncNow(): Promise<void>;
   /** Repair: reconcile from scratch to re-parse frozen/empty message bodies. */
   resyncAccount(): Promise<void>;
@@ -291,6 +297,9 @@ class TauriBackend implements Backend {
   }
   disconnect(email: string) {
     return invoke<AccountsState>("disconnect_account", { email });
+  }
+  eraseAllLocalData() {
+    return invoke<PurgeReport>("erase_all_local_data");
   }
   syncNow() {
     return invoke<void>("sync_now");

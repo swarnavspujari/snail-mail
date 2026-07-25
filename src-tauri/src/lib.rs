@@ -1,10 +1,12 @@
 //! Snail Mail core: IPC surface, app state, and the background loop.
 //! Every command validates its inputs; every secret stays in the keychain.
 mod ai;
+mod attach_cache;
 pub mod badge;
 mod embed;
 mod harper;
 mod mail;
+pub mod purge;
 mod search;
 mod secrets;
 mod splits;
@@ -466,10 +468,9 @@ async fn finish_removal(app: AppHandle, email: String) {
     }
     // 2. Drop the live session so no sync beat re-touches the account.
     state.gmail.lock().await.remove(&email);
-    // 3. Collect this account's attachment-cache filenames BEFORE the db
-    //    goes away (the shared cache dir is swept below; names another
-    //    account still references are kept).
-    let cache_names = attachment_cache_names(&state, &email);
+    // 3. Collect this account's attachment ids BEFORE the db goes away — the
+    //    cache dir is shared and is swept below.
+    let cache_ids = attachment_cache_ids(&state, &email);
     // 4. Drop the account from the registry + prune its signature; the demo
     //    pair comes back when the last real account leaves. From here on no
     //    command can resolve a connection to it.
@@ -508,10 +509,7 @@ async fn finish_removal(app: AppHandle, email: String) {
     //    could strip the one credential a legacy-provisioned account still
     //    boots from.
     if let Ok(dir) = app.path().app_cache_dir() {
-        let dir = dir.join("attachments");
-        for name in cache_names {
-            let _ = std::fs::remove_file(dir.join(name));
-        }
+        attach_cache::forget(&attach_cache::root(&dir), &cache_ids);
     }
     secrets::delete(&secrets::gmail_refresh_entry(&email));
     if accounts.accounts.iter().all(|a| a.provider != "gmail") {
@@ -534,49 +532,111 @@ async fn finish_removal(app: AppHandle, email: String) {
     emit_mail_updated(&app);
 }
 
-/// The removed account's attachment-cache filenames, minus any name another
-/// account's attachments still map to (the cache dir is shared and names
-/// collide by design).
-fn attachment_cache_names(state: &AppState, email: &str) -> Vec<String> {
-    let names_for = |target: &str| -> Vec<String> {
-        let Ok(db) = state.dbs.account(target) else { return vec![] };
-        let conn = db.lock().unwrap();
-        conn.prepare(
-            "SELECT DISTINCT a.filename FROM attachments a
-             JOIN messages m ON m.id = a.message_id
-             JOIN threads t ON t.id = m.thread_id
-             WHERE t.account_id = ?1",
-        )
-        .and_then(|mut st| {
-            st.query_map([target], |r| r.get::<_, String>(0))
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        })
-        .unwrap_or_default()
-    };
-    let mine: Vec<String> = names_for(email).iter().map(|f| safe_attachment_name(f)).collect();
-    let mut kept = std::collections::HashSet::new();
-    for other in state.dbs.registered_emails() {
-        if other == email {
-            continue;
-        }
-        for f in names_for(&other) {
-            kept.insert(safe_attachment_name(&f));
-        }
-    }
-    mine.into_iter().filter(|n| !kept.contains(n)).collect()
+/// The removed account's cached attachment ids. No cross-account filtering is
+/// needed any more: the cache is keyed by attachment id, so an entry belongs to
+/// exactly one account and deleting it cannot orphan another's file.
+fn attachment_cache_ids(state: &AppState, email: &str) -> Vec<String> {
+    let Ok(db) = state.dbs.account(email) else { return vec![] };
+    let conn = db.lock().unwrap();
+    conn.prepare(
+        "SELECT DISTINCT a.id FROM attachments a
+         JOIN messages m ON m.id = a.message_id
+         JOIN threads t ON t.id = m.thread_id
+         WHERE t.account_id = ?1",
+    )
+    .and_then(|mut st| {
+        st.query_map([email], |r| r.get::<_, String>(0))
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+    })
+    .unwrap_or_default()
 }
 
-/// Same sanitization open_attachment applies when writing the cache file.
-fn safe_attachment_name(filename: &str) -> String {
-    let safe: String = filename
-        .chars()
-        .map(|c| if c.is_alphanumeric() || ".-_ ".contains(c) { c } else { '_' })
-        .collect();
-    if safe.trim().is_empty() {
-        "attachment".into()
-    } else {
-        safe
+/// Erase every trace of this app from this machine that the app itself can
+/// reach, and come back up in the zero-account state — no restart.
+///
+/// This exists because **an NSIS uninstaller cannot touch Windows Credential
+/// Manager**. Uninstalling Snail Mail has always left live Google refresh
+/// tokens and AI API keys behind, checkbox or not. The uninstaller now borrows
+/// this same routine headlessly (`--purge-data`), but a user who simply wants
+/// to hand the laptop back should not have to uninstall to get there.
+///
+/// Order matters: credentials first (they are derived from account rows that
+/// step 3 deletes), then databases, then caches. `global.db` is emptied rather
+/// than unlinked — its connection is open and Windows will not unlink a mapped
+/// file — which lands in exactly the state a fresh install boots into.
+#[tauri::command]
+async fn erase_all_local_data(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<purge::PurgeReport, String> {
+    if state.migrating.load(Ordering::SeqCst) {
+        return Err(
+            "Mail is still being reorganized on disk. Try again once that finishes — erasing \
+             mid-migration would leave half-written files behind."
+                .into(),
+        );
     }
+    let mut report = purge::PurgeReport::default();
+
+    // 1. Every address this machine has ever held a token for — the live
+    //    registry plus anything still recorded in the db files, so an account
+    //    dropped by a half-finished removal does not keep its token.
+    let mut emails = state.dbs.registered_emails();
+    for e in purge::known_emails(&[state.data_dir.clone()]) {
+        if !emails.contains(&e) {
+            emails.push(e);
+        }
+    }
+
+    // 2. Revoke server-side, then delete every entry from SnailMail AND both
+    //    legacy services. Capped hard — a dead network must not hang the UI.
+    report.revoked =
+        purge::revoke_tokens(&state.http, &emails, std::time::Duration::from_secs(15)).await;
+    purge::purge_credentials(&purge::credential_names(&emails), false, &mut report);
+
+    // 3. Drop live sessions so no in-flight beat rewrites a file we deleted.
+    state.gmail.lock().await.clear();
+
+    // 4. Per-account db files, then the legacy single-file db, then the rest of
+    //    the app-data tree. close_and_delete already retries a briefly-locked
+    //    file; anything it still cannot take is reported, not fatal — the boot
+    //    orphan sweep finishes the job on the next launch.
+    for email in &emails {
+        if let Err(e) = state.dbs.close_and_delete(email) {
+            report.errors.push(e);
+        } else {
+            report.paths.push(state.dbs.account_db_path(email).display().to_string());
+        }
+    }
+    state.dbs.drop_legacy();
+    for p in purge::data_targets(&state.data_dir, false) {
+        purge::remove(&p, false, &mut report);
+    }
+    if let Ok(cache) = app.path().app_cache_dir() {
+        // The WebView2 profile is left alone: it is in use by the window this
+        // very command is answering, and it holds no mail.
+        for p in purge::cache_targets(&cache, false) {
+            purge::remove(&p, false, &mut report);
+        }
+    }
+
+    // 5. Empty global.db in place — settings, accounts, streaks, knowledge
+    //    base. What remains is byte-for-byte the shape of a fresh install.
+    {
+        let gdb = state.global();
+        let conn = gdb.lock().unwrap();
+        conn.execute("DELETE FROM kv", []).map_err(|e| e.to_string())?;
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;");
+        report.paths.push(format!("{} (emptied)", state.data_dir.join("global.db").display()));
+    }
+
+    let accounts = { store::get_accounts(&state.global().lock().unwrap()) };
+    let _ = app.emit("accounts:updated", &accounts);
+    emit_mail_updated(&app);
+    for line in report.lines() {
+        eprintln!("[erase] {line}");
+    }
+    Ok(report)
 }
 
 /// Boot-time self-heal: delete any account db file no registered account
@@ -2564,14 +2624,10 @@ async fn open_attachment(
 ) -> Result<(), String> {
     valid_id(&attachment_id)?;
     let (row, bytes) = attachment_bytes(&state, &attachment_id).await?;
-    let dir = app
-        .path()
-        .app_cache_dir()
-        .map_err(|e| e.to_string())?
-        .join("attachments");
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let path = dir.join(safe_attachment_name(&row.filename));
-    std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
+    // Keyed by attachment id, not by filename: two senders' invoice.pdf used
+    // to be one cache file, so opening one showed you the other's.
+    let root = attach_cache::root(&app.path().app_cache_dir().map_err(|e| e.to_string())?);
+    let path = attach_cache::put(&root, &attachment_id, &row.filename, &bytes)?;
     tauri_plugin_opener::open_path(&path, None::<String>)
         .map_err(|_| "could not open the attachment".to_string())
 }
@@ -4037,6 +4093,13 @@ async fn list_celebration_images(app: AppHandle, state: State<'_, AppState>) -> 
 // ---------------------------------------------------------------- bootstrap
 
 pub fn run() {
+    // `--purge-data` is handled before anything else exists: no window, no
+    // webview, no database connection. The uninstaller's PREUNINSTALL hook
+    // runs the installed binary this way to reach Windows Credential Manager,
+    // which NSIS cannot. See src-tauri/src/purge.rs.
+    if purge::maybe_run_cli() {
+        return;
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -4209,6 +4272,29 @@ pub fn run() {
             // sync lands — the taskbar shouldn't sit empty through boot when
             // the mailbox is right there.
             badge::refresh(app.handle());
+
+            // Attachment cache housekeeping. Decrypted attachment bytes used to
+            // accumulate forever; this ages them out and caps the total. Off
+            // the setup thread — it walks a directory, and boot should not wait
+            // on the disk for something nobody is looking at.
+            if let Ok(cache) = app.path().app_cache_dir() {
+                std::thread::spawn(move || {
+                    let out = attach_cache::prune(
+                        &attach_cache::root(&cache),
+                        attach_cache::MAX_AGE,
+                        attach_cache::MAX_BYTES,
+                    );
+                    if out.entries > 0 {
+                        eprintln!(
+                            "[attach-cache] pruned {} entr{} ({} KB), {} KB left",
+                            out.entries,
+                            if out.entries == 1 { "y" } else { "ies" },
+                            out.bytes / 1024,
+                            out.remaining / 1024
+                        );
+                    }
+                });
+            }
 
             // Dev-only: SNAIL_AI_SMOKE=1 (legacy FISSION_AI_SMOKE) streams one
             // real draft at startup and logs the result — end-to-end proof of
@@ -4618,6 +4704,7 @@ pub fn run() {
             has_gmail_client,
             start_oauth,
             disconnect_account,
+            erase_all_local_data,
             sync_now,
             resync_account,
             get_sync_activity,

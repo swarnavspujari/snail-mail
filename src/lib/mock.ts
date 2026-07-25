@@ -28,6 +28,7 @@ import type {
   Message,
   OutgoingMail,
   ProfileInfo,
+  PurgeReport,
   SearchResult,
   SendAsAlias,
   Settings,
@@ -530,6 +531,35 @@ export class MockBackend implements Backend {
     }, 400);
     this.emitAccounts();
     return snapshot;
+  }
+  /** The browser demo has no OS keychain and no SQLite files, so the honest
+   *  analogue is "drop everything localStorage is holding". The report names
+   *  the browser's own storage rather than inventing plausible-looking
+   *  Credential Manager entries — a fake receipt for a security action is
+   *  worse than no receipt. */
+  async eraseAllLocalData(): Promise<PurgeReport> {
+    // Reset in-memory state FIRST: `persist()` is called from a dozen places
+    // and the next one would write the old mailbox straight back into the key
+    // we just deleted, turning the receipt into a lie.
+    this.threads = [];
+    this.state.accountOrder = [];
+    this.state.threadPatches = {};
+    this.state.outbox = [];
+    this.state.drafts = [];
+    this.removingAccounts.clear();
+
+    const paths: string[] = [];
+    // LS_KEY by name, plus anything left under a brand prefix by an older
+    // build — the browser analogue of the legacy-identifier sweep.
+    for (const key of Object.keys(localStorage)) {
+      if (key === LS_KEY || /^(snail|fission|zenbox)/.test(key)) {
+        localStorage.removeItem(key);
+        paths.push(`localStorage["${key}"]`);
+      }
+    }
+    this.emitAccounts();
+    this.notify();
+    return { credentials: [], paths, revoked: 0, errors: [], dryRun: false };
   }
   /** Honest about what it does: wakes snoozes AND runs a real per-item
    *  download pass, so "Sync now" in the demo exercises the same event stream
