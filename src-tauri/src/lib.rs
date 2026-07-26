@@ -149,20 +149,45 @@ fn emit_mail_updated(app: &AppHandle) {
 // always win over these.
 // Prefer the SNAIL_* build-time env; fall back to the legacy FISSION_* then
 // ZENBOX_* so the existing CI repo secrets keep working through the renames.
-const BAKED_GMAIL_CLIENT_ID: Option<&str> = match option_env!("SNAIL_GMAIL_CLIENT_ID") {
+// A *set but empty* build env is the dangerous case, and it is the normal one:
+// GitHub Actions renders `${{ secrets.MISSING }}` as an empty string rather
+// than leaving the variable unset, so `option_env!` yields Some("") on every
+// build whose OAuth secrets were never configured. Some("") then defeats every
+// `.or_else()` fallback and every `.is_some()` check, and an empty client_id
+// reaches Google as `client_id=` — which answers
+// "Error 400: invalid_request — Missing required parameter: client_id".
+// Blank is absence. Normalize once, here, so no caller has to remember.
+pub(crate) const fn present(v: Option<&str>) -> Option<&str> {
+    match v {
+        // const fn cannot call str::trim; a credential is never whitespace, so
+        // testing for empty is the check that matters.
+        Some(s) if !s.is_empty() => Some(s),
+        _ => None,
+    }
+}
+
+const BAKED_GMAIL_CLIENT_ID: Option<&str> = match present(option_env!("SNAIL_GMAIL_CLIENT_ID")) {
     Some(v) => Some(v),
-    None => match option_env!("FISSION_GMAIL_CLIENT_ID") {
+    None => match present(option_env!("FISSION_GMAIL_CLIENT_ID")) {
         Some(v) => Some(v),
-        None => option_env!("ZENBOX_GMAIL_CLIENT_ID"),
+        None => present(option_env!("ZENBOX_GMAIL_CLIENT_ID")),
     },
 };
-const BAKED_GMAIL_CLIENT_SECRET: Option<&str> = match option_env!("SNAIL_GMAIL_CLIENT_SECRET") {
-    Some(v) => Some(v),
-    None => match option_env!("FISSION_GMAIL_CLIENT_SECRET") {
+const BAKED_GMAIL_CLIENT_SECRET: Option<&str> =
+    match present(option_env!("SNAIL_GMAIL_CLIENT_SECRET")) {
         Some(v) => Some(v),
-        None => option_env!("ZENBOX_GMAIL_CLIENT_SECRET"),
-    },
-};
+        None => match present(option_env!("FISSION_GMAIL_CLIENT_SECRET")) {
+            Some(v) => Some(v),
+            None => present(option_env!("ZENBOX_GMAIL_CLIENT_SECRET")),
+        },
+    };
+
+/// A stored credential that is present but blank is not a credential. The
+/// keychain can hold one: `start_oauth` used to persist whatever it resolved,
+/// so a single run with an empty baked client wrote "" over a working entry.
+fn stored_secret(name: &str) -> Option<String> {
+    secrets::get(name).map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+}
 
 const BUNDLED_CELEBRATIONS: [&str; 4] = [
     "/inbox-zero/dawn-ridge.svg",
@@ -236,8 +261,8 @@ async fn reorder_accounts(state: State<'_, AppState>, emails: Vec<String>) -> Re
 
 #[tauri::command]
 fn has_gmail_client() -> bool {
-    (secrets::get(secrets::GMAIL_CLIENT_ID).is_some()
-        && secrets::get(secrets::GMAIL_CLIENT_SECRET).is_some())
+    (stored_secret(secrets::GMAIL_CLIENT_ID).is_some()
+        && stored_secret(secrets::GMAIL_CLIENT_SECRET).is_some())
         || (BAKED_GMAIL_CLIENT_ID.is_some() && BAKED_GMAIL_CLIENT_SECRET.is_some())
 }
 
@@ -249,20 +274,27 @@ async fn start_oauth(
     client_secret: String,
 ) -> Result<AccountsState, String> {
     // blank args = keychain client, else the build's baked-in beta client
-    let client_id = if client_id.trim().is_empty() {
-        secrets::get(secrets::GMAIL_CLIENT_ID)
+    const NO_CLIENT: &str =
+        "no Google OAuth client is configured — open Settings → Accounts and paste a client ID and secret (docs/SETUP.md walks through creating one)";
+    let client_id = match client_id.trim() {
+        "" => stored_secret(secrets::GMAIL_CLIENT_ID)
             .or_else(|| BAKED_GMAIL_CLIENT_ID.map(str::to_string))
-            .ok_or("no OAuth client available — paste the client ID and secret")?
-    } else {
-        client_id.trim().to_string()
+            .ok_or(NO_CLIENT)?,
+        v => v.to_string(),
     };
-    let client_secret = if client_secret.trim().is_empty() {
-        secrets::get(secrets::GMAIL_CLIENT_SECRET)
+    let client_secret = match client_secret.trim() {
+        "" => stored_secret(secrets::GMAIL_CLIENT_SECRET)
             .or_else(|| BAKED_GMAIL_CLIENT_SECRET.map(str::to_string))
-            .ok_or("no OAuth client available — paste the client ID and secret")?
-    } else {
-        client_secret.trim().to_string()
+            .ok_or(NO_CLIENT)?,
+        v => v.to_string(),
     };
+    // Belt and braces: never hand Google a blank client_id. Without this the
+    // request becomes `client_id=` and Google answers with a 400 whose text
+    // ("Missing required parameter: client_id") points at itself rather than at
+    // the app that sent it — which is how this shipped unnoticed.
+    if client_id.is_empty() || client_secret.is_empty() {
+        return Err(NO_CLIENT.into());
+    }
     secrets::set(secrets::GMAIL_CLIENT_ID, &client_id)?;
     secrets::set(secrets::GMAIL_CLIENT_SECRET, &client_secret)?;
 
@@ -5087,6 +5119,43 @@ fn migrate_legacy_db(data_dir: &std::path::Path) {
             }
         }
         return;
+    }
+}
+
+/// The v0.24.0 auth outage: every account showed "sign-in expired" and
+/// Reconnect died on Google's own error page with
+/// "Error 400: invalid_request — Missing required parameter: client_id".
+///
+/// Nothing was wrong with the tokens. The repo's OAuth secrets did not exist,
+/// and GitHub Actions renders `${{ secrets.MISSING }}` as an EMPTY STRING
+/// rather than leaving the variable unset — so `option_env!` returned Some("")
+/// and the baked client id was present-but-blank. `Some("")` satisfies
+/// `.is_some()` (so the UI believed a client was configured and never asked for
+/// one) and defeats `.or_else()` (so no fallback ran), and the blank id went
+/// out as `client_id=`.
+#[cfg(test)]
+mod baked_credential_tests {
+    use super::present;
+
+    #[test]
+    fn a_set_but_empty_build_env_is_absence() {
+        // the exact shape CI produces for a secret that was never created
+        assert_eq!(present(Some("")), None, "empty must not read as configured");
+        assert_eq!(present(None), None);
+        assert_eq!(present(Some("123-abc.apps.googleusercontent.com")),
+                   Some("123-abc.apps.googleusercontent.com"));
+    }
+
+    /// The two properties that actually broke, stated directly: a blank must
+    /// not satisfy is_some(), and must not swallow the next fallback.
+    #[test]
+    fn blank_neither_claims_configured_nor_shadows_the_fallback() {
+        let baked = present(Some("")); // build with no secrets configured
+        assert!(!baked.is_some(), "has_oauth_client would have returned true");
+
+        let keychain: Option<String> = None;
+        let resolved = keychain.or_else(|| baked.map(str::to_string));
+        assert_eq!(resolved, None, "must surface 'no client', not send client_id=");
     }
 }
 

@@ -16,10 +16,14 @@ use serde_json::Value;
 
 // SNAIL_* preferred; the legacy FISSION_* name keeps the existing CI repo
 // secret working through the rename.
-pub const BAKED_ACCESS_KEY: Option<&str> = match option_env!("SNAIL_UNSPLASH_ACCESS_KEY") {
-    Some(v) => Some(v),
-    None => option_env!("FISSION_UNSPLASH_ACCESS_KEY"),
-};
+// `present` collapses a set-but-empty build env to None — CI renders a missing
+// `${{ secrets.X }}` as "", and Some("") would defeat the keychain fallback
+// below and send Unsplash an empty key (a 401, and no daily photo, silently).
+pub const BAKED_ACCESS_KEY: Option<&str> =
+    match crate::present(option_env!("SNAIL_UNSPLASH_ACCESS_KEY")) {
+        Some(v) => Some(v),
+        None => crate::present(option_env!("FISSION_UNSPLASH_ACCESS_KEY")),
+    };
 
 pub const KV_PHOTO: &str = "unsplash:daily";
 const KV_HOURLY: &str = "unsplash:hourly";

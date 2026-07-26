@@ -69,9 +69,11 @@ what `app:dev` / `app:build` run — alias it out of the bundle entirely.
 
 ## Connect Gmail
 
-**Installer builds:** just click **Connect Gmail** in the welcome flow — a shared beta OAuth client is built in. Google shows an "unverified app" notice once; click *Advanced → Go to fission-mail* ([why](docs/GOOGLE_OAUTH.md)).
+**You need your own Google OAuth client** (Desktop app type, ~5 minutes) — follow [docs/SETUP.md](docs/SETUP.md), then paste the Client ID + Secret into **Settings → Accounts**. Tokens and the client go straight into the OS keychain, never to disk.
 
-**Building from source:** bring your own Google OAuth client (Desktop app type, ~5 minutes) — follow [docs/SETUP.md](docs/SETUP.md), then paste the Client ID + Secret into **Settings → Account**. Tokens go straight into the OS keychain either way.
+Release builds *can* carry a shared beta client baked in at build time, but only when the `SNAIL_GMAIL_CLIENT_ID` / `SNAIL_GMAIL_CLIENT_SECRET` repo secrets are configured. They currently are not, so published installers ship without one and every install needs its own client.
+
+> **Publish your OAuth consent screen to production (unverified).** While it sits in *Testing*, Google expires every refresh token after **7 days** — so all your accounts drop out weekly with "sign-in expired". One click, no verification submission required; see [docs/GOOGLE_OAUTH.md](docs/GOOGLE_OAUTH.md).
 
 ## Add AI keys
 

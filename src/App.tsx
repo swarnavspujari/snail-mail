@@ -130,8 +130,10 @@ export default function App() {
   const activeConnected =
     accounts.accounts.find((a) => a.email === accounts.active)?.connected ?? true;
   const [reconnecting, setReconnecting] = useState(false);
+  const [reconnectError, setReconnectError] = useState<string | null>(null);
   const reconnectDead = async () => {
     setReconnecting(true);
+    setReconnectError(null);
     try {
       // in-place re-consent: token + scopes refresh, the mailbox is untouched
       await backend.startOauth("", "");
@@ -139,7 +141,9 @@ export default function App() {
       await backend.syncNow();
       await useMail.getState().refresh();
     } catch (e) {
-      useUi.getState().showToast(String(e));
+      // Persist it in the strip below rather than only toasting: this is the
+      // message that explains why every mailbox is frozen.
+      setReconnectError(String(e).replace(/^Error:\s*/, ""));
       await useSettings.getState().refreshAccounts();
     } finally {
       setReconnecting(false);
@@ -442,6 +446,25 @@ export default function App() {
           </button>
         </div>
       ))}
+
+      {/* A failed reconnect used to go out as a 2.6s toast — the one message
+          explaining why every mailbox is frozen, gone before it can be read.
+          It stays until the next attempt, and stays selectable so it can be
+          pasted into a bug report. */}
+      {reconnectError && (
+        <div className="flex shrink-0 items-start gap-3 border-b border-danger/40 bg-danger/10 px-3.5 py-2 text-[12.5px] text-ink-2">
+          <span className="mt-1 h-2 w-2 shrink-0 rounded-full bg-danger" />
+          <span className="min-w-0 flex-1 select-text break-words">
+            Reconnect failed — {reconnectError}
+          </span>
+          <button
+            className="shrink-0 rounded-md px-2 py-0.5 text-[12px] text-ink-3 hover:text-ink-1"
+            onClick={() => setReconnectError(null)}
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
 
       {/* The shortcuts panel docks OUTSIDE <main> so it stays put across
           screens and thread views — the same right-hand slot the calendar
