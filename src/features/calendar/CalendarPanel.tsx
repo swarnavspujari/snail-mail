@@ -81,92 +81,11 @@ function EventBlock({
   );
 }
 
-/** Filled-with-its-hue calendar checkbox (design system calendar panel). */
-function CalCheck({ hue, on }: { hue: string; on: boolean }) {
-  return (
-    <span
-      className="flex h-4 w-4 shrink-0 items-center justify-center rounded text-[11px] leading-none text-on-accent"
-      style={
-        on
-          ? { background: hue }
-          : { border: `1.5px solid color-mix(in oklab, ${hue} 55%, transparent)` }
-      }
-    >
-      {on ? "✓" : ""}
-    </span>
-  );
-}
-
-/** The account's calendars, grouped under its email: each row a color-coded
- *  checkbox that shows/hides that calendar's events live in both views. The
- *  choice persists in settings. */
-function CalendarsList() {
-  const calendars = useCalendar((s) => s.calendars);
-  const hiddenCalendars = useSettings((s) => s.settings.hiddenCalendars);
-  const account = useSettings((s) => s.accounts.active);
-  const [expanded, setExpanded] = useState(true);
-  const hues = useMemo(() => assignCalendarHues(calendars), [calendars]);
-  if (calendars.length === 0) return null;
-  const hidden = new Set(hiddenCalendars);
-
-  const toggle = (id: string) => {
-    const s = useSettings.getState();
-    const cur = s.settings.hiddenCalendars;
-    void s.save({
-      hiddenCalendars: cur.includes(id)
-        ? cur.filter((h) => h !== id)
-        : [...cur, id],
-    });
-  };
-
-  return (
-    <div>
-      <div className="px-1 pb-0.5 text-[11px] font-medium uppercase tracking-wide text-ink-3">
-        Calendars
-      </div>
-      <button
-        className="flex w-full items-center gap-2 rounded-md px-1 py-1 text-left hover:bg-hover"
-        onClick={() => setExpanded((v) => !v)}
-      >
-        <span className="min-w-0 flex-1 truncate text-[12.5px] font-medium text-ink-2">
-          {account}
-        </span>
-        <span
-          className="text-[10px] text-ink-3 transition-transform"
-          style={{ transform: expanded ? "none" : "rotate(-90deg)" }}
-        >
-          ▼
-        </span>
-      </button>
-      {expanded &&
-        calendars.map((c) => {
-          const on = !hidden.has(c.id);
-          return (
-            <button
-              key={c.id}
-              className="flex w-full items-center gap-2.5 rounded-md px-1 py-[5px] text-left hover:bg-hover"
-              onClick={() => toggle(c.id)}
-              title={on ? `Hide ${c.name}` : `Show ${c.name}`}
-            >
-              <CalCheck hue={hueVar(calendarHue(hues, c.id))} on={on} />
-              <span
-                className={`min-w-0 flex-1 truncate text-[12.5px] ${
-                  on ? "text-ink" : "text-ink-3"
-                }`}
-              >
-                {c.name}
-              </span>
-            </button>
-          );
-        })}
-    </div>
-  );
-}
-
 /** Right-hand day calendar, Superhuman-style: toggleable, painted instantly
- *  from the shared day-keyed cache; a background sync keeps it fresh. A
- *  color-coded calendars list sits above the agenda. ←/→ move days while the panel has focus. Click an event for
- *  details/RSVP; click or drag an empty slot to create one. */
+ *  from the shared day-keyed cache; a background sync keeps it fresh. Shows
+ *  the day's events and nothing else. ←/→ move days while the panel has
+ *  focus. Click an event for details/RSVP; click or drag an empty slot to
+ *  create one. */
 export function CalendarPanel() {
   const dayOffset = useCalendar((s) => s.dayOffset);
   const events = useCalendar((s) => s.eventsByDay);
@@ -332,13 +251,12 @@ export function CalendarPanel() {
         </HoverHint>
       </div>
 
-      {/* No mini-month here. This panel answers "what is on today"; a month
-          grid pushed the agenda — the thing being asked for — below the fold,
-          and ←/→ already move days. The full month lives in the Calendar
-          surface, which is one click away in the rail. */}
-      <div className="shrink-0 space-y-2 border-b border-line px-3 pb-2">
-        <CalendarsList />
-      </div>
+      {/* Nothing between the date header and the agenda. This panel answers
+          "what is on today"; the mini-month and the per-calendar checkboxes
+          both pushed the answer below the fold. ←/→ move days, and calendar
+          visibility is a setting you change rarely — both live in the full
+          Calendar surface's own settings — per-calendar visibility lives in
+          Settings -> Mail, which is where it was already editable. */}
 
       {allDay.length > 0 && (
         <div className="space-y-1 px-4 pb-2 pt-2">
