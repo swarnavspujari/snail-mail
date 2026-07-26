@@ -52,6 +52,10 @@ pub enum SyncStage {
     Resync,
     /// "Load older" paging at the bottom of a list.
     LoadOlder,
+    /// "Get me to zero" draining a split. The only stage that isn't
+    /// downloading — it reports local archive progress, because a sweep over a
+    /// large split takes long enough that silence reads as a hang.
+    Sweep,
 }
 
 /// One beat of download activity. `done`/`total` are thread counts within the

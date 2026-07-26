@@ -180,6 +180,27 @@ pub fn open(path: &std::path::Path) -> Result<Connection, String> {
         );",
     )
     .map_err(|e| e.to_string())?;
+    // v0.24: durable queue for the Gmail side of a bulk sweep. "Get me to
+    // zero" archives a whole split now, so the remote half is potentially tens
+    // of thousands of round trips — far more than the spawned in-memory loop
+    // it replaced could finish before the app closed. An un-sent archive is
+    // worse than slow: refetch_thread rebuilds `in_inbox` from Gmail's labels,
+    // so every thread the loop never reached comes BACK at the next reconcile
+    // and the sweep looks like it undid itself. Rows here survive restarts and
+    // drain under the outbox's 5-attempt cap.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS remote_ops (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id TEXT NOT NULL,
+            thread_id TEXT NOT NULL,
+            op TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            claimed INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_remote_ops_due
+            ON remote_ops(account_id, claimed, attempts);",
+    )
+    .map_err(|e| e.to_string())?;
     // v0.9: Gmail label id → display name, refreshed on reconcile so opaque
     // Label_… ids resolve to names on read.
     conn.execute_batch(
@@ -1471,6 +1492,145 @@ pub fn outbox_reset_attempts(conn: &Connection, account_id: &str) {
     );
 }
 
+// ------------------------------------------------------------- remote ops
+//
+// The Gmail half of a bulk sweep, made durable. Single-thread triage still
+// fires its request inline (spawn_remote) — one archive that fails is one
+// thread that comes back, and the owner is looking right at it. A sweep is a
+// different animal: it can owe the server tens of thousands of archives, the
+// app will be closed long before an in-memory loop finishes, and every request
+// that never went out becomes a thread reconcile drags back into the inbox.
+//
+// Shaped deliberately like the outbox — same claim/attempt/park vocabulary —
+// because it has the same job: hold intent that outlives the process.
+
+/// What a queued op does to a thread on Gmail. Stored as text so the queue
+/// stays legible in a sqlite shell when something has gone wrong.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RemoteOp {
+    Archive,
+    Unarchive,
+}
+
+impl RemoteOp {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RemoteOp::Archive => "archive",
+            RemoteOp::Unarchive => "unarchive",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "archive" => Some(RemoteOp::Archive),
+            "unarchive" => Some(RemoteOp::Unarchive),
+            _ => None,
+        }
+    }
+}
+
+/// Demo threads never leave this machine, so they must never enter the queue —
+/// draining one would send Gmail an id it has never heard of, burn 5 attempts,
+/// and park a row forever. lib.rs's `is_mock_id` delegates here so the rule has
+/// exactly one definition.
+pub fn is_demo_thread_id(id: &str) -> bool {
+    id.starts_with("t-") || id.starts_with("t2-")
+}
+
+/// Queue one thread's Gmail-side triage. An *unclaimed* op for the same thread
+/// is replaced rather than stacked: local state is the truth, so a sweep
+/// followed by its undo must leave the server agreeing with the undo instead of
+/// racing it. An op already claimed is in flight and left alone — the
+/// replacement queues behind it and wins by arriving second.
+pub fn remote_op_enqueue(
+    conn: &Connection,
+    account_id: &str,
+    thread_id: &str,
+    op: RemoteOp,
+) -> Result<(), String> {
+    if is_demo_thread_id(thread_id) {
+        return Ok(());
+    }
+    conn.execute(
+        "DELETE FROM remote_ops WHERE thread_id = ?1 AND claimed = 0",
+        params![thread_id],
+    )
+    .map_err(|e| e.to_string())?;
+    conn.execute(
+        "INSERT INTO remote_ops (account_id, thread_id, op) VALUES (?1, ?2, ?3)",
+        params![account_id, thread_id, op.as_str()],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Next batch of queued ops for one account, oldest first. The 5-attempt cap
+/// parks a thread Gmail keeps rejecting instead of retrying it forever.
+pub fn remote_ops_due(
+    conn: &Connection,
+    account_id: &str,
+    limit: usize,
+) -> Vec<(i64, String, RemoteOp)> {
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT id, thread_id, op FROM remote_ops
+         WHERE account_id = ?1 AND claimed = 0 AND attempts < 5
+         ORDER BY id LIMIT ?2",
+    ) else {
+        return vec![];
+    };
+    let rows = stmt.query_map(params![account_id, limit as i64], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+    });
+    match rows {
+        Ok(it) => it
+            .filter_map(|r| r.ok())
+            .filter_map(|(id, tid, op)| RemoteOp::parse(&op).map(|o| (id, tid, o)))
+            .collect(),
+        Err(_) => vec![],
+    }
+}
+
+/// Claim before the network call so two drains can't send the same op.
+pub fn remote_op_claim(conn: &Connection, id: i64) -> bool {
+    conn.execute("UPDATE remote_ops SET claimed = 1 WHERE id = ?1 AND claimed = 0", params![id])
+        .map(|n| n == 1)
+        .unwrap_or(false)
+}
+
+pub fn remote_op_unclaim(conn: &Connection, id: i64) {
+    let _ = conn.execute("UPDATE remote_ops SET claimed = 0 WHERE id = ?1", params![id]);
+}
+
+pub fn remote_op_delete(conn: &Connection, id: i64) {
+    let _ = conn.execute("DELETE FROM remote_ops WHERE id = ?1", params![id]);
+}
+
+pub fn remote_op_bump_attempts(conn: &Connection, id: i64) -> i64 {
+    let _ =
+        conn.execute("UPDATE remote_ops SET attempts = attempts + 1 WHERE id = ?1", params![id]);
+    conn.query_row("SELECT attempts FROM remote_ops WHERE id = ?1", params![id], |r| r.get(0))
+        .unwrap_or(0)
+}
+
+/// A reconnect releases the parking brake, exactly as it does for the outbox.
+pub fn remote_ops_reset_attempts(conn: &Connection, account_id: &str) {
+    let _ = conn.execute(
+        "UPDATE remote_ops SET attempts = 0, claimed = 0 WHERE account_id = ?1",
+        params![account_id],
+    );
+}
+
+/// How much of a sweep Gmail still owes us. Non-zero after a large sweep is
+/// normal — it means the drain is still working through the queue.
+pub fn remote_ops_pending(conn: &Connection, account_id: &str) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM remote_ops WHERE account_id = ?1",
+        params![account_id],
+        |r| r.get(0),
+    )
+    .unwrap_or(0)
+}
+
 /// Trash = remove the thread from the local cache entirely (Gmail keeps it
 /// recoverable server-side for 30 days).
 pub fn delete_thread(conn: &Connection, id: &str) -> Result<(), String> {
@@ -2360,10 +2520,173 @@ pub fn oldest_thread_date(conn: &Connection, view: &str, account_id: &str) -> Op
     .flatten()
 }
 
-/// Threads eligible for "Get Me To Zero"; the split filter runs in the caller
-/// (split semantics live with the settings, not the store).
-pub fn inbox_threads_for_sweep(conn: &Connection, account_id: &str) -> Result<Vec<Thread>, String> {
-    list_threads(conn, "inbox", account_id)
+// ------------------------------------------------------------------ sweep
+//
+// "Get me to zero". Through v0.23 this read `list_threads(inbox)` — the newest
+// 500 rows, a DISPLAY window — and filtered them in Rust, while the split tab
+// beside the button counted the whole mailbox in SQL (`split_counts`). On any
+// split holding more than 500 conversations the two disagreed permanently: one
+// sweep archived 500, the tab still read four figures, and the button looked
+// broken.
+//
+// The predicate below IS split_counts' predicate. The number on the tab and
+// the number the sweep moves are now the same number by construction, not by
+// two implementations agreeing.
+
+/// Which conversations "Get me to zero" claims. Every field is a *restriction*,
+/// so `SweepFilter::default()` selects the entire visible inbox.
+#[derive(Default, Clone, Copy)]
+pub struct SweepFilter<'a> {
+    /// Materialized split membership — the home `split_id` or an alsoShow
+    /// forward in `split_also`. None sweeps across every split.
+    pub split_id: Option<&'a str>,
+    /// Also take rows the classifier has never reached (`split_id IS NULL`).
+    /// Set when `split_id` names the catch-all, because that is where
+    /// threadInSplit files them and therefore where the owner SEES them: sweep
+    /// the catch-all without this and the list still shows the leftovers.
+    pub include_unclassified: bool,
+    /// Only threads last touched at or before this instant ("older than N days").
+    pub before_ms: Option<i64>,
+    pub preserve_unread: bool,
+    pub preserve_starred: bool,
+}
+
+impl SweepFilter<'_> {
+    /// The WHERE body plus its bound values, numbered together so the two can
+    /// never drift apart the way hand-numbered `?N` placeholders do.
+    fn where_sql(&self, account_id: &str) -> (String, Vec<rusqlite::types::Value>) {
+        use rusqlite::types::Value;
+        // Visibility rules copied from split_counts: archived, snoozed and
+        // hidden threads are not in the inbox today, so they are not the
+        // button's business.
+        let mut p: Vec<Value> = vec![Value::Text(account_id.into())];
+        let mut sql = String::from(
+            "account_id = ?1 AND in_inbox = 1 AND snoozed_until IS NULL AND hidden IS NULL",
+        );
+        if let Some(split) = self.split_id {
+            p.push(Value::Text(split.into()));
+            let home = p.len();
+            p.push(Value::Text(split.into()));
+            let also = p.len();
+            // COALESCE mirrors split_counts' `COALESCE(split_id, '')` tally.
+            // Rows the classifier hasn't reached yet are NULL and belong to the
+            // catch-all; a bare `split_id = ?` would skip exactly the threads
+            // the catch-all tab is counting.
+            let unclassified = if self.include_unclassified { " OR split_id IS NULL" } else { "" };
+            sql.push_str(&format!(
+                " AND (COALESCE(split_id, '') = ?{home}
+                       OR EXISTS (SELECT 1 FROM json_each(threads.split_also) WHERE value = ?{also})
+                       {unclassified})"
+            ));
+        }
+        if let Some(ms) = self.before_ms {
+            p.push(Value::Integer(ms));
+            let n = p.len();
+            sql.push_str(&format!(" AND last_date <= ?{n}"));
+        }
+        // The preserve options are part of the predicate, not a post-filter, so
+        // the count below and the pages drained agree about what is exempt.
+        if self.preserve_unread {
+            sql.push_str(" AND unread = 0");
+        }
+        if self.preserve_starred {
+            sql.push_str(" AND starred = 0");
+        }
+        (sql, p)
+    }
+}
+
+/// How many conversations this sweep would archive. Same predicate as the
+/// pager, so it is a promise the sweep can keep rather than an estimate.
+pub fn count_sweep_targets(
+    conn: &Connection,
+    account_id: &str,
+    f: &SweepFilter,
+) -> Result<i64, String> {
+    let (where_sql, p) = f.where_sql(account_id);
+    conn.query_row(
+        &format!("SELECT COUNT(*) FROM threads WHERE {where_sql}"),
+        rusqlite::params_from_iter(p),
+        |r| r.get(0),
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// One chunk of a sweep: take the next page, archive it locally, and queue the
+/// matching Gmail archive — in a single transaction, under the caller's single
+/// lock. Returns the ids moved; empty means the split is drained.
+///
+/// The local write and the queue insert are atomic together on purpose. Split
+/// them and a kill in between strands a thread that is archived here and still
+/// in the inbox on the server, which reconcile then drags back — the sweep
+/// silently undoing part of itself is precisely the bug this function exists
+/// to prevent.
+///
+/// Self-cursoring by construction: archiving sets `in_inbox = 0`, which drops
+/// those rows out of the predicate, so the next call returns the next page.
+/// There is no rowid cursor to skew, and a thread that arrives mid-sweep is
+/// simply picked up by a later page.
+pub fn sweep_once(
+    conn: &Connection,
+    account_id: &str,
+    f: &SweepFilter,
+    limit: usize,
+) -> Result<Vec<String>, String> {
+    let (where_sql, mut p) = f.where_sql(account_id);
+    p.push(rusqlite::types::Value::Integer(limit as i64));
+    let n = p.len();
+    let sql =
+        format!("SELECT id FROM threads WHERE {where_sql} ORDER BY last_date DESC LIMIT ?{n}");
+
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    let ids: Vec<String> = {
+        let mut stmt = tx.prepare(&sql).map_err(|e| e.to_string())?;
+        // The binding is load-bearing: it ends `stmt`'s borrow of `tx` before
+        // the block closes, so `tx.commit()` below can consume the transaction.
+        // Inlining it into the tail expression fails to compile.
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(p), |r| r.get(0))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        rows
+    };
+    for id in &ids {
+        set_in_inbox(&tx, id, false)?;
+        remote_op_enqueue(&tx, account_id, id, RemoteOp::Archive)?;
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(ids)
+}
+
+/// The undo half: put a known set of threads back and queue the Gmail
+/// un-archive. Chunked by the caller the same way the sweep is.
+pub fn unsweep_once(
+    conn: &Connection,
+    account_id: &str,
+    ids: &[String],
+) -> Result<usize, String> {
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    let mut n = 0usize;
+    for id in ids {
+        // Restore only what this account actually holds — an id from another
+        // mailbox (or one deleted since the sweep) must not create a row.
+        let owned: bool = tx
+            .query_row(
+                "SELECT 1 FROM threads WHERE id = ?1 AND account_id = ?2",
+                params![id, account_id],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        if !owned {
+            continue;
+        }
+        set_in_inbox(&tx, id, true)?;
+        remote_op_enqueue(&tx, account_id, id, RemoteOp::Unarchive)?;
+        n += 1;
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(n)
 }
 
 
@@ -2535,6 +2858,219 @@ mod tests {
         let counts = split_counts(&conn, ACCT).unwrap();
         assert_eq!(counts.get("travel"), Some(&1));
         assert_eq!(counts.get("other"), Some(&1));
+    }
+
+    // ------------------------------------------------------------- sweep
+
+    /// The v0.23 "Get me to zero" bug, pinned. `bulk_archive` swept
+    /// `list_threads`' LIMIT 500 DISPLAY window while the tab beside the button
+    /// counted the whole mailbox in SQL, so on a split holding more than 500
+    /// conversations one sweep archived 500 and the tab still read four
+    /// figures — the button looked broken. 600 threads, one drain, tab at zero.
+    #[test]
+    fn sweep_drains_a_split_larger_than_the_display_window() {
+        let conn = open(std::path::Path::new(":memory:")).unwrap();
+        let mut s = default_settings();
+        s.splits.insert(0, travel_split());
+        set_json(&conn, "settings", &s).unwrap();
+
+        const N: usize = 600; // comfortably past the 500-row window
+        for i in 0..N {
+            seed(
+                &conn,
+                &format!("sw{i:04}"),
+                "Flash sale",
+                "40k to Europe",
+                "Thrifty Traveler <deals@thriftytraveler.com>",
+                1_000 + i as i64,
+            );
+        }
+        let travel = || *split_counts(&conn, ACCT).unwrap().get("travel").unwrap_or(&0);
+        assert_eq!(travel(), N as i64, "seeded threads land in the split");
+        // the cage the old sweep was trapped in
+        assert_eq!(list_threads(&conn, "inbox", ACCT).unwrap().len(), 500);
+
+        let f = SweepFilter { split_id: Some("travel"), ..Default::default() };
+        assert_eq!(count_sweep_targets(&conn, ACCT, &f).unwrap(), N as i64);
+
+        // exactly the loop bulk_archive runs, minus the progress emitter
+        let mut swept = vec![];
+        loop {
+            let page = sweep_once(&conn, ACCT, &f, 200).unwrap();
+            if page.is_empty() {
+                break;
+            }
+            swept.extend(page);
+        }
+
+        assert_eq!(swept.len(), N, "the whole split archived, not just the window");
+        assert_eq!(travel(), 0, "the number the owner is staring at reaches zero");
+        assert_eq!(count_sweep_targets(&conn, ACCT, &f).unwrap(), 0);
+        // and Gmail's half is queued, not lost with the process
+        assert_eq!(remote_ops_pending(&conn, ACCT), N as i64);
+    }
+
+    /// The preserve options must mean "exempt from the sweep", not "absent from
+    /// the page we happened to look at" — the distinction the old 500-row
+    /// filter could not make.
+    #[test]
+    fn sweep_preserves_unread_and_starred() {
+        let conn = open(std::path::Path::new(":memory:")).unwrap();
+        let flag = |id: &str, unread: bool, starred: bool| {
+            let t = Thread {
+                id: id.into(),
+                subject: "Subject".into(),
+                snippet: String::new(),
+                participants: vec!["Ann <ann@x.test>".into()],
+                recipients: vec![],
+                message_count: 1,
+                last_date: 5_000,
+                unread,
+                starred,
+                labels: vec![],
+                in_inbox: true,
+                snoozed_until: None,
+                split: String::new(),
+                also_in: vec![],
+            };
+            upsert_thread(&conn, ACCT, &t, &[], &split_config(&conn)).unwrap();
+        };
+        flag("sw-plain", false, false);
+        flag("sw-unread", true, false);
+        flag("sw-starred", false, true);
+        flag("sw-both", true, true);
+
+        let f = SweepFilter { preserve_unread: true, preserve_starred: true, ..Default::default() };
+        assert_eq!(count_sweep_targets(&conn, ACCT, &f).unwrap(), 1);
+        assert_eq!(sweep_once(&conn, ACCT, &f, 100).unwrap(), vec!["sw-plain".to_string()]);
+        assert!(sweep_once(&conn, ACCT, &f, 100).unwrap().is_empty(), "drained");
+        assert_eq!(list_threads(&conn, "inbox", ACCT).unwrap().len(), 3, "exempt rows stay");
+    }
+
+    /// `older_than_days` is a predicate now, not a post-filter over a page.
+    #[test]
+    fn sweep_respects_the_age_cutoff() {
+        let conn = open(std::path::Path::new(":memory:")).unwrap();
+        seed(&conn, "sw-old", "Old", "body", "Ann", 1_000);
+        seed(&conn, "sw-new", "New", "body", "Bob", 9_000);
+
+        let f = SweepFilter { before_ms: Some(5_000), ..Default::default() };
+        assert_eq!(count_sweep_targets(&conn, ACCT, &f).unwrap(), 1);
+        assert_eq!(sweep_once(&conn, ACCT, &f, 100).unwrap(), vec!["sw-old".to_string()]);
+    }
+
+    /// Rows the boot backfill hasn't reached carry `split_id IS NULL`, and
+    /// threadInSplit files them under the catch-all — so that is where the
+    /// owner sees them. A catch-all sweep comparing only `split_id = 'other'`
+    /// would leave exactly those on screen after claiming to empty the tab.
+    #[test]
+    fn sweep_of_the_catch_all_takes_unclassified_rows() {
+        let conn = open(std::path::Path::new(":memory:")).unwrap();
+        seed(&conn, "sw-classified", "Hello", "body", "Bob <bob@plain.io>", 2_000);
+        seed(&conn, "sw-pending", "Hello", "body", "Cal <cal@plain.io>", 1_000);
+        // a pre-v0.23 row the classifier has never touched
+        conn.execute("UPDATE threads SET split_id = NULL WHERE id = 'sw-pending'", []).unwrap();
+
+        // without the fold, the unclassified row survives the sweep
+        let strict = SweepFilter { split_id: Some("other"), ..Default::default() };
+        assert_eq!(count_sweep_targets(&conn, ACCT, &strict).unwrap(), 1);
+
+        let f = SweepFilter {
+            split_id: Some("other"),
+            include_unclassified: true,
+            ..Default::default()
+        };
+        assert_eq!(count_sweep_targets(&conn, ACCT, &f).unwrap(), 2);
+        let swept = sweep_once(&conn, ACCT, &f, 100).unwrap();
+        assert_eq!(swept.len(), 2);
+        assert!(list_threads(&conn, "inbox", ACCT).unwrap().is_empty());
+    }
+
+    /// A sweep of one split must not touch its neighbours, at any size.
+    #[test]
+    fn sweep_leaves_other_splits_alone() {
+        let conn = open(std::path::Path::new(":memory:")).unwrap();
+        let mut s = default_settings();
+        s.splits.insert(0, travel_split());
+        set_json(&conn, "settings", &s).unwrap();
+        seed(&conn, "sw-deal", "Sale", "b", "Thrifty <deals@thriftytraveler.com>", 2_000);
+        seed(&conn, "sw-other", "Hi", "b", "Bob <bob@plain.io>", 1_000);
+
+        let f = SweepFilter { split_id: Some("travel"), ..Default::default() };
+        assert_eq!(sweep_once(&conn, ACCT, &f, 100).unwrap(), vec!["sw-deal".to_string()]);
+        let left = list_threads(&conn, "inbox", ACCT).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].id, "sw-other");
+    }
+
+    /// Undo has to be able to put back what the sweep took — including the
+    /// rows beyond the old 500-row window, which is the whole reason
+    /// bulk_archive hands its ids back now.
+    #[test]
+    fn unsweep_restores_swept_threads_and_queues_the_reversal() {
+        let conn = open(std::path::Path::new(":memory:")).unwrap();
+        seed(&conn, "sw-a", "A", "b", "Ann", 2_000);
+        seed(&conn, "sw-b", "B", "b", "Bob", 1_000);
+
+        let f = SweepFilter::default();
+        let swept = sweep_once(&conn, ACCT, &f, 100).unwrap();
+        assert_eq!(swept.len(), 2);
+        assert!(list_threads(&conn, "inbox", ACCT).unwrap().is_empty());
+
+        assert_eq!(unsweep_once(&conn, ACCT, &swept).unwrap(), 2);
+        assert_eq!(list_threads(&conn, "inbox", ACCT).unwrap().len(), 2);
+        // the archive ops were superseded, not stacked behind the undo
+        let ops = remote_ops_due(&conn, ACCT, 100);
+        assert_eq!(ops.len(), 2);
+        assert!(ops.iter().all(|(_, _, op)| *op == RemoteOp::Unarchive));
+    }
+
+    /// An id from another mailbox must not be resurrected into this one.
+    #[test]
+    fn unsweep_ignores_ids_this_account_does_not_own() {
+        let conn = open(std::path::Path::new(":memory:")).unwrap();
+        seed(&conn, "sw-mine", "A", "b", "Ann", 1_000);
+        let f = SweepFilter::default();
+        sweep_once(&conn, ACCT, &f, 100).unwrap();
+
+        let ids = vec!["sw-mine".to_string(), "sw-someone-elses".to_string()];
+        assert_eq!(unsweep_once(&conn, ACCT, &ids).unwrap(), 1);
+        assert_eq!(list_threads(&conn, "inbox", ACCT).unwrap().len(), 1);
+    }
+
+    /// Demo threads never reach Gmail, so queueing one would hand the API an id
+    /// it has never seen, burn all 5 attempts, and park a row forever.
+    #[test]
+    fn demo_threads_never_enter_the_remote_queue() {
+        let conn = open(std::path::Path::new(":memory:")).unwrap();
+        seed(&conn, "t-demo", "Demo", "b", "Ann", 2_000); // is_demo_thread_id
+        seed(&conn, "sw-real", "Real", "b", "Bob", 1_000);
+
+        let swept = sweep_once(&conn, ACCT, &SweepFilter::default(), 100).unwrap();
+        assert_eq!(swept.len(), 2, "both are archived locally");
+        let ops = remote_ops_due(&conn, ACCT, 100);
+        assert_eq!(ops.len(), 1, "only the real thread is owed to Gmail");
+        assert_eq!(ops[0].1, "sw-real");
+    }
+
+    /// The queue's parking brake, mirroring the outbox: 5 failures park a row,
+    /// a reconnect releases it.
+    #[test]
+    fn remote_ops_park_after_five_attempts_and_reset_on_reconnect() {
+        let conn = open(std::path::Path::new(":memory:")).unwrap();
+        remote_op_enqueue(&conn, ACCT, "sw-x", RemoteOp::Archive).unwrap();
+        let id = remote_ops_due(&conn, ACCT, 10)[0].0;
+
+        assert!(remote_op_claim(&conn, id), "first claim wins");
+        assert!(!remote_op_claim(&conn, id), "a claimed row can't be claimed twice");
+        remote_op_unclaim(&conn, id);
+
+        for _ in 0..5 {
+            remote_op_bump_attempts(&conn, id);
+        }
+        assert!(remote_ops_due(&conn, ACCT, 10).is_empty(), "parked at the cap");
+        remote_ops_reset_attempts(&conn, ACCT);
+        assert_eq!(remote_ops_due(&conn, ACCT, 10).len(), 1, "a reconnect releases it");
     }
 
     #[test]

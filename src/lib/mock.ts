@@ -4,6 +4,7 @@
 import type {
   Backend,
   BulkArchiveOpts,
+  BulkArchiveResult,
   DraftStreamHandlers,
   MailView,
 } from "./ipc";
@@ -988,19 +989,37 @@ export class MockBackend implements Backend {
       .slice(0, CONTACT_HISTORY_LIMIT);
   }
 
-  async bulkArchive(opts: BulkArchiveOpts): Promise<number> {
+  /** Mirrors store::sweep_once + the drain loop in bulk_archive: the whole
+   *  split, not a display window, and the same visibility rules splitCounts
+   *  uses — otherwise the demo reproduces the very bug this replaced, where
+   *  the tab count and the sweep disagreed. */
+  async bulkArchive(opts: BulkArchiveOpts): Promise<BulkArchiveResult> {
     const cutoff = Date.now() - opts.olderThanDays * 24 * 3600_000;
     const splits = this.state.settings.splits;
     const account = this.state.activeAccount;
-    let n = 0;
+    const ids: ThreadId[] = [];
     for (const t of this.threads) {
-      if (!this.inActiveAccount(t)) continue;
+      if (!this.inActiveAccount(t) || this.hiddenOf(t.id) !== null) continue;
       if (!t.inInbox || t.snoozedUntil !== null) continue;
       if (opts.olderThanDays > 0 && t.lastDate > cutoff) continue;
       if (opts.preserveUnread && t.unread) continue;
       if (opts.preserveStarred && t.starred) continue;
       if (opts.splitId && !threadInSplit(t, opts.splitId, splits, account)) continue;
       this.patch(t.id, { inInbox: false });
+      ids.push(t.id);
+    }
+    if (ids.length) this.notify();
+    return { archived: ids.length, ids };
+  }
+
+  async bulkMoveToInbox(ids: ThreadId[]): Promise<number> {
+    let n = 0;
+    for (const id of ids) {
+      // Only restore threads this mailbox actually holds, matching
+      // store::unsweep_once — a stale id must not resurrect anything.
+      const t = this.threads.find((x) => x.id === id);
+      if (!t || !this.inActiveAccount(t)) continue;
+      this.patch(id, { inInbox: true, snoozedUntil: null });
       n++;
     }
     if (n) this.notify();

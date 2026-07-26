@@ -282,9 +282,14 @@ pub fn compile(splits: &[Split], account: &str) -> Vec<SplitSpec> {
 /// it would otherwise have landed — the next matching split, else the
 /// catch-all (with default ordering that is Important-or-Other, Superhuman's
 /// semantics).
+/// The split unmatched threads land in ("other" unless the owner made their
+/// own). Mirrors `catchAllSplitId` in split-query.ts.
+pub fn catch_all_id(specs: &[SplitSpec]) -> String {
+    specs.iter().find(|s| s.catch_all).map(|s| s.id.clone()).unwrap_or_else(|| "other".into())
+}
+
 pub fn classify(specs: &[SplitSpec], f: &Facts) -> (String, Vec<String>) {
-    let catch_all =
-        || specs.iter().find(|s| s.catch_all).map(|s| s.id.clone()).unwrap_or_else(|| "other".into());
+    let catch_all = || catch_all_id(specs);
     for (i, s) in specs.iter().enumerate() {
         let Some(node) = &s.node else { continue };
         if matches(node, f) {

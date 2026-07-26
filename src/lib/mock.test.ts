@@ -140,3 +140,79 @@ describe("MockBackend sync:activity", () => {
     expect(new Set(stages)).toEqual(new Set(["resync"]));
   });
 });
+
+// "Get me to zero". The Rust sweep walks the materialized split; the mock walks
+// the same membership predicate the demo's tabs use. Both must leave the tab
+// count at zero — a sweep that disagrees with the number beside it is the v0.23
+// bug, in whichever backend it happens.
+describe("MockBackend.bulkArchive", () => {
+  beforeEach(() => localStorage.clear());
+
+  test("empties the swept split's tab count and hands back the ids", async () => {
+    const be = new MockBackend();
+    const before = await be.splitCounts();
+    const target = Object.keys(before).find((id) => (before[id] ?? 0) > 0)!;
+
+    const { archived, ids } = await be.bulkArchive({
+      splitId: target,
+      olderThanDays: 0,
+      preserveUnread: false,
+      preserveStarred: false,
+    });
+
+    expect(archived).toBe(before[target]);
+    expect(ids).toHaveLength(archived);
+    const after = await be.splitCounts();
+    expect(after[target] ?? 0).toBe(0);
+  });
+
+  test("preserve options exempt rather than merely skip", async () => {
+    const be = new MockBackend();
+    const inbox = await be.listThreads("inbox");
+    const starred = inbox.filter((t) => t.starred).length;
+    const unread = inbox.filter((t) => t.unread && !t.starred).length;
+
+    const { ids } = await be.bulkArchive({
+      splitId: null,
+      olderThanDays: 0,
+      preserveUnread: true,
+      preserveStarred: true,
+    });
+
+    expect(ids).toHaveLength(inbox.length - starred - unread);
+    const left = await be.listThreads("inbox");
+    expect(left).toHaveLength(starred + unread);
+    expect(left.every((t) => t.unread || t.starred)).toBe(true);
+  });
+
+  test("bulkMoveToInbox restores exactly the swept set", async () => {
+    const be = new MockBackend();
+    const before = await be.listThreads("inbox");
+
+    const { ids } = await be.bulkArchive({
+      splitId: null,
+      olderThanDays: 0,
+      preserveUnread: false,
+      preserveStarred: false,
+    });
+    expect(await be.listThreads("inbox")).toHaveLength(0);
+
+    // the undo path ZeroSweep drives — one call, not one per conversation
+    const restored = await be.bulkMoveToInbox(ids);
+    expect(restored).toBe(ids.length);
+    const after = await be.listThreads("inbox");
+    expect(after.map((t) => t.id).sort()).toEqual(before.map((t) => t.id).sort());
+  });
+
+  test("ignores ids the active mailbox does not hold", async () => {
+    const be = new MockBackend();
+    await be.bulkArchive({
+      splitId: null,
+      olderThanDays: 0,
+      preserveUnread: false,
+      preserveStarred: false,
+    });
+    expect(await be.bulkMoveToInbox(["no-such-thread"])).toBe(0);
+    expect(await be.listThreads("inbox")).toHaveLength(0);
+  });
+});
