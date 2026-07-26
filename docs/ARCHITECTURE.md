@@ -9,13 +9,15 @@ UI (React + TS + Zustand + Tailwind)  ──IPC (Tauri invoke/Channel/events)─
   features/settings   Account / AI keys / KB / splits / shortcuts              ai/context.rs   Context Assembler
   features/zero       Celebration + streaks                                    ai/anthropic.rs Claude adapter (SSE)
   lib/keyboard.ts     Chord-capable key engine                                 ai/openai.rs    OpenAI + NIM adapter
-  lib/commands.ts     Single action registry                                   store/          SQLite + FTS5
+  lib/commands.ts     Single action registry                                   store/          Per-account SQLite + FTS5 + vec
   lib/ipc.ts          Backend seam (Tauri ⇄ browser mock)                      secrets/        OS keychain
 ```
 
 ## Principles
 
-- **The SQLite DB is the UI's single source of truth.** Sync reconciles it with Gmail; mutations apply remotely first (when connected), then locally, so the UI never shows state the server rejected.
+- **The SQLite DB is the UI's single source of truth.** Sync reconciles it with Gmail. Mutations apply **locally first** and push to Gmail in the background, so triage never waits on the network; the local row is the truth the UI renders and the remote call is what eventually agrees with it.
+- **Every account owns its own database file.** `store/registry.rs` maps an account email to its own SQLite file, with app-wide state (settings, the account registry, streaks) in a separate `global.db`. Disconnecting an account is a file delete rather than a multi-gigabyte row purge, and one huge mailbox cannot slow another. Two consequences that are easy to get wrong: classification must read split definitions from `global.db` (never from the account connection it is writing to), and autoincrement row ids in `drafts`/`outbox` are unique only *within* a file — so those rows are addressed by `(id, account_email)`, never by id alone.
+- **Work that outlives the process gets a queue, not a spawned task.** The outbox holds sends; `remote_ops` holds the Gmail side of a bulk sweep. Both survive restart, claim a row before the network call, cap retries, and park (without burning attempts) when a grant is dead. This matters because sync rebuilds `in_inbox` from Gmail's labels: an archive that never reached the server comes *back*, so "fire and forget" silently undoes itself.
 - **Secrets never enter the webview.** AI keys and OAuth tokens live in the Windows Credential Manager; all secret-bearing network calls run in Rust. The one IPC field that touches a key is `set_ai_key` (write-only); reads only expose `hasKey: bool`.
 - **One backend seam.** `src/lib/ipc.ts` defines the `Backend` interface. In Tauri it maps 1:1 to Rust commands; in a plain browser a full mock implements the same surface, so the entire UX is developable and demoable without credentials.
 - **One action registry.** Every user action is a `Command` (`src/lib/commands.ts`). The palette lists them; the keyboard engine binds them from the (remappable) shortcut map. An action can never exist in only one place.

@@ -2,24 +2,27 @@
 
 A **keyboard-first, AI-native desktop email client** in the spirit of Superhuman — built with Tauri v2 (Rust core + system webview), React, and your own AI keys. Local-first: your mail cache, your settings, and your API keys never leave your machine.
 
-> **Status:** v0.9 beta — Windows 11, auto-updating installer on the [Releases page](https://github.com/swarnavspujari/snail-mail/releases/latest). The same codebase targets macOS next, then iOS/Android via Tauri v2 mobile.
+> **Status:** v0.24.0 — Windows 11, auto-updating installer on the [Releases page](https://github.com/swarnavspujari/snail-mail/releases/latest). macOS and Linux compile in CI on every push; neither has a released build yet.
 
 *(screenshots/GIFs coming — run it and hit `Ctrl+K`)*
 
 ## Features
 
-- **Fly through email** — the keymap replicates **Superhuman v7 (Windows/Linux)**: `E` done, `Shift+E` not done, `R`/`A` reply/reply-all, `S` star, `#` trash, `!` spam, `M` mute, `H` remind, `U` read/unread, `Z` **undo anything**, `Ctrl+U` unsubscribe, `J/K` navigate, `G`-chords (incl. `G S` starred), `Tab` next split. A `Ctrl+K` command palette lists everything with its shortcut.
-- **Undo Send & Send Later** — every send has a 10-second `Z` window; `Ctrl+Shift+L` schedules for later. The outbox lives in SQLite, so scheduled mail survives restarts — no server involved.
-- **Multiple accounts, instant switching** — connect several Gmail accounts and jump between inboxes with `Alt+1…9`; slots are reassignable by reordering in Settings. Per-account rich signatures (paste your Gmail one, images included). Outlook (Microsoft Graph) is scaffolded for a later release.
-- **Real mail, rendered properly** — HTML email on a clean white card (sanitized, script-free), quoted trails tucked behind `•••`, collapsed older messages, attachments that open/save, and a toggleable Google Calendar day panel.
-- **Split Inbox** — Important / Other out of the box (calendar lives in a toggleable side panel), plus custom splits defined in a Gmail-style query language — `from:thriftytraveler.com OR from:thepointsguy.com`, quoted phrases, parentheses, bare domains matching subdomains — with per-account scoping, drag-free reordering, an "also show in Important" toggle, and membership classified at sync time over the whole mailbox. Counts show **total** conversations, so a split reads like a to-do list.
-- **Inbox Zero, celebrated** — hit zero in a split and get a full-screen celebration image with your daily/weekly streak. **Get Me To Zero** bulk-archives old mail (preserving unread/starred if you want) so the first cleanup takes seconds.
-- **Write with AI (`Ctrl+J`)** — drafts stream in from **Claude, OpenAI, or NVIDIA NIM** using *your* key. The model sees the full thread, parsed attachments (PDF, text, best-effort .docx, images to multimodal models), and your personal Knowledge Base — so drafts sound like you and are grounded in real context.
+- **Fly through email** — the keymap replicates **Superhuman v7 (Windows/Linux)**: `E` done, `Shift+E` not done, `R`/`A` reply/reply-all, `S` star, `#` trash, `!` spam, `M` mute, `H` remind, `U` read/unread, `Z` **undo anything**, `Ctrl+U` unsubscribe, `J/K` navigate, `G`-chords (incl. `G S` starred), `Tab` next split. A `Ctrl+K` command palette lists everything with its shortcut, and every binding is remappable in Settings with conflict detection.
+- **Search that reaches your whole mailbox** — a background crawler indexes full history (not just the synced window), ranked with SQLite FTS5 + BM25. Semantic search runs on a bundled local embedding model — no bytes leave the machine — and hybrid results fuse keyword and meaning. Natural-language queries (`from maya last week about the term sheet`) are planned into structured filters.
+- **Undo Send & Send Later** — every send has a configurable `Z` window (10s default); `Ctrl+Shift+L` schedules for later. The outbox lives in SQLite, so scheduled mail survives restarts — no server involved. Replies send optimistically: the row appears instantly, `Z` pulls it back to a draft.
+- **Multiple accounts, properly isolated** — every account gets its **own SQLite file**, so connecting a second mailbox can't slow the first and disconnecting one is a file delete rather than a multi-gigabyte row purge. `Alt+1…9` switches; per-account rich signatures; dead OAuth grants surface as a Reconnect banner instead of failing silently.
+- **Real mail, rendered properly** — HTML email renders inline in a shadow DOM as one continuous document: selection crosses subject into body, nothing reflows, and the sanitizer is the sole trust boundary (CSS scrubbed, `position:fixed` jailed, per-attribute URL policy). Quoted trails tuck behind `•••`, attachments open/save, and Drive files attach as links or copies.
+- **Split Inbox v2** — Important / Other out of the box, plus custom splits in a Gmail-style query language (`from:thriftytraveler.com OR from:thepointsguy.com`, quoted phrases, parentheses, bare domains matching subdomains), with per-account scoping and an "also show in Important" toggle. Membership is classified **at sync time** and stored on the row, so tab counts, the unread badge, and bulk actions all read the same materialized value.
+- **Inbox Zero, celebrated** — hit zero in a split and get a full-screen celebration with your daily/weekly streak. **Get Me To Zero** bulk-archives the *entire* split (not just what's on screen), chunked so the UI stays live, with one `Z` restoring the whole sweep.
+- **Two-way calendar** — Google Calendar in a side panel and a week view, with event create/edit/delete, invitations and RSVP-from-mail, and Google Meet links created on demand.
+- **Write with AI (`Ctrl+J`)** — drafts stream in from **Claude, OpenAI, or NVIDIA NIM** using *your* key. The model sees the full thread, parsed attachments (PDF, text, best-effort .docx, images to multimodal models), and your personal Knowledge Base.
 - **Instant Reply** — up to 3 suggested replies per thread; `Tab` previews, `R` inserts. Nothing ever sends without your explicit review.
 - **Ask AI (`?`)** — ask questions about the open thread, answered from its content.
 - **Sound like me** — standing instructions, reusable snippets, and pasted voice examples persist locally and shape every draft.
-- **Private by design** — OAuth tokens and AI keys live in the Windows Credential Manager (OS keychain). All secret-bearing calls happen in the Rust core, never the webview. No telemetry. No servers.
-- **Dark theme done right** — layered surfaces, no pure black/white, deepened accents, WCAG AA contrast, visible focus rings.
+- **Live sync feedback** — a "Downloading 17 of 30…" pill while the Gmail API is being hit, a long-term crawl-completeness strip, and an unread badge on the Windows taskbar, macOS dock, and Linux launcher.
+- **Private by design, and erasable** — OAuth tokens and AI keys live in the OS keychain; all secret-bearing calls happen in the Rust core, never the webview. No telemetry, no servers. **Settings → Privacy & keys → Erase all local data** removes every mailbox, credential and cache and shows you a literal list of what it deleted; uninstalling offers the same cleanup.
+- **Dark and light, done right** — layered surfaces, no pure black/white, deepened accents, WCAG AA contrast, visible focus rings.
 
 ## Install (beta testers)
 
@@ -100,6 +103,22 @@ Details and model configuration: [docs/AI_PROVIDERS.md](docs/AI_PROVIDERS.md). U
 
 Every shortcut is remappable in **Settings → Shortcuts**. Full list + smoke test: [docs/SHORTCUTS.md](docs/SHORTCUTS.md).
 
+## Tests
+
+```powershell
+npm test                       # front end (vitest)
+npx tsc --noEmit               # type check
+cd src-tauri; cargo test       # Rust core
+```
+
+CI runs all three on every push and pull request ([.github/workflows/build.yml](.github/workflows/build.yml)):
+
+| Job | What it covers |
+|---|---|
+| **windows** | `tsc`, `npm test`, production build, `cargo check --locked`, and a guard that the desktop bundle contains no demo-fixture strings |
+| **linux** | the full `cargo test --features demo-fixtures` suite, run inside `dbus-run-session` with a real `gnome-keyring` — so the credential-store tests exercise an actual Secret Service rather than being skipped. A follow-up step asserts those four tests **ran by name**, because a skipped test and a passing test look identical in a green build |
+| **macos** | `cargo check --locked`, the only leg that compiles the macOS `cfg` arms |
+
 ## Docs
 
 - [docs/SETUP.md](docs/SETUP.md) — full Windows setup incl. creating the Gmail OAuth client
@@ -113,9 +132,9 @@ Every shortcut is remappable in **Settings → Shortcuts**. Full list + smoke te
 
 ## Roadmap
 
-- **Shipped through v0.9:** Gmail sync (incremental via history API) · full Superhuman-style keymap + palette · split inbox · bulk selection with single-`Z` undo · real synced Trash · folder/label sidebar with proper label names · Inbox Zero celebrations + Get Me To Zero · streaming BYOK AI (Claude/OpenAI/NIM) · Instant Reply · Ask AI · undo anything incl. send · send later · multi-account · theme-aware HTML mail rendering · attachments · local drafts · onboarding · auto-update · notifications · local-first calendar (day panel + week view) · daily Unsplash photo on empty splits · offline Harper spell/grammar in compose · the Fission Mail Design System in dark + light
-- **Next:** Outlook (Microsoft Graph) adapter · search operators (`from:`, `in:`) · macOS build · Ask AI across the whole inbox
-- **Later (documented, not built):** iOS/Android via Tauri v2 mobile · calendar week view + event creation · team collaboration · CRM integrations — see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#p2-later)
+- **Shipped through v0.24:** Gmail sync (incremental via history API) · full Superhuman-style keymap + remappable palette · Split Inbox v2 with a query language and sync-time classification · full-history search with BM25 + local semantic embeddings + NL query planning · two-way calendar with invites, RSVP and Meet links · streaming BYOK AI (Claude/OpenAI/NIM) · Instant Reply · Ask AI · undo anything incl. send · send later · optimistic reply-send · per-account SQLite storage with resumable migration · inline shadow-DOM mail rendering + hardened sanitizer · Drive attachments · contacts autocomplete · snooze with natural-language reminders · unread badge on all three OSes · live sync-activity pill · rebuilt Settings with a shortcuts editor · welcome/onboarding flow · erase-all-local-data + clean uninstall · auto-update · notifications · offline Harper spell/grammar · the Snail Mail Design System in dark + light
+- **Next:** macOS and Linux release builds (both already compile in CI) · Outlook (Microsoft Graph) adapter · Ask AI across the whole inbox · diagnostic/crash reporter
+- **Later (documented, not built):** iOS/Android via Tauri v2 mobile · team collaboration · CRM integrations — see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#p2-later)
 
 ## License
 
