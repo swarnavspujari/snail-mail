@@ -82,6 +82,10 @@ export interface Backend {
   switchAccount(email: string): Promise<AccountsState>;
   reorderAccounts(emails: string[]): Promise<AccountsState>;
   hasGmailClient(): Promise<boolean>;
+  /** Is a refresh token still stored for this account? Distinguishes "Google
+   *  refused it" from "we have nothing to refresh with" — both show as
+   *  disconnected, but only one is Google's doing. */
+  hasStoredGrant(email: string): Promise<boolean>;
   /** What the account's OAuth grant covers (Drive/Contacts/…) — features
    *  gate on this; legacyGrant means "reconnect to unlock the new scopes". */
   getCapabilities(email: string): Promise<Capabilities>;
@@ -310,6 +314,9 @@ class TauriBackend implements Backend {
   }
   hasGmailClient() {
     return invoke<boolean>("has_gmail_client");
+  }
+  hasStoredGrant(email: string) {
+    return invoke<boolean>("has_stored_grant", { email });
   }
   getCapabilities(email: string) {
     return invoke<Capabilities>("get_capabilities", { email });

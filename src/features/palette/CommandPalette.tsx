@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { useScrollSelectedIntoView } from "@/lib/scroll-into-view";
 import { allCommands, runCommand, type Command } from "@/lib/commands";
 import { formatKeyExpr } from "@/lib/keyboard";
 import { useSettings } from "@/stores/settings";
@@ -21,6 +22,9 @@ export function CommandPalette() {
   const [query, setQuery] = useState("");
   const [index, setIndex] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
+  // Same fix as PickerShell: the highlight must drag the scroll viewport with
+  // it, or arrowing past the visible rows steers something off-screen.
+  const listRef = useScrollSelectedIntoView<HTMLDivElement>(index);
   const shortcuts = useSettings((s) => s.settings.shortcuts);
   // The per-command chord chip teaches that command's key, so it answers to
   // showKeyHints like every other hint. The palette's OWN driving keys are a
@@ -99,7 +103,7 @@ export function CommandPalette() {
           placeholder="Type a command…"
           className="w-full border-b border-t border-[var(--palette-line)] bg-transparent px-4 py-3 text-[15px] text-[var(--palette-text)] outline-none placeholder:text-[var(--palette-text-faint)]"
         />
-        <div className="max-h-[52vh] overflow-y-auto py-1">
+        <div ref={listRef} className="max-h-[52vh] overflow-y-auto py-1">
           {items.map((c, i) => {
             const header = c.group !== lastGroup ? c.group : null;
             lastGroup = c.group;
@@ -111,6 +115,7 @@ export function CommandPalette() {
                   </div>
                 )}
                 <button
+                  data-row={i}
                   onClick={() => runItem(c)}
                   onMouseEnter={() => setIndex(i)}
                   className={`flex w-full items-center px-4 py-2 text-left text-[13.5px] ${

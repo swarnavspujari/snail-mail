@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { runCommandById } from "@/lib/commands";
-import { startOfToday, useCalendar } from "@/stores/calendar";
 import { splitThreads, useMail } from "@/stores/mail";
 import { useSettings } from "@/stores/settings";
 import { CalendarPanel } from "@/features/calendar/CalendarPanel";
@@ -31,49 +30,6 @@ function timeLabel(ms: number): string {
 }
 
 /** Toggle for the day panel; the badge counts what's still ahead today. */
-function CalendarToggle({ overlay }: { overlay?: boolean }) {
-  const open = useSettings((s) => s.settings.calendarOpen);
-  // The badge derives from the shared day-keyed cache (the open panel's
-  // loadRange fills it) — no listEvents round-trip of its own on every
-  // MailScreen remount, and nothing hits Google while the panel is closed.
-  const eventsByDay = useCalendar((s) => s.eventsByDay);
-  const loadedDays = useCalendar((s) => s.loadedDays);
-  const dayStart = startOfToday();
-  const upcoming =
-    open && loadedDays[dayStart]
-      ? (eventsByDay[dayStart] ?? []).filter((e) => e.endMs > Date.now()).length
-      : null;
-
-  return (
-    <button
-      onClick={() => {
-        const next = !open;
-        void useSettings.getState().save({ calendarOpen: next });
-        useUi.getState().setFocusRegion(next ? "calendar" : "mail");
-      }}
-      className={`flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-[12px] transition-colors ${
-        overlay
-          ? "border-white/30 text-white/85 hover:border-white/50 hover:text-white"
-          : open
-            ? "border-accent/50 bg-accent-dim text-ink"
-            : "border-line text-ink-3 hover:border-line-strong hover:text-ink-2"
-      }`}
-      title="Toggle the calendar panel"
-    >
-      <span aria-hidden>▦</span> Calendar
-      {upcoming !== null && upcoming > 0 && (
-        <span
-          className={`rounded-full px-1.5 text-[10.5px] leading-[16px] ${
-            open ? "bg-accent text-on-accent" : "bg-raised text-ink-3"
-          }`}
-        >
-          {upcoming}
-        </span>
-      )}
-    </button>
-  );
-}
-
 function SplitTabs({ overlay }: { overlay?: boolean }) {
   const inbox = useMail((s) => s.inbox);
   const activeSplitId = useMail((s) => s.activeSplitId);
@@ -144,7 +100,6 @@ function SplitTabs({ overlay }: { overlay?: boolean }) {
           )}
         </span>
       )}
-      <CalendarToggle overlay={overlay} />
     </div>
   );
 }
@@ -384,7 +339,6 @@ export function MailScreen() {
               {threads.length}
             </span>
             <div className="flex-1" />
-            <CalendarToggle />
           </div>
         )}
         {selectedIds.size > 0 && <BulkBar count={selectedIds.size} />}

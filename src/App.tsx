@@ -131,6 +131,29 @@ export default function App() {
     accounts.accounts.find((a) => a.email === accounts.active)?.connected ?? true;
   const [reconnecting, setReconnecting] = useState(false);
   const [reconnectError, setReconnectError] = useState<string | null>(null);
+  // email -> "is a refresh token still stored". Undefined until asked, and the
+  // banner falls back to the "revoked" wording then, because that is the safe
+  // reading: claiming a credential is MISSING when it is merely refused would
+  // send someone deleting and re-pasting things that were fine.
+  const [grants, setGrants] = useState<Record<string, boolean>>({});
+  // Ask once per dead account (and again after a reconnect attempt changes the
+  // set) rather than on every render.
+  const deadKey = deadAccounts.map((a) => a.email).join(",");
+  useEffect(() => {
+    let cancelled = false;
+    void Promise.all(
+      deadAccounts.map(async (a) => [a.email, await backend.hasStoredGrant(a.email)] as const)
+    )
+      .then((pairs) => {
+        if (!cancelled) setGrants(Object.fromEntries(pairs));
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [deadKey]);
+
   const reconnectDead = async () => {
     setReconnecting(true);
     setReconnectError(null);
@@ -434,8 +457,17 @@ export default function App() {
         >
           <span className="h-2 w-2 shrink-0 rounded-full bg-warn" />
           <span className="min-w-0 flex-1 truncate">
-            Google sign-in for {a.email} expired or was revoked — mail and
-            calendar are paused, queued sends are parked.
+            {grants[a.email] === false ? (
+              <>
+                No saved Google sign-in for {a.email} — it was removed from this
+                machine, or consent never finished. Reconnect to sign in again.
+              </>
+            ) : (
+              <>
+                Google sign-in for {a.email} expired or was revoked — mail and
+                calendar are paused, queued sends are parked.
+              </>
+            )}
           </span>
           <button
             className="shrink-0 rounded-md bg-accent px-2.5 py-1 text-[12px] font-medium text-on-accent hover:opacity-90 disabled:opacity-60"

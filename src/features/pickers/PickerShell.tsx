@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { useScrollSelectedIntoView } from "@/lib/scroll-into-view";
 import { useUi } from "@/stores/ui";
 
 export interface PickerItem {
@@ -32,6 +33,10 @@ export function PickerShell({
   const [query, setQuery] = useState("");
   const boxRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  // The list scrolls (max-h + overflow), so moving the highlight has to move
+  // the viewport with it — otherwise holding Down walks the selection off the
+  // bottom and you are steering something you cannot see.
+  const listRef = useScrollSelectedIntoView<HTMLDivElement>(index);
 
   const hasInput = filterable || onQuery !== undefined;
   const shown = filterable
@@ -99,10 +104,11 @@ export function PickerShell({
             className="w-full border-b border-line bg-transparent px-4 py-2.5 text-[13px] text-ink outline-none placeholder:text-ink-3"
           />
         )}
-        <div className="max-h-[46vh] overflow-y-auto py-1">
+        <div ref={listRef} className="max-h-[46vh] overflow-y-auto py-1">
           {shown.map((item, i) => (
             <button
               key={`${i}-${item.label}`}
+              data-row={i}
               onClick={() => {
                 useUi.getState().closePicker();
                 void item.run();

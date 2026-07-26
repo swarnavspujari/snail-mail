@@ -1,7 +1,7 @@
 // Right-hand identity rail for the open thread (design system
 // mail/ContactPanel): who you're talking to, plus recent mail history.
 import { useEffect, useState } from "react";
-import { backend } from "@/lib/ipc";
+import { backend, openExternal } from "@/lib/ipc";
 import { useMail } from "@/stores/mail";
 import type { SearchResult, ThreadId } from "@/lib/types";
 import { Avatar } from "@/components/Avatar";
@@ -95,7 +95,18 @@ export function ContactPanel({
           <span aria-hidden className="opacity-55">
             🔗
           </span>
-          {website}
+          {/* The domain is derived from the sender's address, so it is only ever
+              a guess at "their website" — but it was rendered as dead text
+              beside a link glyph, which promises a link and delivers nothing.
+              Opens in the system browser, never in-app: this is untrusted
+              content derived from mail. */}
+          <button
+            className="truncate text-left text-accent-strong hover:underline"
+            title={`Open https://${website}`}
+            onClick={() => void openExternal(`https://${website}`)}
+          >
+            {website}
+          </button>
         </div>
       )}
     </aside>

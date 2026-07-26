@@ -493,6 +493,12 @@ export class MockBackend implements Backend {
     }
     return this.accountsState();
   }
+  /** The demo never loses a token, so a disconnected demo account is always
+   *  the "refused" case rather than the "missing" one. */
+  async hasStoredGrant(email: string): Promise<boolean> {
+    return this.accountsState().accounts.some((a) => a.email === email);
+  }
+
   async hasGmailClient(): Promise<boolean> {
     return false;
   }

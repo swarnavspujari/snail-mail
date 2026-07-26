@@ -37,6 +37,7 @@ export const DEFAULT_SHORTCUTS: Record<string, string> = {
   "thread.reply": "r",
   "thread.replyAll": "a",
   "thread.forward": "f",
+  "thread.introReply": "ctrl+shift+i",
   "thread.replyAllOrOpen": "enter",
   "thread.star": "s",
   "thread.trash": "#|delete|backspace",

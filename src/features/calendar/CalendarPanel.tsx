@@ -81,100 +81,6 @@ function EventBlock({
   );
 }
 
-const MINI_DOW = ["S", "M", "T", "W", "T", "F", "S"];
-
-/** Navigable mini-month: today filled with the accent, the focused day (and
- *  the focused week, while the week view is open) banded; click any day to
- *  jump the agenda — and the week view's range with it. */
-function MiniMonth({ dayStart }: { dayStart: number }) {
-  const [monthOffset, setMonthOffset] = useState(0);
-  const weekViewOpen = useUi((s) => s.screen === "calendar");
-  const focused = new Date(dayStart);
-  // follow the agenda when it moves to another month
-  useEffect(() => setMonthOffset(0), [dayStart]);
-
-  const view = new Date(focused.getFullYear(), focused.getMonth() + monthOffset, 1);
-  const gridStart = new Date(
-    view.getFullYear(),
-    view.getMonth(),
-    1 - view.getDay()
-  );
-  const cells = Array.from({ length: 42 }, (_, i) => {
-    const d = new Date(
-      gridStart.getFullYear(),
-      gridStart.getMonth(),
-      gridStart.getDate() + i
-    );
-    return { ms: d.getTime(), date: d.getDate(), inMonth: d.getMonth() === view.getMonth() };
-  });
-  const today = startOfToday();
-  const weekStart = dayStart - new Date(dayStart).getDay() * DAY_MS;
-  const weekEnd = weekStart + 6 * DAY_MS;
-  const label = view.toLocaleDateString(undefined, { month: "long", year: "numeric" });
-  const navBtn =
-    "flex h-[22px] w-[22px] items-center justify-center rounded-md text-[14px] text-ink-3 hover:bg-hover hover:text-ink";
-
-  return (
-    <div>
-      <div className="mb-2 flex items-center">
-        <span className="flex-1 text-[13.5px] font-semibold text-ink">{label}</span>
-        <HoverHint label="Previous month" placement="bottom">
-          <button
-            className={navBtn}
-            aria-label="Previous month"
-            onClick={() => setMonthOffset((o) => o - 1)}
-          >
-            ‹
-          </button>
-        </HoverHint>
-        <HoverHint label="Next month" placement="bottom">
-          <button
-            className={navBtn}
-            aria-label="Next month"
-            onClick={() => setMonthOffset((o) => o + 1)}
-          >
-            ›
-          </button>
-        </HoverHint>
-      </div>
-      <div className="grid grid-cols-7 gap-y-px">
-        {MINI_DOW.map((d, i) => (
-          <div
-            key={i}
-            className="pb-0.5 text-center text-[10.5px] font-medium text-ink-3"
-          >
-            {d}
-          </div>
-        ))}
-        {cells.map((c) => {
-          const isToday = c.ms === today;
-          const isFocused = c.ms === dayStart;
-          const inWeek = weekViewOpen && c.ms >= weekStart && c.ms <= weekEnd;
-          return (
-            <button
-              key={c.ms}
-              onClick={() => useCalendar.getState().goToDay(c.ms)}
-              className={`flex h-[26px] items-center justify-center rounded-full text-[12px] tabular-nums ${
-                isToday
-                  ? "bg-accent font-bold text-on-accent"
-                  : isFocused
-                    ? "bg-selected font-semibold text-ink"
-                    : inWeek
-                      ? "bg-hover font-semibold text-ink-2"
-                      : c.inMonth
-                        ? "text-ink-2 hover:bg-hover"
-                        : "text-ink-3 opacity-45 hover:bg-hover"
-              }`}
-            >
-              {c.date}
-            </button>
-          );
-        })}
-      </div>
-    </div>
-  );
-}
-
 /** Filled-with-its-hue calendar checkbox (design system calendar panel). */
 function CalCheck({ hue, on }: { hue: string; on: boolean }) {
   return (
@@ -259,8 +165,7 @@ function CalendarsList() {
 
 /** Right-hand day calendar, Superhuman-style: toggleable, painted instantly
  *  from the shared day-keyed cache; a background sync keeps it fresh. A
- *  navigable mini-month and the color-coded calendars list sit above the
- *  agenda. ←/→ move days while the panel has focus. Click an event for
+ *  color-coded calendars list sits above the agenda. ←/→ move days while the panel has focus. Click an event for
  *  details/RSVP; click or drag an empty slot to create one. */
 export function CalendarPanel() {
   const dayOffset = useCalendar((s) => s.dayOffset);
@@ -427,8 +332,11 @@ export function CalendarPanel() {
         </HoverHint>
       </div>
 
+      {/* No mini-month here. This panel answers "what is on today"; a month
+          grid pushed the agenda — the thing being asked for — below the fold,
+          and ←/→ already move days. The full month lives in the Calendar
+          surface, which is one click away in the rail. */}
       <div className="shrink-0 space-y-2 border-b border-line px-3 pb-2">
-        <MiniMonth dayStart={dayStart} />
         <CalendarsList />
       </div>
 

@@ -8,6 +8,7 @@ import { useSettings } from "@/stores/settings";
 import { useUi } from "@/stores/ui";
 import { Avatar } from "@/components/Avatar";
 import { ContactPanel } from "@/components/ContactPanel";
+import { CalendarPanel } from "@/features/calendar/CalendarPanel";
 import { HoverHint } from "@/components/HoverHint";
 import { Kbd } from "@/components/Kbd";
 import { Label } from "@/components/Label";
@@ -449,6 +450,7 @@ export function ThreadView() {
   const blankHealDone = useMail((s) => s.blankHealDone);
   const myEmail = useSettings((s) => s.accounts.active);
   const keyHints = useSettings((s) => s.settings.showKeyHints);
+  const calendarOpen = useSettings((s) => s.settings.calendarOpen);
   const compose = useUi((s) => s.compose);
   // A reply/forward for THIS thread docks its composer inline at the bottom
   // (new-message compose stays the modal); Instant Replies hide while it's open.
@@ -687,11 +689,20 @@ export function ThreadView() {
         </div>
         {!replyingHere && <InstantReplies />}
       </div>
-      <ContactPanel
-        name={contact.fromName}
-        email={contact.from}
-        currentThreadId={threadId}
-      />
+      {/* `0` toggles the day calendar here too. It takes the sidebar slot
+          rather than adding a third column: at thread width there is only room
+          for one right-hand panel, and the contact card is the thing you are
+          willing to trade away when you asked to see your day. Toggling back
+          restores it. */}
+      {calendarOpen ? (
+        <CalendarPanel />
+      ) : (
+        <ContactPanel
+          name={contact.fromName}
+          email={contact.from}
+          currentThreadId={threadId}
+        />
+      )}
     </div>
   );
 }

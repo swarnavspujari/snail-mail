@@ -259,6 +259,23 @@ async fn reorder_accounts(state: State<'_, AppState>, emails: Vec<String>) -> Re
     Ok(accounts)
 }
 
+/// Is a Google refresh token still stored for this account?
+///
+/// A dead grant and a *missing* credential both surface as `connected: false`,
+/// but they are different failures. "Expired or was revoked" means Google
+/// refused a token we still hold. An absent token means there is nothing to
+/// refresh with at all — an erase, a credential purge, or consent that never
+/// completed. The remedy is the same (reconnect), the diagnosis is not: the
+/// banner claimed revocation for a local deletion once and sent a debugging
+/// session hunting Google-side causes for hours.
+#[tauri::command]
+fn has_stored_grant(email: String) -> bool {
+    if email.trim().is_empty() {
+        return false;
+    }
+    stored_secret(&secrets::gmail_refresh_entry(email.trim())).is_some()
+}
+
 #[tauri::command]
 fn has_gmail_client() -> bool {
     (stored_secret(secrets::GMAIL_CLIENT_ID).is_some()
@@ -5013,6 +5030,7 @@ pub fn run() {
             reorder_accounts,
             get_capabilities,
             has_gmail_client,
+            has_stored_grant,
             start_oauth,
             disconnect_account,
             erase_all_local_data,

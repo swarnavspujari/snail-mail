@@ -4,6 +4,7 @@ import { backend } from "./ipc";
 import { useUpdater } from "./updater";
 import type { Binding } from "./keyboard";
 import { popUndo, pushUndo } from "./undo";
+import { addressOf, introGreetingName, introRecipients } from "./intro-forward";
 import { DAY_MS, startOfToday, useCalendar } from "@/stores/calendar";
 import { useMail, visibleThreads } from "@/stores/mail";
 import { useSettings } from "@/stores/settings";
@@ -151,6 +152,45 @@ export async function startReply(
   // (e.g. when replying straight from a list selection).
   if (mail().openThreadId !== id) await mail().openThread(id);
   ui().startCompose(base);
+}
+
+/** Double-opt-in intro reply: the introducer drops to Bcc, the people being
+ *  introduced become To, and the body opens with the customary one-liner.
+ *  Stays a reply on the thread (subject + quoted trail intact) so the intro
+ *  keeps its context — recipient arithmetic lives in lib/intro-forward.ts. */
+export async function startIntroReply() {
+  const id = actionTargetThreadId();
+  if (!id) return;
+  const msgs = await messagesFor(id);
+  if (msgs.length === 0) return;
+  const me = myAddress();
+  const meAddr = addressOf(me);
+  // The introducer is the last person who wrote who isn't you.
+  const target =
+    [...msgs].reverse().find((m) => addressOf(m.from) !== meAddr) ??
+    msgs[msgs.length - 1];
+
+  const { to, bcc } = introRecipients(
+    { from: target.from, to: target.to, cc: target.cc },
+    me
+  );
+  const greeting = `Thanks ${introGreetingName(target.fromName)}, in BCC to spare inbox.`;
+  const subject = msgs[0].subject;
+  ui().startCompose({
+    mode: "replyAll",
+    threadId: id,
+    to: to.join(", "),
+    cc: "",
+    bcc: bcc.join(", "),
+    attachments: [],
+    driveLinks: [],
+    draftId: null,
+    draftAccount: null,
+    subject: subject.startsWith("Re:") ? subject : `Re: ${subject}`,
+    body: `<p>${escapeHtml(greeting)}</p><p></p>`,
+    quote: replyTrailerHtml(target),
+  });
+  if (mail().openThreadId !== id) await mail().openThread(id);
 }
 
 function pickedSuggestion(): string | undefined {
@@ -472,6 +512,13 @@ export function allCommands(): Command[] {
       group: "Compose",
       when: () => hasTarget() && !inCompose(),
       run: () => startReply("forward"),
+    },
+    {
+      id: "thread.introReply",
+      title: "Reply to intro (sender to Bcc)",
+      group: "Compose",
+      when: () => hasTarget() && !inCompose(),
+      run: () => startIntroReply(),
     },
     // Multi-message threads only: ↓/↑ move a per-message cursor (highlight +
     // scroll into view) and Enter drills into the focused message (open it, or
