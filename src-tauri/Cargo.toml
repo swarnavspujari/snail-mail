@@ -1,6 +1,6 @@
 [package]
 name = "snail-mail"
-version = "0.24.1"
+version = "0.24.2"
 description = "Snail Mail — keyboard-first, AI-native email client"
 authors = ["Swarnav S Pujari"]
 license = "MIT"
