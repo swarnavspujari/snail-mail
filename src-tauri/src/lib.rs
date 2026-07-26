@@ -5146,6 +5146,28 @@ mod baked_credential_tests {
                    Some("123-abc.apps.googleusercontent.com"));
     }
 
+    /// Whatever this build baked in, it is whole or it is nothing. A release
+    /// carrying an id without its secret would report "no OAuth client" at
+    /// runtime while the repo believed it shipped one — the silence #141 was
+    /// about. Dev builds bake neither and pass trivially; `--nocapture` prints
+    /// what a release build actually captured, which is how the v0.24.2 client
+    /// was confirmed present rather than inferred from CI logs.
+    #[test]
+    fn baked_client_is_whole_or_absent() {
+        match (super::BAKED_GMAIL_CLIENT_ID, super::BAKED_GMAIL_CLIENT_SECRET) {
+            (None, None) => println!("no baked client (dev build)"),
+            (Some(id), Some(_)) => {
+                assert!(
+                    id.ends_with(".apps.googleusercontent.com"),
+                    "baked client id is not a Google client id: {id}"
+                );
+                println!("baked client present: {id}");
+            }
+            (Some(_), None) => panic!("baked client id without its secret"),
+            (None, Some(_)) => panic!("baked client secret without its id"),
+        }
+    }
+
     /// The two properties that actually broke, stated directly: a blank must
     /// not satisfy is_some(), and must not swallow the next fallback.
     #[test]
