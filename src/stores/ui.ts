@@ -29,6 +29,10 @@ export interface ComposeState {
   driveLinks: DriveLinkRef[];
   /** Persisted-draft row backing this compose; null until first autosave. */
   draftId: number | null;
+  /** The account that owns `draftId`. Draft ids are per-account autoincrement,
+   *  so the id alone doesn't name a row — without the owner, an autosave after
+   *  an account switch rewrites the active mailbox's row of the same number. */
+  draftAccount: string | null;
 }
 
 /** One Drive file linked into the body as a chip. */
@@ -307,6 +311,9 @@ export interface DriveUploadUi {
 export interface PendingSend {
   /** The outbox row to cancel (Z) or flush now (Ctrl/Cmd+Shift+Z). */
   outboxId: number;
+  /** The account that owns `outboxId` — ids are per-account, so both are
+   *  needed or Z can cancel another mailbox's identically-numbered send. */
+  outboxAccount: string;
   /** Epoch ms when the message actually leaves; drives the countdown. */
   expiresAt: number;
   /** Bar label, e.g. "Sent" or "Sent & marked done". */

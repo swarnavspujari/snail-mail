@@ -204,14 +204,17 @@ export function useComposeController() {
       const c = useUi.getState().compose;
       if (!c) return;
       if (!composeHasContent(c)) return;
-      const { draftId, ...payload } = c;
+      // draftId/draftAccount name the row — they're never part of its contents
+      const { draftId, draftAccount, ...payload } = c;
       void backend
-        .saveDraft(draftId, JSON.stringify(payload))
-        .then((id) => {
+        .saveDraft(draftId, draftAccount, JSON.stringify(payload))
+        .then((ref) => {
           const cur = useUi.getState().compose;
-          if (cur && cur.draftId !== id) {
+          if (cur && (cur.draftId !== ref.id || cur.draftAccount !== ref.account)) {
             useUi.setState((s) => ({
-              compose: s.compose ? { ...s.compose, draftId: id } : null,
+              compose: s.compose
+                ? { ...s.compose, draftId: ref.id, draftAccount: ref.account }
+                : null,
             }));
           }
         })
@@ -270,7 +273,8 @@ export function useComposeController() {
         const appendPending = (
           status: "sending" | "sent",
           sentAt: number | null,
-          outboxId: number | null
+          outboxId: number | null,
+          outboxAccount: string | null
         ) =>
           useMail.getState().addPendingMessage({
             threadId: c.threadId!,
@@ -284,6 +288,7 @@ export function useComposeController() {
             status,
             sentAt,
             outboxId,
+            outboxAccount,
             baselineCount: useMail.getState().openMessages.length,
           });
 
@@ -302,9 +307,10 @@ export function useComposeController() {
 
         if (undoMs === 0) {
           // Undo Send off: deliver immediately, no window, nothing to undo.
-          if (c.draftId !== null) void backend.deleteDraft(c.draftId).catch(() => {});
+          if (c.draftId !== null && c.draftAccount !== null)
+            void backend.deleteDraft(c.draftId, c.draftAccount).catch(() => {});
           useUi.getState().closeCompose();
-          if (optimistic) pendingLocalId = appendPending("sending", null, null);
+          if (optimistic) pendingLocalId = appendPending("sending", null, null, null);
           await backend.sendMailNow(outgoing);
           if (pendingLocalId)
             useMail.getState().markPendingSent(pendingLocalId, Date.now());
@@ -313,12 +319,13 @@ export function useComposeController() {
         } else {
           // Queue with the fuse — that delay IS the Undo Send window (Z pulls
           // the draft back; the UndoSendBar shows the countdown + Send now).
-          const outboxId = await backend.queueMail(outgoing, undoMs);
-          if (c.draftId !== null) void backend.deleteDraft(c.draftId).catch(() => {});
-          const saved = { ...c, draftId: null };
+          const queued = await backend.queueMail(outgoing, undoMs);
+          if (c.draftId !== null && c.draftAccount !== null)
+            void backend.deleteDraft(c.draftId, c.draftAccount).catch(() => {});
+          const saved = { ...c, draftId: null, draftAccount: null };
           useUi.getState().closeCompose();
           if (optimistic) {
-            pendingLocalId = appendPending("sending", null, outboxId);
+            pendingLocalId = appendPending("sending", null, queued.id, queued.account);
             const id = pendingLocalId;
             // Flip "Sending…" → sent with a real timestamp when the window ends
             // (the flush's mail:updated then reconciles it against the real row).
@@ -338,7 +345,7 @@ export function useComposeController() {
             expiresAt: Date.now() + undoMs,
             run: async () => {
               try {
-                await backend.cancelOutbox(outboxId);
+                await backend.cancelOutbox(queued.id, queued.account);
                 // Retract the optimistic row; the draft comes back below.
                 if (localId) {
                   clearTimeout(timer);
@@ -355,7 +362,8 @@ export function useComposeController() {
           });
           const done = await runMarkDone();
           useUi.getState().setPendingSend({
-            outboxId,
+            outboxId: queued.id,
+            outboxAccount: queued.account,
             expiresAt: Date.now() + undoMs,
             label: done ? "Sent & marked done" : "Sent",
           });

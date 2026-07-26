@@ -361,11 +361,29 @@ export interface OutgoingMail {
   attachments: MailAttachment[];
 }
 
-/** A locally persisted, unsent compose draft (payload = ComposeState JSON). */
+/** A locally persisted, unsent compose draft (payload = ComposeState JSON).
+ *
+ *  `account` is part of the row's identity, not decoration: ids are per-account
+ *  autoincrement, so id 7 exists independently in every connected mailbox and
+ *  only names a row alongside its owner. */
 export interface DraftEntry {
   id: number;
+  account: string;
   payload: string;
   updatedAt: number;
+}
+
+/** Where a just-saved draft landed — held by compose and handed back on the
+ *  next save/delete so the row is never addressed by a bare id. */
+export interface DraftRef {
+  id: number;
+  account: string;
+}
+
+/** Where a just-queued send landed — the handle Undo Send and "send now" use. */
+export interface OutboxRef {
+  id: number;
+  account: string;
 }
 
 export interface SearchResult {

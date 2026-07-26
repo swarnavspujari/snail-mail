@@ -34,16 +34,17 @@ export function SendLaterPicker() {
       return;
     }
     if (!(await shareDriveLinks(c, mail))) return; // user cancelled
-    const outboxId = await backend.queueMail(mail, Math.max(0, sendAtMs - Date.now()));
-    if (c.draftId !== null) void backend.deleteDraft(c.draftId).catch(() => {});
-    const saved = { ...c, draftId: null };
+    const queued = await backend.queueMail(mail, Math.max(0, sendAtMs - Date.now()));
+    if (c.draftId !== null && c.draftAccount !== null)
+      void backend.deleteDraft(c.draftId, c.draftAccount).catch(() => {});
+    const saved = { ...c, draftId: null, draftAccount: null };
     useUi.getState().closeCompose();
     useUi.getState().showToast(`Scheduled — ${label} (Z to unschedule)`);
     pushUndo({
       label: "Send Later",
       run: async () => {
         try {
-          await backend.cancelOutbox(outboxId);
+          await backend.cancelOutbox(queued.id, queued.account);
           useUi.getState().startCompose(saved);
           useUi.getState().showToast("Unscheduled — draft restored");
         } catch {

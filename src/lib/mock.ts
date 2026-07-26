@@ -20,6 +20,8 @@ import type {
   SendUpdates,
   ThreadInvite,
   DraftEntry,
+  DraftRef,
+  OutboxRef,
   DraftRequest,
   DriveFile,
   DriveShareMode,
@@ -95,7 +97,8 @@ interface PersistedState {
     }
   >;
   trashed: string[]; // legacy hard-trash list (pre-undo); still honored
-  outbox: { id: number; mail: OutgoingMail; sendAt: number }[];
+  /** `account` is absent on rows persisted before ids carried their owner. */
+  outbox: { id: number; account?: string; mail: OutgoingMail; sendAt: number }[];
   outboxSeq: number;
   drafts: DraftEntry[];
   draftSeq: number;
@@ -697,18 +700,28 @@ export class MockBackend implements Backend {
     return [...set];
   }
 
-  async queueMail(mail: OutgoingMail, delayMs: number): Promise<number> {
+  async queueMail(mail: OutgoingMail, delayMs: number): Promise<OutboxRef> {
     const id = this.state.outboxSeq++;
-    this.state.outbox.push({ id, mail, sendAt: Date.now() + delayMs });
+    const account = this.state.activeAccount;
+    this.state.outbox.push({ id, account, mail, sendAt: Date.now() + delayMs });
     this.persist();
     setTimeout(() => this.flushOutbox(), delayMs + 100);
-    return id;
+    return { id, account };
   }
 
-  async cancelOutbox(outboxId: number): Promise<OutgoingMail> {
-    const entry = this.state.outbox.find((o) => o.id === outboxId);
+  /** Rows are addressed by (id, account) exactly as the Rust backend does —
+   *  ids are per-account there, so matching on id alone would let one mailbox
+   *  cancel another's identically-numbered send. */
+  private outboxRow(outboxId: number, account: string) {
+    return this.state.outbox.find(
+      (o) => o.id === outboxId && (o.account ?? this.state.activeAccount) === account
+    );
+  }
+
+  async cancelOutbox(outboxId: number, account: string): Promise<OutgoingMail> {
+    const entry = this.outboxRow(outboxId, account);
     if (!entry) throw new Error("already sent");
-    this.state.outbox = this.state.outbox.filter((o) => o.id !== outboxId);
+    this.state.outbox = this.state.outbox.filter((o) => o !== entry);
     this.persist();
     return entry.mail;
   }
@@ -720,11 +733,11 @@ export class MockBackend implements Backend {
     this.notify();
   }
 
-  async sendOutboxNow(outboxId: number): Promise<void> {
+  async sendOutboxNow(outboxId: number, account: string): Promise<void> {
     // Accelerate: flush a still-pending send now instead of waiting the window.
-    const entry = this.state.outbox.find((o) => o.id === outboxId);
+    const entry = this.outboxRow(outboxId, account);
     if (!entry) throw new Error("already sent");
-    this.state.outbox = this.state.outbox.filter((o) => o.id !== outboxId);
+    this.state.outbox = this.state.outbox.filter((o) => o !== entry);
     this.deliverNow(entry.mail);
     this.persist();
     this.notify();
@@ -1186,29 +1199,50 @@ export class MockBackend implements Backend {
     setTimeout(() => URL.revokeObjectURL(url), 60_000);
   }
 
-  async saveDraft(draftId: number | null, payload: string): Promise<number> {
+  /** Drafts persisted before ids carried their owner default to the active
+   *  account — the mailbox that necessarily wrote them back when this was a
+   *  single-account store. */
+  private draftAccountOf(d: DraftEntry): string {
+    return d.account ?? this.state.activeAccount;
+  }
+
+  async saveDraft(
+    draftId: number | null,
+    draftAccount: string | null,
+    payload: string
+  ): Promise<DraftRef> {
     const now = Date.now();
-    if (draftId !== null) {
-      const d = this.state.drafts.find((d) => d.id === draftId);
+    if (draftId !== null && draftAccount !== null) {
+      const d = this.state.drafts.find(
+        (d) => d.id === draftId && this.draftAccountOf(d) === draftAccount
+      );
       if (d) {
         d.payload = payload;
         d.updatedAt = now;
+        d.account = draftAccount;
         this.persist();
-        return draftId;
+        return { id: draftId, account: draftAccount };
       }
+      // row vanished — fall through and recreate under the active account
     }
     const id = this.state.draftSeq++;
-    this.state.drafts.push({ id, payload, updatedAt: now });
+    const account = this.state.activeAccount;
+    this.state.drafts.push({ id, account, payload, updatedAt: now });
     this.persist();
-    return id;
+    return { id, account };
   }
 
   async listDrafts(): Promise<DraftEntry[]> {
-    return [...this.state.drafts].sort((a, b) => b.updatedAt - a.updatedAt);
+    return this.state.drafts
+      .filter((d) => this.draftAccountOf(d) === this.state.activeAccount)
+      .map((d) => ({ ...d, account: this.draftAccountOf(d) }))
+      .sort((a, b) => b.updatedAt - a.updatedAt);
   }
 
-  async deleteDraft(draftId: number): Promise<void> {
-    this.state.drafts = this.state.drafts.filter((d) => d.id !== draftId);
+  async deleteDraft(draftId: number, account: string): Promise<void> {
+    this.state.drafts = this.state.drafts.filter(
+      (d) => !(d.id === draftId && this.draftAccountOf(d) === account)
+    );
     this.persist();
   }
 

@@ -83,6 +83,18 @@ impl AppState {
         self.dbs.account(email)
     }
 
+    /// `account_db` for an email that came from the frontend. Opening a db is
+    /// lazy-CREATE, so a stale account string (compose still holding a draft
+    /// from a mailbox since disconnected) would otherwise write a fresh empty
+    /// file back onto disk. Rows can only belong to a registered account, so
+    /// anything else is resolved as "no such row".
+    fn registered_account_db(&self, email: &str) -> Option<Arc<Mutex<Connection>>> {
+        if email.is_empty() || !self.dbs.registered_emails().iter().any(|e| e == email) {
+            return None;
+        }
+        self.dbs.account(email).ok()
+    }
+
     /// Resolve which account owns a thread: the active account's file almost
     /// always has it, so probe that first, then the rest of the registry.
     /// Returns the OWNING email (the row's account_id — during the migration
@@ -2923,19 +2935,34 @@ async fn drive_share(
 
 // ---------------------------------------------------------------- drafts
 
+/// Autosave. `draft_account` is the account that owns `draft_id` — the pair the
+/// last save handed back. Without it an autosave after an account switch
+/// rewrites whatever row happens to carry that number in the *active* file.
 #[tauri::command]
 async fn save_draft(
     state: State<'_, AppState>,
     draft_id: Option<i64>,
+    draft_account: Option<String>,
     payload: String,
-) -> Result<i64, String> {
+) -> Result<DraftRef, String> {
     if payload.len() > 40_000_000 {
         return Err("draft is too large".into());
+    }
+    if let (Some(id), Some(owner)) = (draft_id, draft_account) {
+        if let Some(db) = state.registered_account_db(&owner) {
+            let conn = db.lock().unwrap();
+            if store::draft_update(&conn, id, &owner, &payload, now_ms()) {
+                return Ok(DraftRef { id, account: owner });
+            }
+        }
+        // row vanished (sent, discarded, account disconnected) — fall through
+        // and recreate under the active account rather than lose the work
     }
     let account = state.active_email();
     let db = state.account_db(&account)?;
     let conn = db.lock().unwrap();
-    store::draft_save(&conn, draft_id, &account, &payload, now_ms())
+    let id = store::draft_insert(&conn, &account, &payload, now_ms())?;
+    Ok(DraftRef { id, account })
 }
 
 #[tauri::command]
@@ -2945,34 +2972,24 @@ async fn list_drafts(state: State<'_, AppState>) -> Result<Vec<DraftEntry>, Stri
     let conn = db.lock().unwrap();
     Ok(store::draft_list(&conn, &account)
         .into_iter()
-        .map(|(id, payload, updated_at)| DraftEntry { id, payload, updated_at })
+        .map(|(id, payload, updated_at)| DraftEntry {
+            id,
+            account: account.clone(),
+            payload,
+            updated_at,
+        })
         .collect())
 }
 
 #[tauri::command]
-async fn delete_draft(state: State<'_, AppState>, draft_id: i64) -> Result<(), String> {
-    // draft ids are per-file; the active account wrote it in practice, but
-    // sweep the registry so a stale id can't strand a row after a switch
-    let active = state.active_email();
-    let mut emails = vec![];
-    if !active.is_empty() {
-        emails.push(active.clone());
-    }
-    for e in state.dbs.registered_emails() {
-        if e != active {
-            emails.push(e);
-        }
-    }
-    for email in emails {
-        let db = state.account_db(&email)?;
+async fn delete_draft(
+    state: State<'_, AppState>,
+    draft_id: i64,
+    account: String,
+) -> Result<(), String> {
+    if let Some(db) = state.registered_account_db(&account) {
         let conn = db.lock().unwrap();
-        let hit: bool = conn
-            .query_row("SELECT 1 FROM drafts WHERE id = ?1", [draft_id], |_| Ok(true))
-            .unwrap_or(false);
-        if hit {
-            store::draft_delete(&conn, draft_id);
-            return Ok(());
-        }
+        store::draft_delete(&conn, draft_id, &account);
     }
     Ok(())
 }
@@ -3802,7 +3819,11 @@ async fn deliver_mail(app: &AppHandle, account_email: &str, mail: &OutgoingMail)
 /// Queue a message. delay_ms ≈ 10s gives the Undo Send window; larger values
 /// are Send Later. The outbox survives app restarts.
 #[tauri::command]
-async fn queue_mail(state: State<'_, AppState>, mail: OutgoingMail, delay_ms: i64) -> Result<i64, String> {
+async fn queue_mail(
+    state: State<'_, AppState>,
+    mail: OutgoingMail,
+    delay_ms: i64,
+) -> Result<OutboxRef, String> {
     validate_mail(&mail)?;
     if !(0..=90 * 24 * 3_600_000).contains(&delay_ms) {
         return Err("invalid send delay".into());
@@ -3810,41 +3831,21 @@ async fn queue_mail(state: State<'_, AppState>, mail: OutgoingMail, delay_ms: i6
     let account = state.active_email();
     let db = state.account_db(&account)?;
     let conn = db.lock().unwrap();
-    store::outbox_add(&conn, &account, &mail, now_ms() + delay_ms)
+    let id = store::outbox_add(&conn, &account, &mail, now_ms() + delay_ms)?;
+    Ok(OutboxRef { id, account })
 }
 
-/// Which account file holds this outbox row. Active first — undo/accelerate
-/// always fire from the account that queued moments ago.
-fn outbox_db(state: &AppState, outbox_id: i64) -> Result<(String, Arc<Mutex<Connection>>), String> {
-    let active = state.active_email();
-    let mut emails = vec![];
-    if !active.is_empty() {
-        emails.push(active.clone());
-    }
-    for e in state.dbs.registered_emails() {
-        if e != active {
-            emails.push(e);
-        }
-    }
-    for email in emails {
-        let db = state.account_db(&email)?;
-        let hit: bool = {
-            let conn = db.lock().unwrap();
-            conn.query_row("SELECT 1 FROM outbox WHERE id = ?1", [outbox_id], |_| Ok(true))
-                .unwrap_or(false)
-        };
-        if hit {
-            return Ok((email, db));
-        }
-    }
-    Err("already sent".into())
-}
-
-/// Undo Send: pull a message back before the outbox flushes it.
+/// Undo Send: pull a message back before the outbox flushes it. `account` is
+/// the owner queue_mail handed back — outbox ids are per-file, so resolving by
+/// id alone could cancel another account's identically-numbered send.
 #[tauri::command]
-async fn cancel_outbox(state: State<'_, AppState>, outbox_id: i64) -> Result<OutgoingMail, String> {
-    let (_, db) = outbox_db(&state, outbox_id)?;
-    let cancelled = store::outbox_cancel(&db.lock().unwrap(), outbox_id);
+async fn cancel_outbox(
+    state: State<'_, AppState>,
+    outbox_id: i64,
+    account: String,
+) -> Result<OutgoingMail, String> {
+    let db = state.registered_account_db(&account).ok_or("already sent")?;
+    let cancelled = store::outbox_cancel(&db.lock().unwrap(), outbox_id, &account);
     cancelled.ok_or("already sent".to_string())
 }
 
@@ -3869,26 +3870,26 @@ async fn send_mail_now(app: AppHandle, mail: OutgoingMail) -> Result<(), String>
 /// flush leaves it queued for the processor to retry. Its send_at is still in
 /// the future, so the processor won't double-send it in the meantime.
 #[tauri::command]
-async fn send_outbox_now(app: AppHandle, outbox_id: i64) -> Result<(), String> {
+async fn send_outbox_now(app: AppHandle, outbox_id: i64, account: String) -> Result<(), String> {
     // Claim the row before the (async) network send so the 3s outbox processor
     // can never also deliver it. The claim + read run under one lock, so they're
     // atomic; a claimed row is invisible to outbox_due and to cancel_outbox.
     let db = {
         let state = app.state::<AppState>();
-        outbox_db(&state, outbox_id)?.1
+        state.registered_account_db(&account).ok_or("already sent")?
     };
-    let (account, mail) = {
+    let mail = {
         let conn = db.lock().unwrap();
-        if !store::outbox_claim(&conn, outbox_id) {
+        if !store::outbox_claim(&conn, outbox_id, &account) {
             return Err("already sent".into());
         }
-        store::outbox_get(&conn, outbox_id)
+        store::outbox_get(&conn, outbox_id, &account)
     }
     .ok_or_else(|| "already sent".to_string())?;
     match deliver_mail(&app, &account, &mail).await {
         Ok(()) => {
             let conn = db.lock().unwrap();
-            store::outbox_delete(&conn, outbox_id);
+            store::outbox_delete(&conn, outbox_id, &account);
             drop(conn);
             emit_mail_updated(&app);
             Ok(())
@@ -3896,7 +3897,7 @@ async fn send_outbox_now(app: AppHandle, outbox_id: i64) -> Result<(), String> {
         Err(e) => {
             // Delivery failed — release the claim so the processor retries it.
             let conn = db.lock().unwrap();
-            store::outbox_unclaim(&conn, outbox_id);
+            store::outbox_unclaim(&conn, outbox_id, &account);
             Err(e)
         }
     }
@@ -4500,7 +4501,8 @@ pub fn run() {
                         for (id, account, mail) in due {
                             // While the legacy db still serves several accounts
                             // this loop sees every row once per email — only the
-                            // owning pass may act.
+                            // owning pass may act. (The store mutators below are
+                            // account-scoped too, so this is belt-and-braces.)
                             if account != email {
                                 continue;
                             }
@@ -4508,7 +4510,7 @@ pub fn run() {
                             // Send-now (accelerate) can't also deliver this row.
                             let won = {
                                 let conn = db.lock().unwrap();
-                                store::outbox_claim(&conn, id)
+                                store::outbox_claim(&conn, id, &account)
                             };
                             if !won {
                                 continue;
@@ -4516,7 +4518,7 @@ pub fn run() {
                             match deliver_mail(&outbox_handle, &account, &mail).await {
                                 Ok(()) => {
                                     let conn = db.lock().unwrap();
-                                    store::outbox_delete(&conn, id);
+                                    store::outbox_delete(&conn, id, &account);
                                     sent_any = true;
                                 }
                                 Err(e) => {
@@ -4525,13 +4527,13 @@ pub fn run() {
                                         classify_sync_error(&outbox_handle, &account, &e).await;
                                     let attempts = {
                                         let conn = db.lock().unwrap();
-                                        store::outbox_unclaim(&conn, id);
+                                        store::outbox_unclaim(&conn, id, &account);
                                         // auth failures park without burning
                                         // attempts — the message isn't at fault
                                         if auth_dead {
                                             0
                                         } else {
-                                            store::outbox_bump_attempts(&conn, id)
+                                            store::outbox_bump_attempts(&conn, id, &account)
                                         }
                                     };
                                     if attempts == 5 {
@@ -5039,7 +5041,7 @@ mod auth_classification_tests {
         let id = crate::store::outbox_add(&conn, "a@x.test", &mail, 0).unwrap();
         // five failed deliveries: the row must survive (the old code deleted it)
         for want in 1..=5i64 {
-            assert_eq!(crate::store::outbox_bump_attempts(&conn, id), want);
+            assert_eq!(crate::store::outbox_bump_attempts(&conn, id, "a@x.test"), want);
         }
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM outbox", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 1, "parked, not destroyed");

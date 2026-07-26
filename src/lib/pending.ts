@@ -26,6 +26,8 @@ export interface PendingMessage {
   /** Outbox row backing a queued send (undo cancels it); null for an
    *  immediate send (Undo Send off). */
   outboxId: number | null;
+  /** The account owning `outboxId` (null whenever outboxId is). */
+  outboxAccount: string | null;
   /** openMessages length when the send fired — the reconcile baseline. */
   baselineCount: number;
 }

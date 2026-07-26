@@ -16,6 +16,7 @@ function pending(over: Partial<PendingMessage>): PendingMessage {
     status: "sending",
     sentAt: null,
     outboxId: 7,
+    outboxAccount: "you@fission.local",
     baselineCount: 2,
     ...over,
   };

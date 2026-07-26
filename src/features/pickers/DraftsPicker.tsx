@@ -24,7 +24,7 @@ export function DraftsPicker() {
   if (drafts === null) return null;
 
   const items: PickerItem[] = drafts.map((d) => {
-    let parsed: Omit<ComposeState, "draftId"> | null = null;
+    let parsed: Omit<ComposeState, "draftId" | "draftAccount"> | null = null;
     try {
       parsed = JSON.parse(d.payload);
     } catch {
@@ -37,7 +37,7 @@ export function DraftsPicker() {
       detail: `${to ? `to ${to} · ` : ""}${fmtWhen(d.updatedAt)}`,
       run: () => {
         if (!parsed) {
-          void backend.deleteDraft(d.id);
+          void backend.deleteDraft(d.id, d.account);
           useUi.getState().showToast("Draft was unreadable — removed");
           return;
         }
@@ -48,6 +48,7 @@ export function DraftsPicker() {
           attachments: parsed.attachments ?? [],
           driveLinks: parsed.driveLinks ?? [],
           draftId: d.id,
+          draftAccount: d.account,
         });
       },
     };

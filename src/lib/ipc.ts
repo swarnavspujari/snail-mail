@@ -12,6 +12,8 @@ import type {
   Contact,
   DailyPhoto,
   DraftEntry,
+  DraftRef,
+  OutboxRef,
   DraftRequest,
   DriveChunkResult,
   DriveFile,
@@ -104,14 +106,16 @@ export interface Backend {
   markRead(id: ThreadId): Promise<void>;
   moveLabel(id: ThreadId, label: string): Promise<void>;
   listLabels(): Promise<string[]>;
-  /** Schedule a send; ~10s delay = the Undo Send window. Returns outbox id. */
-  queueMail(mail: OutgoingMail, delayMs: number): Promise<number>;
+  /** Schedule a send; ~10s delay = the Undo Send window. Returns the row's
+   *  (id, account) — outbox ids are per-account, so both are needed to name it
+   *  again. */
+  queueMail(mail: OutgoingMail, delayMs: number): Promise<OutboxRef>;
   /** Undo Send: reclaim the draft before the outbox flushes. Throws if sent. */
-  cancelOutbox(outboxId: number): Promise<OutgoingMail>;
+  cancelOutbox(outboxId: number, account: string): Promise<OutgoingMail>;
   /** Send immediately, bypassing the outbox — used when Undo Send is off. */
   sendMailNow(mail: OutgoingMail): Promise<void>;
   /** Accelerate a pending send: flush it now instead of waiting the window. */
-  sendOutboxNow(outboxId: number): Promise<void>;
+  sendOutboxNow(outboxId: number, account: string): Promise<void>;
   search(query: string): Promise<SearchResult[]>;
   /** Full-history search: local matches plus a live Gmail search for mail
    *  older than the local cache. Slower than search(); call it debounced. */
@@ -148,10 +152,16 @@ export interface Backend {
   /** Open with the default app. */
   openAttachment(attachmentId: string): Promise<void>;
 
-  /** Persist an unsent draft; pass null id to create. Returns the draft id. */
-  saveDraft(draftId: number | null, payload: string): Promise<number>;
+  /** Persist an unsent draft; pass null id to create. `draftAccount` is the
+   *  owner the last save returned — without it an autosave after an account
+   *  switch would rewrite whatever row carries that id in the active mailbox. */
+  saveDraft(
+    draftId: number | null,
+    draftAccount: string | null,
+    payload: string
+  ): Promise<DraftRef>;
   listDrafts(): Promise<DraftEntry[]>;
-  deleteDraft(draftId: number): Promise<void>;
+  deleteDraft(draftId: number, account: string): Promise<void>;
 
   /** The account's Gmail send-as aliases (read-only; cached at connect). */
   getSendAs(email: string): Promise<SendAsAlias[]>;
@@ -356,16 +366,16 @@ class TauriBackend implements Backend {
     return invoke<string[]>("list_labels");
   }
   queueMail(mail: OutgoingMail, delayMs: number) {
-    return invoke<number>("queue_mail", { mail, delayMs });
+    return invoke<OutboxRef>("queue_mail", { mail, delayMs });
   }
-  cancelOutbox(outboxId: number) {
-    return invoke<OutgoingMail>("cancel_outbox", { outboxId });
+  cancelOutbox(outboxId: number, account: string) {
+    return invoke<OutgoingMail>("cancel_outbox", { outboxId, account });
   }
   sendMailNow(mail: OutgoingMail) {
     return invoke<void>("send_mail_now", { mail });
   }
-  sendOutboxNow(outboxId: number) {
-    return invoke<void>("send_outbox_now", { outboxId });
+  sendOutboxNow(outboxId: number, account: string) {
+    return invoke<void>("send_outbox_now", { outboxId, account });
   }
   search(query: string) {
     return invoke<SearchResult[]>("search_threads", { query });
@@ -444,14 +454,14 @@ class TauriBackend implements Backend {
   openAttachment(attachmentId: string) {
     return invoke<void>("open_attachment", { attachmentId });
   }
-  saveDraft(draftId: number | null, payload: string) {
-    return invoke<number>("save_draft", { draftId, payload });
+  saveDraft(draftId: number | null, draftAccount: string | null, payload: string) {
+    return invoke<DraftRef>("save_draft", { draftId, draftAccount, payload });
   }
   listDrafts() {
     return invoke<DraftEntry[]>("list_drafts");
   }
-  deleteDraft(draftId: number) {
-    return invoke<void>("delete_draft", { draftId });
+  deleteDraft(draftId: number, account: string) {
+    return invoke<void>("delete_draft", { draftId, account });
   }
   getSendAs(email: string) {
     return invoke<SendAsAlias[]>("get_send_as", { email });

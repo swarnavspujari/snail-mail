@@ -123,6 +123,7 @@ export async function startReply(
     attachments: [],
     driveLinks: [],
     draftId: null,
+    draftAccount: null,
     subject:
       mode === "forward"
         ? subject.startsWith("Fwd:")
@@ -236,8 +237,8 @@ export function composeGoToEmail(dir: 1 | -1) {
   // closeCompose keeps (never deletes) the draft, but the last keystrokes may
   // predate the 800ms autosave — flush them so the draft is truly in Drafts.
   if (composeHasContent(c)) {
-    const { draftId, ...payload } = c;
-    void backend.saveDraft(draftId, JSON.stringify(payload)).catch(() => {});
+    const { draftId, draftAccount, ...payload } = c;
+    void backend.saveDraft(draftId, draftAccount, JSON.stringify(payload)).catch(() => {});
   }
   u.closeCompose();
   void m.openThread(t.id);
@@ -291,6 +292,7 @@ export function allCommands(): Command[] {
           attachments: [],
           driveLinks: [],
           draftId: null,
+    draftAccount: null,
         });
       },
     },
@@ -421,6 +423,7 @@ export function allCommands(): Command[] {
             attachments: [],
             driveLinks: [],
             draftId: null,
+    draftAccount: null,
           });
         } else {
           ui().showToast("No unsubscribe link in this thread");
@@ -847,7 +850,8 @@ export function allCommands(): Command[] {
       run: () => {
         const c = ui().compose;
         if (!c) return;
-        if (c.draftId != null) void backend.deleteDraft(c.draftId).catch(() => {});
+        if (c.draftId != null && c.draftAccount != null)
+          void backend.deleteDraft(c.draftId, c.draftAccount).catch(() => {});
         ui().closeCompose();
         ui().showToast("Draft discarded");
       },
@@ -883,7 +887,7 @@ export function allCommands(): Command[] {
         const ps = ui().pendingSend;
         if (!ps) return;
         try {
-          await backend.sendOutboxNow(ps.outboxId);
+          await backend.sendOutboxNow(ps.outboxId, ps.outboxAccount);
           ui().clearPendingSend();
           ui().showToast("Sent");
         } catch (e) {
@@ -1159,9 +1163,9 @@ export function allCommands(): Command[] {
           // isn't worth saving — composeHasContent handles that.
           const c = u.compose;
           if (composeHasContent(c)) {
-            const { draftId, ...payload } = c;
+            const { draftId, draftAccount, ...payload } = c;
             void backend
-              .saveDraft(draftId, JSON.stringify(payload))
+              .saveDraft(draftId, draftAccount, JSON.stringify(payload))
               .then(() => u.showToast("Draft saved"))
               .catch(() => {});
           }

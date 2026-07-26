@@ -2,6 +2,7 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { AccountsState } from "./types";
 import { MockBackend } from "./mock";
+import { DEMO_ACCOUNT, DEMO_ACCOUNT_2 } from "./mock-data";
 
 // The contact panel's mail history: threads a person was actually ON (a
 // sender or recipient), never every message that merely mentions them.
@@ -138,5 +139,76 @@ describe("MockBackend sync:activity", () => {
 
     expect(stages.length).toBeGreaterThan(0);
     expect(new Set(stages)).toEqual(new Set(["resync"]));
+  });
+});
+
+// Draft and outbox ids are per-account autoincrement on the Rust side, so the
+// same number names a different row in every connected mailbox. The mock has
+// to key rows by (id, account) the same way, or the demo silently disagrees
+// with the desktop about which draft "id 1" is.
+describe("MockBackend draft + outbox rows are account-scoped", () => {
+  beforeEach(() => localStorage.clear());
+
+  test("a draft belongs to the account that saved it and is invisible to the other", async () => {
+    const be = new MockBackend();
+    const first = await be.saveDraft(null, null, JSON.stringify({ subject: "for demo" }));
+    expect(first.account).toBe(DEMO_ACCOUNT);
+
+    await be.switchAccount(DEMO_ACCOUNT_2);
+    const second = await be.saveDraft(null, null, JSON.stringify({ subject: "for angel" }));
+    expect(second.account).toBe(DEMO_ACCOUNT_2);
+    expect(await be.listDrafts()).toHaveLength(1);
+
+    // deleting from the wrong account must miss rather than take the neighbour
+    await be.deleteDraft(first.id, DEMO_ACCOUNT_2);
+    await be.switchAccount(DEMO_ACCOUNT);
+    const mine = await be.listDrafts();
+    expect(mine.map((d) => d.id)).toEqual([first.id]);
+    expect(JSON.parse(mine[0].payload).subject).toBe("for demo");
+
+    await be.deleteDraft(first.id, DEMO_ACCOUNT);
+    expect(await be.listDrafts()).toEqual([]);
+  });
+
+  test("saving against another account's id recreates rather than clobbering it", async () => {
+    const be = new MockBackend();
+    const owned = await be.saveDraft(null, null, JSON.stringify({ subject: "keep me" }));
+
+    await be.switchAccount(DEMO_ACCOUNT_2);
+    const reSaved = await be.saveDraft(owned.id, DEMO_ACCOUNT_2, JSON.stringify({ subject: "mine" }));
+    expect(reSaved.account).toBe(DEMO_ACCOUNT_2);
+
+    await be.switchAccount(DEMO_ACCOUNT);
+    const mine = await be.listDrafts();
+    expect(JSON.parse(mine[0].payload).subject).toBe("keep me");
+  });
+
+  test("Undo Send cancels the owning account's queued message, not a same-id neighbour", async () => {
+    vi.useFakeTimers();
+    try {
+      const be = new MockBackend();
+      const mail = (subject: string) => ({
+        threadId: null,
+        to: ["x@y.test"],
+        cc: [],
+        bcc: [],
+        subject,
+        bodyText: "b",
+        bodyHtml: null,
+        replyAll: false,
+        attachments: [],
+      });
+      const a = await be.queueMail(mail("from demo"), 60_000);
+      await be.switchAccount(DEMO_ACCOUNT_2);
+      const b = await be.queueMail(mail("from angel"), 60_000);
+
+      // wrong owner → no such row
+      await expect(be.cancelOutbox(a.id, DEMO_ACCOUNT_2)).rejects.toThrow("already sent");
+      // right owner → the correct payload comes back
+      expect((await be.cancelOutbox(a.id, DEMO_ACCOUNT)).subject).toBe("from demo");
+      expect((await be.cancelOutbox(b.id, DEMO_ACCOUNT_2)).subject).toBe("from angel");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
