@@ -62,8 +62,20 @@ jobs:
           # a stale locked login keyring would block every set_password
           rm -rf "$HOME/.local/share/keyrings"
           # --unlock reads the password from stdin and creates the login keyring
-          # if absent; --components=secrets skips the ssh/gpg agents we never use
-          echo -n "ci-keyring" | gnome-keyring-daemon --unlock --components=secrets
+          # if absent; --components=secrets skips the ssh/gpg agents we never use.
+          #
+          # The password is deliberately EMPTY. A login keyring with a non-empty
+          # password is encrypted with it, and the collection can re-lock during
+          # the run — which surfaced as an intermittent
+          # `org.freedesktop.Secret.Error.IsLocked` on whichever secrets test
+          # happened to write first, with the other five passing. An empty
+          # password stores the keyring unencrypted and it is never re-locked,
+          # which is what we want from a throwaway CI credential store.
+          #
+          # eval-exporting the daemon's output matters too: it prints
+          # GNOME_KEYRING_CONTROL, and clients that cannot see it fall back to
+          # paths that assume a session that is not there.
+          eval "$(printf '' | gnome-keyring-daemon --unlock --components=secrets | sed 's/^/export /')"
           ready=""
           for _ in $(seq 1 40); do
             if dbus-send --session --dest=org.freedesktop.DBus --type=method_call \
