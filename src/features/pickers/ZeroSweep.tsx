@@ -1,8 +1,6 @@
 import { backend } from "@/lib/ipc";
-import { threadInSplit } from "@/lib/split-query";
 import { pushUndo } from "@/lib/undo";
 import { useMail } from "@/stores/mail";
-import { useSettings } from "@/stores/settings";
 import { useUi } from "@/stores/ui";
 import { PickerShell, type PickerItem } from "./PickerShell";
 
@@ -12,45 +10,29 @@ export function ZeroSweep() {
   const run =
     (olderThanDays: number, preserveUnread: boolean, preserveStarred: boolean) =>
     async () => {
-      // Predict the swept set with the same materialized membership the
-      // backend applies, so a single undo entry can bring all of it back.
-      const m = useMail.getState();
-      const st = useSettings.getState();
-      const cutoff = Date.now() - olderThanDays * 86_400_000;
-      const swept = m.inbox
-        .filter(
-          (t) =>
-            t.snoozedUntil === null &&
-            (olderThanDays === 0 || t.lastDate <= cutoff) &&
-            !(preserveUnread && t.unread) &&
-            !(preserveStarred && t.starred) &&
-            (m.listView !== "inbox" ||
-              threadInSplit(t, m.activeSplitId, st.settings.splits, st.accounts.active))
-        )
-        .map((t) => t.id);
-
-      const n = await useMail.getState().bulkArchive({
+      // The sweep covers the whole split, so the undo set comes back FROM the
+      // backend. Predicting it here from `inbox` (the loaded page) is what made
+      // "Z restores all" a lie the moment a split outgrew the display window.
+      const { archived, ids } = await useMail.getState().bulkArchive({
         olderThanDays,
         preserveUnread,
         preserveStarred,
       });
-      if (swept.length > 0) {
+      if (ids.length > 0) {
         pushUndo({
           label: "Get Me To Zero",
           run: async () => {
-            for (const id of swept) {
-              await backend.moveToInbox(id);
-            }
+            const restored = await backend.bulkMoveToInbox(ids);
             await useMail.getState().refresh();
             useUi
               .getState()
-              .showToast(`Restored ${swept.length} conversation${swept.length === 1 ? "" : "s"}`);
+              .showToast(`Restored ${restored} conversation${restored === 1 ? "" : "s"}`);
           },
         });
       }
       useUi
         .getState()
-        .showToast(`Archived ${n} conversation${n === 1 ? "" : "s"} — Z restores all`);
+        .showToast(`Archived ${archived} conversation${archived === 1 ? "" : "s"} — Z restores all`);
       await useUi.getState().checkInboxZero();
     };
 

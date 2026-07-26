@@ -576,6 +576,17 @@ pub struct BulkArchiveOpts {
     pub preserve_starred: bool,
 }
 
+/// What a sweep actually moved. The ids matter as much as the count: the sweep
+/// covers the whole split now, so the UI can no longer reconstruct the swept
+/// set from the threads it had loaded, and undo would silently restore only
+/// the visible slice.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct BulkArchiveResult {
+    pub archived: i64,
+    pub ids: Vec<String>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct TestResult {

@@ -23,6 +23,7 @@ const STAGE_LABEL: Record<SyncStage, string> = {
   crawl: "Indexing",
   resync: "Repairing",
   "load-older": "Loading",
+  sweep: "Archiving",
 };
 
 /** Identity of a pass. A pass is one account moving through one stage, so a

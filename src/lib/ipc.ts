@@ -62,6 +62,15 @@ export interface BulkArchiveOpts {
   preserveStarred: boolean;
 }
 
+/** What a sweep moved. The sweep covers the whole split now, not the loaded
+ *  page, so the UI can no longer reconstruct the swept set from `inbox` — undo
+ *  needs the ids the backend actually archived or it restores only the slice
+ *  that happened to be on screen. */
+export interface BulkArchiveResult {
+  archived: number;
+  ids: ThreadId[];
+}
+
 export interface DraftStreamHandlers {
   onChunk: (text: string) => void;
   onDone: () => void;
@@ -127,7 +136,10 @@ export interface Backend {
   /** Fetch the next older page of a paged view (done/starred/trash) from
    *  Gmail. Returns how many new threads were added. */
   loadOlder(view: MailView): Promise<number>;
-  bulkArchive(opts: BulkArchiveOpts): Promise<number>;
+  bulkArchive(opts: BulkArchiveOpts): Promise<BulkArchiveResult>;
+  /** Undo a sweep: restore an exact set of threads. Chunked backend-side, so
+   *  this is one call rather than one call per conversation. */
+  bulkMoveToInbox(ids: ThreadId[]): Promise<number>;
 
   /** Drive picker: recents (empty query) or name/full-text search. */
   driveSearch(query: string): Promise<DriveFile[]>;
@@ -390,7 +402,10 @@ class TauriBackend implements Backend {
     return invoke<number>("load_older", { view });
   }
   bulkArchive(opts: BulkArchiveOpts) {
-    return invoke<number>("bulk_archive", { opts });
+    return invoke<BulkArchiveResult>("bulk_archive", { opts });
+  }
+  bulkMoveToInbox(ids: ThreadId[]) {
+    return invoke<number>("bulk_move_to_inbox", { threadIds: ids });
   }
   driveSearch(query: string) {
     return invoke<{ files: DriveFile[]; nextPageToken: string | null }>(

@@ -418,7 +418,11 @@ export type SyncStage =
   | "incremental"
   | "crawl"
   | "resync"
-  | "load-older";
+  | "load-older"
+  // "Get me to zero" draining a split. The one stage that isn't downloading:
+  // it reports local archive progress, because sweeping a large split takes
+  // long enough that silence reads as a hang.
+  | "sweep";
 
 /** Live download activity — "Downloading 17 of 30…". Distinct from
  *  SyncProgress: that measures long-term crawl COMPLETENESS from persisted

@@ -176,7 +176,7 @@ fn now_ms() -> i64 {
 }
 
 fn is_mock_id(id: &str) -> bool {
-    id.starts_with("t-") || id.starts_with("t2-")
+    store::is_demo_thread_id(id)
 }
 
 fn valid_id(id: &str) -> Result<(), String> {
@@ -336,11 +336,15 @@ async fn start_oauth(
     };
 
     // Parked sends from a dead-grant window get fresh attempts now that the
-    // grant is back — the outbox pump picks them up on its next beat.
+    // grant is back — the outbox pump picks them up on its next beat. A sweep's
+    // queued archives park the same way and are released here too, otherwise a
+    // sweep that spanned a dead grant would leave those threads back in the
+    // inbox at the next reconcile with nothing left to retry them.
     {
         let db = state.account_db(&email)?;
         let conn = db.lock().unwrap();
         store::outbox_reset_attempts(&conn, &email);
+        store::remote_ops_reset_attempts(&conn, &email);
     }
     let session = GmailSession::new_connected(email.clone(), outcome.access_token, outcome.expires_in)
         .ok_or("keychain readback failed")?;
@@ -3597,61 +3601,112 @@ async fn move_label(
     Ok(())
 }
 
+/// How many threads one sweep chunk moves. Small enough that the DB lock is
+/// held for a few milliseconds at a time (the crawl-beat pattern), large enough
+/// that a 20k sweep isn't 20k round trips through the lock.
+const SWEEP_CHUNK: usize = 200;
+
+/// "Get me to zero" — archive a whole split.
+///
+/// Through v0.23 this read the newest 500 threads and filtered them in Rust,
+/// while the tab beside the button counted the entire mailbox in SQL. Anything
+/// larger than the window archived 500 and left the tab unchanged, so the
+/// button read as broken. The predicate now lives in the store next to
+/// `split_counts` and the work is chunked until the split is genuinely empty.
+///
+/// Returns the ids as well as the count: undo can no longer reconstruct the
+/// swept set from what the UI had on screen, because the sweep is no longer
+/// bounded by what the UI had on screen.
 #[tauri::command]
 async fn bulk_archive(
     app: AppHandle,
     state: State<'_, AppState>,
     opts: BulkArchiveOpts,
+) -> Result<BulkArchiveResult, String> {
+    let active = state.active_email();
+    let db = state.account_db(&active)?;
+
+    // A sweep of the catch-all has to include rows the classifier hasn't
+    // reached (split_id IS NULL): threadInSplit files them there, so that is
+    // where the owner is looking at them.
+    let include_unclassified = match &opts.split_id {
+        Some(id) => {
+            let specs = crate::splits::compile(&state.dbs.split_defs(), &active);
+            *id == crate::splits::catch_all_id(&specs)
+        }
+        None => true, // sweeping every split leaves nothing behind by definition
+    };
+    let filter = store::SweepFilter {
+        split_id: opts.split_id.as_deref(),
+        include_unclassified,
+        before_ms: (opts.older_than_days > 0)
+            .then(|| now_ms() - opts.older_than_days * 24 * 3_600_000),
+        preserve_unread: opts.preserve_unread,
+        preserve_starred: opts.preserve_starred,
+    };
+
+    // One indexed COUNT up front so the progress pill has an honest
+    // denominator instead of counting up to a number nobody knows.
+    let total = { store::count_sweep_targets(&db.lock().unwrap(), &active, &filter)? } as usize;
+    let gate = ActivityGate::new();
+    let tick = |done: usize| {
+        let t = mail::sync::SyncTick {
+            account: active.clone(),
+            stage: mail::sync::SyncStage::Sweep,
+            done,
+            total,
+        };
+        if gate.allows(&t) {
+            emit_sync_activity(&app, t);
+        }
+    };
+
+    let mut ids: Vec<String> = Vec::with_capacity(total);
+    loop {
+        // Lock, move one chunk, unlock. Each chunk archives locally AND queues
+        // its Gmail archive in one transaction, so a kill mid-sweep can't leave
+        // a thread archived here and still in the inbox on the server.
+        let page = { store::sweep_once(&db.lock().unwrap(), &active, &filter, SWEEP_CHUNK)? };
+        if page.is_empty() {
+            break;
+        }
+        ids.extend(page);
+        tick(ids.len());
+        // Repaint per chunk so the list visibly drains, the way the fetching
+        // paths repaint every REPAINT_EVERY threads. A sweep that redraws only
+        // at the end looks frozen for the whole of a large split.
+        emit_mail_updated(&app);
+        // Let the UI (and the queue drain) breathe between chunks.
+        tokio::task::yield_now().await;
+    }
+    // Terminal beat: the pill fades instead of freezing mid-count. Also fires
+    // for an empty sweep, which has to clear whatever the last pass left up.
+    tick(total.max(ids.len()));
+
+    emit_mail_updated(&app);
+    badge::refresh(&app);
+    Ok(BulkArchiveResult { archived: ids.len() as i64, ids })
+}
+
+/// Undo for the sweep: put an exact set of threads back and queue the Gmail
+/// un-archive. Takes the ids `bulk_archive` returned rather than re-deriving a
+/// set, so "Z restores all" is true at any size.
+#[tauri::command]
+async fn bulk_move_to_inbox(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    thread_ids: Vec<String>,
 ) -> Result<i64, String> {
     let active = state.active_email();
     let db = state.account_db(&active)?;
-    let targets = { store::inbox_threads_for_sweep(&db.lock().unwrap(), &active)? };
-    let cutoff = now_ms() - opts.older_than_days * 24 * 3_600_000;
-    let mut ids: Vec<String> = vec![];
-    for t in targets {
-        if opts.older_than_days > 0 && t.last_date > cutoff {
-            continue;
-        }
-        if opts.preserve_unread && t.unread {
-            continue;
-        }
-        if opts.preserve_starred && t.starred {
-            continue;
-        }
-        if let Some(split_id) = &opts.split_id {
-            // Membership is the materialized split_id column — the same value
-            // the UI renders, so the sweep can never disagree with the tabs.
-            if t.split != *split_id && !t.also_in.contains(split_id) {
-                continue;
-            }
-        }
-        ids.push(t.id);
-    }
-    // Local writes are synchronous (instant); archive on Gmail in the background.
-    {
-        let conn = db.lock().unwrap();
-        for id in &ids {
-            store::set_in_inbox(&conn, id, false)?;
-        }
-    }
-    let n = ids.len() as i64;
-    let remote_ids: Vec<String> = ids.into_iter().filter(|id| !is_mock_id(id)).collect();
-    if !remote_ids.is_empty() {
-        let app2 = app.clone();
-        tauri::async_runtime::spawn(async move {
-            let state = app2.state::<AppState>();
-            let mut sessions = state.gmail.lock().await;
-            if let Some(sess) = sessions.get_mut(&active) {
-                for id in remote_ids {
-                    if let Err(e) = sess.modify_thread(&state.http, &id, &[], &["INBOX"]).await {
-                        eprintln!("[bulk_archive:{active}] {id}: {e}");
-                    }
-                }
-            }
-        });
+    let mut restored = 0i64;
+    for chunk in thread_ids.chunks(SWEEP_CHUNK) {
+        restored += { store::unsweep_once(&db.lock().unwrap(), &active, chunk)? } as i64;
+        tokio::task::yield_now().await;
     }
     emit_mail_updated(&app);
-    Ok(n)
+    badge::refresh(&app);
+    Ok(restored)
 }
 
 /// Reclassify stored threads in the background — chunked so each DB lock hold
@@ -4554,6 +4609,91 @@ pub fn run() {
                 }
             });
 
+            // remote-ops drain: the Gmail half of "Get me to zero". A sweep can
+            // owe the server tens of thousands of archives, so the work is
+            // queued in SQLite and drained here at a steady drip that survives
+            // restarts. Without this every request the app closed before
+            // sending became a thread reconcile dragged back into the inbox —
+            // the sweep appearing to undo itself hours later.
+            let ops_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    let state = ops_handle.state::<AppState>();
+                    if state.migrating.load(Ordering::SeqCst) {
+                        continue;
+                    }
+                    let mut drained_any = false;
+                    let snapshot = { store::get_accounts(&state.global().lock().unwrap()) };
+                    for email in state.dbs.registered_emails() {
+                        // Same parking rule as the outbox: a dead grant holds
+                        // the queue instead of burning attempts against it.
+                        let deliverable = snapshot.accounts.iter().any(|a| {
+                            a.email == email && !a.removing && a.connected && a.provider == "gmail"
+                        });
+                        if !deliverable {
+                            continue;
+                        }
+                        let Ok(db) = state.account_db(&email) else { continue };
+                        let due = {
+                            let conn = db.lock().unwrap();
+                            store::remote_ops_due(&conn, &email, 25)
+                        };
+                        for (id, thread_id, op) in due {
+                            let won = {
+                                let conn = db.lock().unwrap();
+                                store::remote_op_claim(&conn, id)
+                            };
+                            if !won {
+                                continue;
+                            }
+                            // Archive removes INBOX; un-archive puts it back.
+                            let (add, remove): (&[&str], &[&str]) = match op {
+                                store::RemoteOp::Archive => (&[], &["INBOX"]),
+                                store::RemoteOp::Unarchive => (&["INBOX"], &[]),
+                            };
+                            let result = {
+                                let mut sessions = state.gmail.lock().await;
+                                match sessions.get_mut(&email) {
+                                    Some(sess) => {
+                                        sess.modify_thread(&state.http, &thread_id, add, remove)
+                                            .await
+                                    }
+                                    None => Err("account not connected".into()),
+                                }
+                            };
+                            match result {
+                                Ok(()) => {
+                                    let conn = db.lock().unwrap();
+                                    store::remote_op_delete(&conn, id);
+                                    drained_any = true;
+                                }
+                                Err(e) => {
+                                    let auth_dead =
+                                        classify_sync_error(&ops_handle, &email, &e).await;
+                                    let conn = db.lock().unwrap();
+                                    store::remote_op_unclaim(&conn, id);
+                                    if !auth_dead {
+                                        let attempts = store::remote_op_bump_attempts(&conn, id);
+                                        if attempts == 5 {
+                                            eprintln!(
+                                                "[remote-ops:{email}] {thread_id} parked after 5 tries: {e}"
+                                            );
+                                        }
+                                    }
+                                    // One bad grant means the rest of this
+                                    // account's queue will fail identically.
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if drained_any {
+                        emit_mail_updated(&ops_handle);
+                    }
+                }
+            });
+
             // Split the legacy db first (progress-visible, resumable), then the
             // forced boot reconcile — the split never races live sync writes.
             let boot = app.handle().clone();
@@ -4866,6 +5006,7 @@ pub fn run() {
             mark_read,
             move_label,
             bulk_archive,
+            bulk_move_to_inbox,
             queue_mail,
             cancel_outbox,
             send_mail_now,

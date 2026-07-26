@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { backend, type MailView } from "@/lib/ipc";
+import { backend, type BulkArchiveResult, type MailView } from "@/lib/ipc";
 import { threadInSplit } from "@/lib/split-query";
 import { reconcilePendingMessages, type PendingMessage } from "@/lib/pending";
 import { useSettings } from "./settings";
@@ -113,7 +113,7 @@ interface MailState {
     olderThanDays: number;
     preserveUnread: boolean;
     preserveStarred: boolean;
-  }) => Promise<number>;
+  }) => Promise<BulkArchiveResult>;
 }
 
 /** Threads of the given split. Membership is the backend-materialized
@@ -532,11 +532,11 @@ export const useMail = create<MailState>((set, get) => ({
 
   bulkArchive: async (opts) => {
     const s = get();
-    const n = await backend.bulkArchive({
+    const result = await backend.bulkArchive({
       splitId: s.listView === "inbox" ? s.activeSplitId : null,
       ...opts,
     });
     await get().refresh();
-    return n;
+    return result;
   },
 }));
