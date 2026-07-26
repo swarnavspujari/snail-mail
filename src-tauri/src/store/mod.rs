@@ -1646,17 +1646,6 @@ pub fn remote_ops_reset_attempts(conn: &Connection, account_id: &str) {
     );
 }
 
-/// How much of a sweep Gmail still owes us. Non-zero after a large sweep is
-/// normal — it means the drain is still working through the queue.
-pub fn remote_ops_pending(conn: &Connection, account_id: &str) -> i64 {
-    conn.query_row(
-        "SELECT COUNT(*) FROM remote_ops WHERE account_id = ?1",
-        params![account_id],
-        |r| r.get(0),
-    )
-    .unwrap_or(0)
-}
-
 /// Trash = remove the thread from the local cache entirely (Gmail keeps it
 /// recoverable server-side for 30 days).
 pub fn delete_thread(conn: &Connection, id: &str) -> Result<(), String> {
@@ -2933,7 +2922,7 @@ mod tests {
         assert_eq!(travel(), 0, "the number the owner is staring at reaches zero");
         assert_eq!(count_sweep_targets(&conn, ACCT, &f).unwrap(), 0);
         // and Gmail's half is queued, not lost with the process
-        assert_eq!(remote_ops_pending(&conn, ACCT), N as i64);
+        assert_eq!(remote_ops_due(&conn, ACCT, 10_000).len(), N);
     }
 
     /// The preserve options must mean "exempt from the sweep", not "absent from
