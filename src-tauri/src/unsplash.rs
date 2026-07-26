@@ -14,8 +14,10 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-// SNAIL_* preferred; the legacy FISSION_* name keeps the existing CI repo
-// secret working through the rename.
+// SNAIL_* is the name the workflow sets. The FISSION_* arm is kept only so a
+// locally-exported legacy env still builds — it was once justified as
+// "keeps the existing CI repo secret working", but no such secret ever existed,
+// which is precisely how an empty key shipped unnoticed.
 // `present` collapses a set-but-empty build env to None — CI renders a missing
 // `${{ secrets.X }}` as "", and Some("") would defeat the keychain fallback
 // below and send Unsplash an empty key (a 401, and no daily photo, silently).
@@ -30,7 +32,12 @@ const KV_HOURLY: &str = "unsplash:hourly";
 pub const DAY_MS: i64 = 86_400_000;
 const HOUR_MS: i64 = 3_600_000;
 const HOURLY_CAP: usize = 50;
-const UTM: &str = "utm_source=fission_mail&utm_medium=referral";
+// Unsplash's API terms require every photo/photographer link to carry the
+// app's own utm_source. This still said `fission_mail` two rebrands later, so
+// every attribution link credited an application name that no longer exists —
+// which is both wrong for the photographer and out of step with the registered
+// app. Must match the Unsplash application's name, not the repo or the binary.
+const UTM: &str = "utm_source=snail_mail&utm_medium=referral";
 
 /// Cached photo + whether its download event already fired.
 #[derive(Serialize, Deserialize, Clone)]
@@ -123,4 +130,23 @@ pub async fn fetch_daily(
         cached_data_uri,
         fetched_at: now_ms,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UTM;
+
+    /// Unsplash's API terms require attribution links to carry the app's own
+    /// utm_source. This string said `fission_mail` through two rebrands — it
+    /// is exactly the kind of literal nobody re-reads, and it is only visible
+    /// in a query string on a photographer's profile link, so nothing surfaces
+    /// it. Pinned to the current brand.
+    #[test]
+    fn attribution_credits_the_current_brand() {
+        assert!(UTM.contains("utm_source=snail_mail"), "stale utm_source: {UTM}");
+        assert!(UTM.contains("utm_medium=referral"));
+        for dead in ["fission", "zenbox"] {
+            assert!(!UTM.to_lowercase().contains(dead), "retired brand in {UTM}");
+        }
+    }
 }
