@@ -81,7 +81,14 @@ jobs:
           # Baked Unsplash Access Key for the daily empty-state photo
           # (optional — builds without it just skip the photo; users can
           # paste their own key in Settings).
-          SNAIL_UNSPLASH_ACCESS_KEY: ${{ secrets.FISSION_UNSPLASH_ACCESS_KEY }}
+          # Named SNAIL_* like the Gmail pair above. It previously read a
+          # FISSION_*-prefixed secret that had never been created, so every
+          # build baked an empty key — which pre-v0.24.1 was sent to Unsplash
+          # as if it were real (401, no photo, no error anywhere). `present()`
+          # now reads empty as absent, so an unset key simply means no daily
+          # photo. Optional by design: unset is a supported state, and users
+          # can paste their own in Settings -> Privacy & keys.
+          SNAIL_UNSPLASH_ACCESS_KEY: ${{ secrets.SNAIL_UNSPLASH_ACCESS_KEY }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "Snail Mail ${{ github.ref_name }}"
