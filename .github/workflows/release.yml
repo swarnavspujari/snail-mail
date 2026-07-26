@@ -34,6 +34,33 @@ jobs:
           workspaces: src-tauri
       - run: npm ci
 
+      # A baked client is optional, but a HALF-baked one is not: an id without
+      # its secret (or either one blank) produces an installer that reports a
+      # configured client and then fails at Google. `present()` now collapses
+      # blanks to None at runtime, so this only has to catch the case where
+      # exactly one of the pair was set — the one silence the code cannot
+      # distinguish from "no baked client at all".
+      - name: baked OAuth client is whole, or absent
+        shell: bash
+        env:
+          ID: ${{ secrets.SNAIL_GMAIL_CLIENT_ID }}
+          SECRET: ${{ secrets.SNAIL_GMAIL_CLIENT_SECRET }}
+        run: |
+          if [ -n "$ID" ] && [ -z "$SECRET" ]; then
+            echo "SNAIL_GMAIL_CLIENT_ID is set but SNAIL_GMAIL_CLIENT_SECRET is empty." >&2
+            echo "This build would ship a client id with no secret. Set both, or neither." >&2
+            exit 1
+          fi
+          if [ -z "$ID" ] && [ -n "$SECRET" ]; then
+            echo "SNAIL_GMAIL_CLIENT_SECRET is set but SNAIL_GMAIL_CLIENT_ID is empty." >&2
+            exit 1
+          fi
+          if [ -n "$ID" ]; then
+            echo "baked OAuth client present (id ends ...${ID: -30})"
+          else
+            echo "no baked OAuth client — installers will ask for one (this is allowed)"
+          fi
+
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -41,12 +68,16 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           # Baked-in beta OAuth client so testers skip the Google-console setup
           # (optional — builds without it still accept pasted credentials).
-          # New env-var names read from the existing repo secrets — the secret
-          # names deliberately keep their historical ZENBOX_*/FISSION_* prefixes
-          # so no repo reconfiguration is needed; the Rust code also falls back
-          # to the legacy FISSION_*/ZENBOX_* env for older builds.
-          SNAIL_GMAIL_CLIENT_ID: ${{ secrets.ZENBOX_GMAIL_CLIENT_ID }}
-          SNAIL_GMAIL_CLIENT_SECRET: ${{ secrets.ZENBOX_GMAIL_CLIENT_SECRET }}
+          #
+          # These read SNAIL_*-named repo secrets directly. They used to be
+          # mapped from ZENBOX_*-prefixed names, justified as "so no repo
+          # reconfiguration is needed" — but those secrets had never actually
+          # existed, so the indirection bought nothing and hid the fact that
+          # every published installer was baking an EMPTY client. A missing
+          # `${{ secrets.X }}` renders as "" rather than leaving the variable
+          # unset, which is what made that invisible (see DECISIONS #141).
+          SNAIL_GMAIL_CLIENT_ID: ${{ secrets.SNAIL_GMAIL_CLIENT_ID }}
+          SNAIL_GMAIL_CLIENT_SECRET: ${{ secrets.SNAIL_GMAIL_CLIENT_SECRET }}
           # Baked Unsplash Access Key for the daily empty-state photo
           # (optional — builds without it just skip the photo; users can
           # paste their own key in Settings).

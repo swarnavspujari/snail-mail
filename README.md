@@ -69,11 +69,11 @@ what `app:dev` / `app:build` run — alias it out of the bundle entirely.
 
 ## Connect Gmail
 
-**You need your own Google OAuth client** (Desktop app type, ~5 minutes) — follow [docs/SETUP.md](docs/SETUP.md), then paste the Client ID + Secret into **Settings → Accounts**. Tokens and the client go straight into the OS keychain, never to disk.
+**Installer builds** carry a shared beta OAuth client baked in at build time, from the `SNAIL_GMAIL_CLIENT_ID` / `SNAIL_GMAIL_CLIENT_SECRET` repo secrets — click **Connect Gmail** and go. A release built without both secrets ships no client and says so; it does not pretend to have one.
 
-Release builds *can* carry a shared beta client baked in at build time, but only when the `SNAIL_GMAIL_CLIENT_ID` / `SNAIL_GMAIL_CLIENT_SECRET` repo secrets are configured. They currently are not, so published installers ship without one and every install needs its own client.
+**Building from source:** bring your own Google OAuth client (Desktop app type, ~5 minutes) — follow [docs/SETUP.md](docs/SETUP.md), then paste the Client ID + Secret into **Settings → Accounts**. The client and every token live in the OS keychain, never on disk.
 
-> **Publish your OAuth consent screen to production (unverified).** While it sits in *Testing*, Google expires every refresh token after **7 days** — so all your accounts drop out weekly with "sign-in expired". One click, no verification submission required; see [docs/GOOGLE_OAUTH.md](docs/GOOGLE_OAUTH.md).
+> **The beta consent screen is deliberately in *Testing*.** Google expires refresh tokens after **7 days** in that state, so expect to hit Reconnect about weekly — that is the configuration working as intended, not a bug. Publishing to production (unverified) removes the weekly expiry and takes one click when the app is ready for wider testers; the trade-offs are in [docs/GOOGLE_OAUTH.md](docs/GOOGLE_OAUTH.md).
 
 ## Add AI keys
 
