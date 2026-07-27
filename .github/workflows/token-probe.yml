@@ -1,0 +1,38 @@
+# TEMPORARY — isolates one variable and then gets deleted.
+#
+# Same POST /releases call, same `permissions: contents: write`, same repo:
+#   - triggered by workflow_dispatch on a branch  -> HTTP 201
+#   - triggered by a tag push (the release path)  -> ??? (403 in release.yml)
+# The tag pattern is zz-probe-* so it can never collide with the release
+# workflow's `v*` trigger.
+name: token-probe
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["zz-probe-*"]
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: can this token publish, on this trigger
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "event=$GITHUB_EVENT_NAME ref=$GITHUB_REF"
+          set +e
+          gh api -X POST "repos/$REPO/releases" \
+            -f tag_name=zz-token-probe -F draft=true -i 2>&1 | head -3
+          echo "exit=$?"
+          set -e
+          id=$(gh api "repos/$REPO/releases" --jq '.[] | select(.tag_name=="zz-token-probe") | .id' || true)
+          if [ -n "$id" ]; then
+            gh api -X DELETE "repos/$REPO/releases/$id" && echo "cleaned up"
+          else
+            echo "nothing created"
+          fi
