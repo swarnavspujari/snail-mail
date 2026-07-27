@@ -92,10 +92,14 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "Snail Mail ${{ github.ref_name }}"
+          # v0.26.0 stopped installing updates unattended (DECISIONS #154), so
+          # "update themselves automatically" is no longer true of anything
+          # from that release onward — it downloads, then waits for you.
           releaseBody: |
             Snail Mail ${{ github.ref_name }} — download the Windows installer
-            below (`Snail.Mail_*_x64-setup.exe`). Existing installs update
-            themselves automatically.
+            below (`Snail.Mail_*_x64-setup.exe`). Existing installs download
+            this in the background and offer to install it; if you never click,
+            it installs when you next quit the app.
           releaseDraft: false
           prerelease: false
           includeUpdaterJson: true
