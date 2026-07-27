@@ -234,7 +234,17 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          exe=$(ls src-tauri/target/release/bundle/nsis/*_x64-setup.exe | head -1)
+          # A glob into an array, not `ls | head -1`: the bundler's own output
+          # is literally "Snail Mail_<v>_x64-setup.exe" — a filename with a
+          # space in it — which is the exact case word-splitting `ls` mangles.
+          shopt -s nullglob
+          matches=(src-tauri/target/release/bundle/nsis/*_x64-setup.exe)
+          if [ ${#matches[@]} -ne 1 ]; then
+            echo "::error::expected exactly one NSIS installer, found ${#matches[@]}" >&2
+            printf '  %s\n' "${matches[@]}" >&2
+            exit 1
+          fi
+          exe="${matches[0]}"
           name="Snail.Mail_${version}_x64-setup.exe"
           cp "$exe" "$name"
           cp "$exe.sig" "$name.sig"
@@ -258,6 +268,11 @@ jobs:
           # node, not jq: node is guaranteed here (setup-node ran), whereas jq
           # is a runner-image convenience. Discovering it missing would cost
           # another full build to find out.
+          #
+          # The single quotes are deliberate: `${REPO}` and `${TAG}` below are
+          # JavaScript template-literal interpolations reading process.env, and
+          # the shell must not touch them.
+          # shellcheck disable=SC2016
           node -e '
             const fs = require("fs");
             const { NAME, VERSION, REPO, GITHUB_REF_NAME: TAG } = process.env;
@@ -367,8 +382,16 @@ jobs:
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
           bundle=src-tauri/target/universal-apple-darwin/release/bundle
-          dmg=$(ls "$bundle"/dmg/*.dmg | head -1)
-          tgz=$(ls "$bundle"/macos/*.app.tar.gz | head -1)
+          # Globs into arrays — the bundle names contain a space ("Snail Mail…").
+          shopt -s nullglob
+          dmgs=("$bundle"/dmg/*.dmg)
+          tgzs=("$bundle"/macos/*.app.tar.gz)
+          if [ ${#dmgs[@]} -ne 1 ] || [ ${#tgzs[@]} -ne 1 ]; then
+            echo "::error::expected one .dmg and one .app.tar.gz, found ${#dmgs[@]} and ${#tgzs[@]}" >&2
+            exit 1
+          fi
+          dmg="${dmgs[0]}"
+          tgz="${tgzs[0]}"
           dmg_name="Snail.Mail_${version}_universal.dmg"
           tgz_name="Snail.Mail_${version}_universal.app.tar.gz"
           cp "$dmg" "$dmg_name"
@@ -406,7 +429,13 @@ jobs:
       - name: verify the signature and the notarization ticket
         run: |
           set -euo pipefail
-          app=$(ls -d src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app | head -1)
+          shopt -s nullglob
+          apps=(src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app)
+          if [ ${#apps[@]} -ne 1 ]; then
+            echo "::error::expected exactly one .app bundle, found ${#apps[@]}" >&2
+            exit 1
+          fi
+          app="${apps[0]}"
           # Deep-verify the signature over every nested binary.
           codesign --verify --deep --strict --verbose=2 "$app"
           # The one that matters: Gatekeeper's own verdict on a downloaded app.
