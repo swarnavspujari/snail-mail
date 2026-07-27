@@ -164,7 +164,6 @@ export function defaultSettings(): Settings {
         hasKey: false,
       },
     ],
-    celebrationDir: null,
     shortcuts: { ...DEFAULT_SHORTCUTS },
     signatures: {},
     theme: "dark",
@@ -186,10 +185,3 @@ export function defaultSettings(): Settings {
 export function defaultKnowledgeBase(): KnowledgeBase {
   return { instructions: "", snippets: [], voiceExamples: [] };
 }
-
-export const BUNDLED_CELEBRATIONS = [
-  "/inbox-zero/dawn-ridge.svg",
-  "/inbox-zero/quiet-lake.svg",
-  "/inbox-zero/night-dunes.svg",
-  "/inbox-zero/aurora-field.svg",
-];

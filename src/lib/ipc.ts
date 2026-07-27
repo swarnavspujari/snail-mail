@@ -256,7 +256,6 @@ export interface Backend {
 
   getStreaks(): Promise<Streaks>;
   recordZero(splitId: string): Promise<ZeroEvent | null>;
-  listCelebrationImages(): Promise<string[]>;
 
   /** Backend pushes when sync/reminders change mail state. Returns unsubscribe. */
   onMailUpdated(cb: () => void): () => void;
@@ -613,9 +612,6 @@ class TauriBackend implements Backend {
   }
   recordZero(splitId: string) {
     return invoke<ZeroEvent | null>("record_zero", { splitId });
-  }
-  listCelebrationImages() {
-    return invoke<string[]>("list_celebration_images");
   }
   onMailUpdated(cb: () => void): () => void {
     const un = listen("mail:updated", cb);

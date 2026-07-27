@@ -234,18 +234,6 @@ export const PREF_ROWS: PrefRow[] = [
     ],
     keywords: "semantic vector search meaning",
   },
-
-  // ------------------------------------------------------------- Inbox zero
-  {
-    id: "celebrationDir",
-    label: "Photo folder",
-    help: "Point at your own images instead of the daily photo. Empty uses the bundled set.",
-    pane: "zero",
-    section: "Rest photo",
-    control: "text",
-    key: "celebrationDir",
-    keywords: "celebration images pictures unsplash folder",
-  },
 ];
 
 export function prefsFor(pane: PaneId, section: string): PrefRow[] {

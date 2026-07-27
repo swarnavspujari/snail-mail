@@ -7,7 +7,7 @@ UI (React + TS + Zustand + Tailwind)  ──IPC (Tauri invoke/Channel/events)─
   features/compose    Compose + streaming AI bar                               mail/sync.rs    Server⇄SQLite reconcile
   features/palette    Ctrl+K command palette                                   mail/mock.rs    Demo fixtures
   features/settings   Account / AI keys / KB / splits / shortcuts              ai/context.rs   Context Assembler
-  features/zero       Celebration + streaks                                    ai/anthropic.rs Claude adapter (SSE)
+  components/RestState Inbox-zero photo + streak                               ai/anthropic.rs Claude adapter (SSE)
   lib/keyboard.ts     Chord-capable key engine                                 ai/openai.rs    OpenAI + NIM adapter
   lib/commands.ts     Single action registry                                   store/          Per-account SQLite + FTS5 + vec
   lib/ipc.ts          Backend seam (Tauri ⇄ browser mock)                      secrets/        OS keychain

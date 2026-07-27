@@ -10,7 +10,7 @@ export interface Binding {
   expr: string;
   run: () => void;
   when?: () => boolean;
-  /** Fire even while an overlay (palette/picker/celebration) is open. */
+  /** Fire even while an overlay (palette/picker/event popover) is open. */
   bypassOverlays?: boolean;
   /** Precomputed expr.split("|") (filled lazily, once per binding). */
   alts?: string[];

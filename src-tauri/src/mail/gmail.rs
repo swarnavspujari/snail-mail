@@ -599,8 +599,14 @@ pub async fn hydrate_body_data(
 fn collect_body_att_paths(part: &Value, prefix: &[usize], out: &mut Vec<(Vec<usize>, String)>) {
     let mime = part["mimeType"].as_str().unwrap_or_default();
     let filename = part["filename"].as_str().unwrap_or_default();
-    let has_cid = header(part, "Content-ID").or_else(|| header(part, "Content-Id")).is_some();
-    let is_body = filename.is_empty() && !has_cid && (mime == "text/html" || mime == "text/plain");
+    // Every text part is a body candidate, including one the sender labelled
+    // with a `name=`/`filename=` parameter or a Content-ID. walk_parts files
+    // labelled parts under attachments, but parse_gmail_message falls back to
+    // them when a message has no unlabelled body — so their bytes have to be
+    // hydrated here or that fallback has nothing to read. The extra fetch only
+    // reaches messages that ship a text/* attachment (a few dozen in a
+    // 100k-message mailbox) and is capped like any other body.
+    let is_body = !is_ics_mime(mime, filename) && (mime == "text/html" || mime == "text/plain");
     // Calendar invites whose ICS rides only as an attachment (invite.ics with
     // no inline data) hydrate too, so the invite parse sees the payload —
     // but only plausibly-sized ones (the part's declared size is known here;
@@ -797,6 +803,39 @@ fn walk_parts(
     }
 }
 
+/// Second-pass body hunt, for messages whose body part carries a label.
+///
+/// `walk_parts` files any part with a filename or a Content-ID under
+/// attachments. That is right for an inline image and wrong for the senders
+/// that hang a `name=` parameter or a Content-ID on the text/html alternative
+/// itself — LinkedIn's bulk mail, several ESPs, and a scattering of desktop
+/// clients. Worse, such a part with no `attachmentId` lands nowhere at all:
+/// not a body, and not an attachment row either, because there is nothing to
+/// fetch. The message persists blank and every reopen re-runs the same parse,
+/// so the on-open heal can never rescue it.
+///
+/// This pass ignores the labels and takes the first decodable text part. It
+/// runs only when the first pass found no body whatsoever, so every message
+/// that parses today parses identically — the only ones it can reach are the
+/// ones that would otherwise render empty. Calendar parts stay excluded so an
+/// invite's raw VCALENDAR never poses as prose.
+fn walk_body_fallback(part: &Value, text: &mut Option<String>, html: &mut Option<String>) {
+    let mime = part["mimeType"].as_str().unwrap_or_default();
+    let filename = part["filename"].as_str().unwrap_or_default();
+    if !is_ics_mime(mime, filename) {
+        if mime == "text/plain" && text.is_none() {
+            *text = decode_body(part);
+        } else if mime == "text/html" && html.is_none() {
+            *html = decode_body(part);
+        }
+    }
+    if let Some(children) = part["parts"].as_array() {
+        for child in children {
+            walk_body_fallback(child, text, html);
+        }
+    }
+}
+
 pub fn parse_gmail_message(msg: &Value, thread_id: &str) -> ParsedMessage {
     let payload = &msg["payload"];
     let id = msg["id"].as_str().unwrap_or_default().to_string();
@@ -823,6 +862,11 @@ pub fn parse_gmail_message(msg: &Value, thread_id: &str) -> ParsedMessage {
     let mut raw_atts = vec![];
     let mut ics = None;
     walk_parts(payload, &mut text, &mut html, &mut raw_atts, &mut ics);
+    // A labelled body part is invisible to walk_parts (see walk_body_fallback).
+    // Ask only when nothing came back, so nothing that already works changes.
+    if text.is_none() && html.is_none() {
+        walk_body_fallback(payload, &mut text, &mut html);
+    }
     let body_text = text
         .clone()
         .or_else(|| html.as_deref().map(strip_html))
@@ -947,5 +991,206 @@ fn body_section(mail: &OutgoingMail) -> String {
                 mail.body_text, html
             )
         }
+    }
+}
+
+// --------------------------------------------------------------------- tests
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn data(s: &str) -> Value {
+        json!({ "size": s.len(), "data": B64URL.encode(s.as_bytes()) })
+    }
+
+    /// A part whose bytes Gmail withheld: no data, fetchable by attachmentId.
+    fn behind_attachment(size: usize, att_id: &str) -> Value {
+        json!({ "size": size, "data": "", "attachmentId": att_id })
+    }
+
+    fn message(payload: Value) -> Value {
+        json!({
+            "id": "m1",
+            "internalDate": "1700000000000",
+            "snippet": "a snippet Gmail computed from the body",
+            "labelIds": ["INBOX"],
+            "payload": payload,
+        })
+    }
+
+    fn headers(pairs: &[(&str, &str)]) -> Value {
+        Value::Array(pairs.iter().map(|(n, v)| json!({ "name": n, "value": v })).collect())
+    }
+
+    fn envelope() -> Value {
+        headers(&[
+            ("From", "News <editors-noreply@example.com>"),
+            ("To", "reader@example.com"),
+            ("Subject", "Employers turn to backdoor references"),
+        ])
+    }
+
+    #[test]
+    fn a_plain_multipart_alternative_is_unaffected() {
+        let msg = message(json!({
+            "mimeType": "multipart/alternative",
+            "filename": "",
+            "headers": envelope(),
+            "parts": [
+                { "mimeType": "text/plain", "filename": "", "body": data("hello in text") },
+                { "mimeType": "text/html", "filename": "", "body": data("<p>hello in html</p>") },
+            ],
+        }));
+        let p = parse_gmail_message(&msg, "t1");
+        assert_eq!(p.message.body_text, "hello in text");
+        assert_eq!(p.message.body_html.as_deref(), Some("<p>hello in html</p>"));
+        assert!(p.attachments.is_empty());
+    }
+
+    #[test]
+    fn a_body_part_labelled_with_a_content_id_still_renders() {
+        // The shape behind ~490 blank messages in a real mailbox: the sender
+        // hangs a Content-ID on the body parts themselves. They carry no
+        // attachmentId, so walk_parts' attachment branch drops them entirely.
+        let msg = message(json!({
+            "mimeType": "multipart/alternative",
+            "filename": "",
+            "headers": envelope(),
+            "parts": [
+                {
+                    "mimeType": "text/plain",
+                    "filename": "",
+                    "headers": headers(&[("Content-ID", "<text-part>")]),
+                    "body": data("the plain text body"),
+                },
+                {
+                    "mimeType": "text/html",
+                    "filename": "",
+                    "headers": headers(&[("Content-ID", "<html-part>")]),
+                    "body": data("<p>the html body</p>"),
+                },
+            ],
+        }));
+        let p = parse_gmail_message(&msg, "t1");
+        assert_eq!(p.message.body_text, "the plain text body");
+        assert_eq!(p.message.body_html.as_deref(), Some("<p>the html body</p>"));
+        // A labelled part with no attachmentId is not fetchable, so it must not
+        // masquerade as an attachment chip either.
+        assert!(p.attachments.is_empty());
+    }
+
+    #[test]
+    fn a_body_part_labelled_with_a_name_parameter_still_renders() {
+        // Gmail surfaces `Content-Type: text/html; name="message.html"` as a
+        // filename, which the same branch treats as an attachment.
+        let msg = message(json!({
+            "mimeType": "multipart/alternative",
+            "filename": "",
+            "headers": envelope(),
+            "parts": [
+                { "mimeType": "text/html", "filename": "message.html", "body": data("<p>bulk mail</p>") },
+            ],
+        }));
+        let p = parse_gmail_message(&msg, "t1");
+        assert_eq!(p.message.body_html.as_deref(), Some("<p>bulk mail</p>"));
+        assert_eq!(p.message.body_text, "bulk mail");
+    }
+
+    #[test]
+    fn a_real_attachment_never_displaces_a_body_that_parsed() {
+        let msg = message(json!({
+            "mimeType": "multipart/mixed",
+            "filename": "",
+            "headers": envelope(),
+            "parts": [
+                { "mimeType": "text/html", "filename": "", "body": data("<p>see attached</p>") },
+                {
+                    "mimeType": "text/plain",
+                    "filename": "notes.txt",
+                    "body": behind_attachment(64, "ANGjdJ-notes"),
+                },
+            ],
+        }));
+        let p = parse_gmail_message(&msg, "t1");
+        assert_eq!(p.message.body_html.as_deref(), Some("<p>see attached</p>"));
+        assert_eq!(p.message.body_text, "see attached");
+        assert_eq!(p.attachments.len(), 1);
+        assert_eq!(p.attachments[0].0.filename, "notes.txt");
+    }
+
+    #[test]
+    fn an_invite_reply_with_no_body_stays_empty() {
+        // "Accepted: <meeting>" carries a text/calendar part and nothing else.
+        // The fallback must not hand the raw VCALENDAR back as prose — a blank
+        // body here is the truth, and the reading pane now says so.
+        let ics = "BEGIN:VCALENDAR\r\nMETHOD:REPLY\r\nEND:VCALENDAR";
+        let msg = message(json!({
+            "mimeType": "multipart/mixed",
+            "filename": "",
+            "headers": envelope(),
+            "parts": [
+                { "mimeType": "text/calendar", "filename": "invite.ics", "body": data(ics) },
+            ],
+        }));
+        let p = parse_gmail_message(&msg, "t1");
+        assert_eq!(p.message.body_text, "");
+        assert_eq!(p.message.body_html, None);
+        assert_eq!(p.ics.as_deref(), Some(ics));
+    }
+
+    #[test]
+    fn an_attachment_only_message_falls_back_to_its_text_part() {
+        // Nothing else to show, so the attachment's text beats a blank pane.
+        let msg = message(json!({
+            "mimeType": "multipart/mixed",
+            "filename": "",
+            "headers": envelope(),
+            "parts": [
+                { "mimeType": "text/plain", "filename": "transcript.txt", "body": data("the whole message") },
+            ],
+        }));
+        let p = parse_gmail_message(&msg, "t1");
+        assert_eq!(p.message.body_text, "the whole message");
+    }
+
+    #[test]
+    fn hydrate_collects_a_labelled_body_held_behind_an_attachment_id() {
+        // The same bug on the other path: when Gmail withholds a *labelled*
+        // body's bytes, collect_body_att_paths has to list it or the fallback
+        // finds an empty part and the message stays blank.
+        let payload = json!({
+            "mimeType": "multipart/alternative",
+            "filename": "",
+            "parts": [
+                {
+                    "mimeType": "text/html",
+                    "filename": "",
+                    "headers": headers(&[("Content-ID", "<html-part>")]),
+                    "body": behind_attachment(900_000, "ANGjdJ-body"),
+                },
+            ],
+        });
+        let mut out = vec![];
+        collect_body_att_paths(&payload, &[], &mut out);
+        assert_eq!(out, vec![(vec![0], "ANGjdJ-body".to_string())]);
+    }
+
+    #[test]
+    fn hydrate_still_skips_an_oversized_calendar_part() {
+        let payload = json!({
+            "mimeType": "multipart/mixed",
+            "filename": "",
+            "parts": [
+                {
+                    "mimeType": "text/calendar",
+                    "filename": "invite.ics",
+                    "body": behind_attachment(MAX_ICS_BYTES + 1, "ANGjdJ-ics"),
+                },
+            ],
+        });
+        let mut out = vec![];
+        collect_body_att_paths(&payload, &[], &mut out);
+        assert!(out.is_empty());
     }
 }

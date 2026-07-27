@@ -111,7 +111,6 @@ pub struct Settings {
     pub splits: Vec<Split>,
     pub default_ai_provider: String,
     pub providers: Vec<AiProviderConfig>,
-    pub celebration_dir: Option<String>,
     pub shortcuts: std::collections::HashMap<String, String>,
     /// account email -> signature text, appended to outgoing mail
     #[serde(default)]
@@ -564,7 +563,6 @@ pub struct ZeroEvent {
     pub split_id: String,
     pub daily: i64,
     pub weekly: i64,
-    pub image_path: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

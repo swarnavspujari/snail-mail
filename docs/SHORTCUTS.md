@@ -267,7 +267,7 @@ Launch `npm run app:dev`, then:
 12. [ ] `C` → `Ctrl+J` → instruction → draft **streams** in; with text present `Ctrl+J` edits it
 13. [ ] Open a thread → up to 3 Instant Replies; `Tab` previews; `R` inserts
 14. [ ] `?` on a thread → ask a question → streamed answer
-15. [ ] Archive a split to zero → celebration + streak; palette → "Get Me To Zero" works
+15. [ ] Archive a split to zero → rest photo + streak, no overlay; palette → "Get Me To Zero" works
 16. [ ] `/` search finds body text instantly; `Enter` opens the hit
 17. [ ] Settings → AI Providers → **Test connection** OK for each configured provider
 18. [ ] Settings → Knowledge Base → add an instruction → next AI draft complies

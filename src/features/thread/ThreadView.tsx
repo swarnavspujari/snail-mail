@@ -296,11 +296,14 @@ function MessageCard({
         />
       ) : isEmpty ? (
         healTried ? (
-          // Heal ran and the body is still empty — genuinely unavailable (a
-          // body past even the raised hydrate cap, or a fetch that failed).
-          // Offer Gmail rather than spinning forever.
+          // Heal ran and the body is still empty. Usually that is the honest
+          // answer: an "Accepted:"/"Declined:" invite reply carries a
+          // text/calendar part and no prose at all, and the InviteBar above has
+          // already shown the only content there is. The old copy blamed size,
+          // which was a guess — and a wrong one for every invite reply in the
+          // mailbox. Say what is true, and keep the escape hatch.
           <div className="px-[18px] py-3 text-[13px] text-ink-3">
-            This message is too large to preview here.{" "}
+            No message body.{" "}
             <button
               onClick={() =>
                 void openExternal(

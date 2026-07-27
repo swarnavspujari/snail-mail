@@ -61,10 +61,10 @@ screen — desktop builds ship no demo data.
 ## 3. Inbox Zero (45s)
 
 1. `Tab` to a split → `E` everything in it (or palette → *Get Me To Zero*; one `Z` restores the whole sweep).
-2. Full-screen celebration image + day streak appears. Any key dismisses.
+2. The list gives way to the day's photograph, streak bottom-left. No interstitial, nothing to dismiss.
 3. Palette → *Get Me To Zero* on another split → pick a preserve option → toast reports the count.
 
-✅ *DoD: celebration + streak + Get Me To Zero.*
+✅ *DoD: rest photo + streak + Get Me To Zero.*
 
 ## 4. AI drafting — the full loop (2–3 min, needs one key)
 

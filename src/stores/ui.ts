@@ -4,7 +4,7 @@ import { sanitizeUserHtml } from "@/lib/sanitize";
 import { splitThreads, useMail, visibleThreads } from "./mail";
 import { activeSignature, useSettings } from "./settings";
 import type { Recipients } from "@/lib/recipients";
-import type { MailAttachment, MigrationProgress, OutgoingMail, SyncProgress, ThreadId, ZeroEvent } from "@/lib/types";
+import type { MailAttachment, MigrationProgress, OutgoingMail, SyncProgress, ThreadId } from "@/lib/types";
 
 export type Screen = "mail" | "settings" | "search" | "calendar";
 
@@ -237,7 +237,6 @@ interface UiState {
   paletteOpen: boolean;
   picker: Picker;
   compose: ComposeState | null;
-  celebration: ZeroEvent | null;
   toast: string | null;
   /** Background mail-download progress (initial reconcile + history crawl);
    *  drives the "Downloading mail history… N%" footer strip. Null until the
@@ -286,7 +285,6 @@ interface UiState {
   closeCompose: () => void;
   setSettingsTab: (t: string) => void;
   showToast: (msg: string) => void;
-  dismissCelebration: () => void;
   setSuggestions: (s: string[]) => void;
   cycleSuggestion: () => void;
   setAiBarOpen: (open: boolean) => void;
@@ -296,8 +294,8 @@ interface UiState {
   clearPendingSend: () => void;
   setSyncProgress: (p: SyncProgress) => void;
   setMigration: (p: MigrationProgress) => void;
-  /** Called after any archive-ish action: fires the celebration if the
-   *  active split just hit zero. */
+  /** Called after any archive-ish action: banks the streak when the active
+   *  split just hit zero. */
   checkInboxZero: () => Promise<void>;
 }
 
@@ -324,13 +322,12 @@ export interface PendingSend {
 
 let toastTimer: ReturnType<typeof setTimeout> | undefined;
 
-export const useUi = create<UiState>((set, get) => ({
+export const useUi = create<UiState>((set) => ({
   screen: "mail",
   focusRegion: "mail",
   paletteOpen: false,
   picker: "none",
   compose: null,
-  celebration: null,
   toast: null,
   syncProgress: null,
   migration: null,
@@ -401,19 +398,19 @@ export const useUi = create<UiState>((set, get) => ({
     toastTimer = setTimeout(() => set({ toast: null }), 2600);
   },
 
-  dismissCelebration: () => set({ celebration: null }),
-
   checkInboxZero: async () => {
     const mail = useMail.getState();
     if (mail.listView !== "inbox" || !mail.loaded) return;
-    if (get().celebration) return;
     const remaining = splitThreads(mail.inbox, mail.activeSplitId).length;
     if (remaining > 0) return;
-    const event = await backend.recordZero(mail.activeSplitId);
-    if (event) {
-      // refresh streaks shown in settings
+    // Hitting zero used to raise a full-screen illustration over the top. The
+    // inbox-zero screen IS the reward — App swaps the list for RestState (the
+    // daily photo, streak bottom-left) the moment a split empties, and the
+    // overlay only hid it behind bundled placeholder art. So all that is left
+    // here is banking the streak, and reloading settings so the count under
+    // the photo is today's. record_zero is idempotent per day.
+    if (await backend.recordZero(mail.activeSplitId)) {
       void useSettings.getState().load();
-      set({ celebration: event });
     }
   },
 }));
