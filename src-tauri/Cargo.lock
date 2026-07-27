@@ -6597,7 +6597,7 @@ dependencies = [
 
 [[package]]
 name = "snail-mail"
-version = "0.24.2"
+version = "0.25.0"
 dependencies = [
  "ammonia",
  "base64 0.22.1",
