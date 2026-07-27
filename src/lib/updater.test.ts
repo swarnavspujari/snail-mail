@@ -14,7 +14,13 @@ vi.mock("@tauri-apps/plugin-updater", () => updaterApi);
 vi.mock("@tauri-apps/plugin-process", () => processApi);
 vi.mock("@/lib/ipc", () => ({ backend, isTauri: true }));
 
-import { installOnQuit, updatePromptSuppressed, useUpdater } from "./updater";
+import {
+  handleCloseRequest,
+  installOnQuit,
+  updatePromptSuppressed,
+  useUpdater,
+  type CloseRequestDeps,
+} from "./updater";
 import { useUi } from "@/stores/ui";
 
 /** A found update: download() and install() are separate, and we assert on
@@ -171,5 +177,85 @@ describe("updatePromptSuppressed", () => {
     // is not a reason to hide a ready update forever.
     expect(updatePromptSuppressed({ total: 0, done: false })).toBe(false);
     expect(updatePromptSuppressed(null)).toBe(false);
+  });
+});
+
+// The X button. Every case below is one where the OLD handler left the window
+// open with the close already swallowed — press X, nothing happens, press it
+// again, nothing happens, forever. It only ever called destroy() on the branch
+// where the install returned false, which is the one path that already worked
+// (and the only one the old "a failing install never traps the user" test
+// exercised).
+describe("handleCloseRequest", () => {
+  function deps(over: Partial<CloseRequestDeps> = {}) {
+    return {
+      hasPendingUpdate: () => true,
+      sendInFlight: () => false,
+      preventDefault: vi.fn(),
+      install: vi.fn().mockResolvedValue(undefined),
+      destroy: vi.fn().mockResolvedValue(undefined),
+      forceExit: vi.fn().mockResolvedValue(undefined),
+      budgetMs: 50,
+      ...over,
+    };
+  }
+
+  test("with nothing to install it never touches the close at all", async () => {
+    const d = deps({ hasPendingUpdate: () => false });
+    expect(await handleCloseRequest(d)).toBe("close-normally");
+    // Not preventing default is what lets Tauri destroy the window itself.
+    expect(d.preventDefault).not.toHaveBeenCalled();
+    expect(d.install).not.toHaveBeenCalled();
+  });
+
+  test("a live Undo Send window closes normally rather than installing", async () => {
+    const d = deps({ sendInFlight: () => true });
+    expect(await handleCloseRequest(d)).toBe("close-normally");
+    expect(d.preventDefault).not.toHaveBeenCalled();
+  });
+
+  test("an install that succeeds WITHOUT exiting still closes the window", async () => {
+    // THE REPORTED BUG. Windows/NSIS exits inside install(), so the old code
+    // got away with returning true and never calling destroy(). Everywhere
+    // else — and on Windows when the installer declines to launch — the
+    // process lives on, and the window was trapped for good.
+    const d = deps();
+    expect(await handleCloseRequest(d)).toBe("destroyed");
+    expect(d.destroy).toHaveBeenCalledTimes(1);
+  });
+
+  test("an install that never resolves does not hold the window hostage", async () => {
+    const d = deps({ install: vi.fn(() => new Promise<void>(() => {})) });
+    expect(await handleCloseRequest(d)).toBe("destroyed");
+    expect(d.destroy).toHaveBeenCalledTimes(1);
+  });
+
+  test("an install that throws still closes the window", async () => {
+    const d = deps({ install: vi.fn().mockRejectedValue(new Error("boom")) });
+    expect(await handleCloseRequest(d)).toBe("destroyed");
+    expect(d.destroy).toHaveBeenCalledTimes(1);
+  });
+
+  test("the quit is honoured even if destroy() itself fails", async () => {
+    const d = deps({ destroy: vi.fn().mockRejectedValue(new Error("no window")) });
+    expect(await handleCloseRequest(d)).toBe("destroyed");
+    expect(d.forceExit).toHaveBeenCalledTimes(1);
+  });
+
+  test("it takes the close over before doing anything slow", async () => {
+    // preventDefault has to happen synchronously with the decision; deferring
+    // it past an await would let Tauri close the window mid-install.
+    const order: string[] = [];
+    const d = deps({
+      preventDefault: vi.fn(() => order.push("prevent")),
+      install: vi.fn(async () => {
+        order.push("install");
+      }),
+      destroy: vi.fn(async () => {
+        order.push("destroy");
+      }),
+    });
+    await handleCloseRequest(d);
+    expect(order).toEqual(["prevent", "install", "destroy"]);
   });
 });

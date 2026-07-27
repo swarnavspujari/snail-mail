@@ -152,6 +152,72 @@ export async function installOnQuit(): Promise<boolean> {
   }
 }
 
+/** How long a quit-time install gets before we close anyway. Windows' NSIS
+ *  install resolves as soon as the installer is spawned, so this is generous;
+ *  it exists for the install that never resolves at all. */
+export const INSTALL_ON_QUIT_BUDGET_MS = 10_000;
+
+/** Resolves with the promise, or with `undefined` once `ms` has passed. The
+ *  promise is not cancelled — nothing here can cancel a native installer — it
+ *  simply stops being something the user's quit waits on. */
+function withBudget<T>(p: Promise<T>, ms: number): Promise<T | undefined> {
+  return Promise.race([
+    p,
+    new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), ms)),
+  ]);
+}
+
+export type CloseOutcome = "close-normally" | "destroyed";
+
+export interface CloseRequestDeps {
+  hasPendingUpdate: () => boolean;
+  sendInFlight: () => boolean;
+  preventDefault: () => void;
+  install: () => Promise<unknown>;
+  destroy: () => Promise<void>;
+  /** Last resort if even destroy() fails. */
+  forceExit?: () => Promise<void>;
+  budgetMs?: number;
+}
+
+/**
+ * What the X button does.
+ *
+ * The contract that matters, and that the previous version got wrong: Tauri's
+ * `onCloseRequested` wrapper destroys the window itself ONLY when the handler
+ * resolves *without* `preventDefault`. The instant we call preventDefault,
+ * closing the window is OUR job — on every path, not just the happy one.
+ *
+ * The old code called `destroy()` on exactly one branch, the install that
+ * returned false. So an install that resolved *true* without exiting the
+ * process (which is every platform except Windows/NSIS, and Windows too when
+ * the installer declines to launch), or one that never resolved at all, left
+ * the close swallowed and the window open — and every subsequent press ran the
+ * same code and got stuck the same way. The app could not be quit.
+ *
+ * Hence: bounded, and `destroy()` in a `finally`. An install we could not
+ * finish is worth strictly less than the user's ability to close their mail
+ * client — and the update is still pending next launch either way.
+ */
+export async function handleCloseRequest(d: CloseRequestDeps): Promise<CloseOutcome> {
+  if (!d.hasPendingUpdate() || d.sendInFlight()) return "close-normally";
+  d.preventDefault();
+  try {
+    await withBudget(Promise.resolve(d.install()), d.budgetMs ?? INSTALL_ON_QUIT_BUDGET_MS);
+  } catch {
+    // An install that fails must never cost the user their quit.
+  } finally {
+    try {
+      await d.destroy();
+    } catch {
+      // destroy() itself failed — exiting the process is the only honest way
+      // left to honour a quit the user already asked for twice over.
+      await d.forceExit?.();
+    }
+  }
+  return "destroyed";
+}
+
 /** Call once at app boot. Safe in the browser (does nothing). Checks on boot,
  *  every 4h, and when the window regains focus/visibility (throttled), so a user
  *  who reopens the app after a release gets it promptly — and installs a ready
@@ -176,12 +242,28 @@ export function startUpdateChecks(): void {
   void (async () => {
     const { getCurrentWindow } = await import("@tauri-apps/api/window");
     const win = getCurrentWindow();
+    // A press while the previous one is still installing falls straight
+    // through WITHOUT preventDefault, so Tauri's own wrapper closes the
+    // window. That is the escape hatch: pressing X twice always quits,
+    // whatever the installer is doing.
+    let handling = false;
     await win.onCloseRequested(async (event) => {
-      if (!pendingUpdate() || sendInFlight()) return; // close normally
-      event.preventDefault();
-      if (!(await installOnQuit())) {
-        // install failed or was skipped — honour the quit anyway
-        await win.destroy();
+      if (handling) return;
+      handling = true;
+      try {
+        await handleCloseRequest({
+          hasPendingUpdate: () => pendingUpdate() !== null,
+          sendInFlight,
+          preventDefault: () => event.preventDefault(),
+          install: () => installOnQuit(),
+          destroy: () => win.destroy(),
+          forceExit: async () => {
+            const { exit } = await import("@tauri-apps/plugin-process");
+            await exit(0);
+          },
+        });
+      } finally {
+        handling = false;
       }
     });
   })();
