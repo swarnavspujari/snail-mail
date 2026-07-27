@@ -431,6 +431,121 @@ impl GmailSession {
     }
 }
 
+// ------------------------------------------------------- token-based fetch
+//
+// The crawl runs several `threads.get` calls at once, which the `&mut self`
+// methods above cannot do — the session owns the token cache. It resolves ONE
+// bearer per page instead (the calendar fetch already works this way) and
+// issues plain requests with it. That also makes the token refresh
+// single-flight by construction: N concurrent 401s can't become N refreshes,
+// because none of these calls can refresh at all — the page fails, and the
+// next one re-resolves through the session.
+//
+// Backoff lives with the caller here, not in a per-request retry loop: the
+// crawl's governor has to see throttling to slow the WHOLE walk down, and a
+// request that quietly retried itself three times would hide it.
+
+/// Why one thread fetch failed, in the terms the crawl's scheduler reacts to.
+#[derive(Debug)]
+pub enum FetchErr {
+    /// 404 — gone server-side; drop the local row.
+    Gone,
+    /// 429 or 5xx — not this thread's fault. Back off and retry the page.
+    Throttled,
+    /// 401 — the token was rejected. The caller re-resolves and classifies
+    /// (a dead grant surfaces as invalid_grant on the next refresh).
+    Unauthorized,
+    Other(String),
+}
+
+impl std::fmt::Display for FetchErr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FetchErr::Gone => write!(f, "thread is gone (404)"),
+            FetchErr::Throttled => write!(f, "rate-limited (429/5xx)"),
+            FetchErr::Unauthorized => write!(f, "token rejected (401)"),
+            FetchErr::Other(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+async fn get_with_token(
+    http: &reqwest::Client,
+    token: &str,
+    url: &str,
+) -> Result<Value, FetchErr> {
+    let resp = http
+        .get(url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|_| FetchErr::Other("Gmail request failed (network)".into()))?;
+    let status = resp.status().as_u16();
+    if status == 429 || status >= 500 {
+        return Err(FetchErr::Throttled);
+    }
+    if status == 401 {
+        return Err(FetchErr::Unauthorized);
+    }
+    if status == 404 {
+        return Err(FetchErr::Gone);
+    }
+    if !resp.status().is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        let snippet: String = body.chars().take(500).collect();
+        return Err(FetchErr::Other(format!("Gmail API error ({status}): {snippet}")));
+    }
+    resp.json()
+        .await
+        .map_err(|_| FetchErr::Other("Gmail returned an unexpected response".into()))
+}
+
+/// One thread in full, using a bearer resolved by the caller.
+pub async fn fetch_thread_full(
+    http: &reqwest::Client,
+    token: &str,
+    id: &str,
+) -> Result<Value, FetchErr> {
+    get_with_token(http, token, &format!("{BASE}/threads/{id}?format=full")).await
+}
+
+/// `hydrate_body_data` for the token-based path. Same contract: best-effort,
+/// parts that fail stay empty and heal on the next open.
+pub async fn hydrate_body_data_with_token(
+    http: &reqwest::Client,
+    token: &str,
+    thread_json: &mut Value,
+) {
+    const MAX_BODY_BYTES: usize = 25_000_000;
+    let Some(messages) = thread_json["messages"].as_array_mut() else {
+        return;
+    };
+    for msg in messages.iter_mut() {
+        let mid = msg["id"].as_str().unwrap_or_default().to_string();
+        if mid.is_empty() {
+            continue;
+        }
+        let mut paths: Vec<(Vec<usize>, String)> = vec![];
+        collect_body_att_paths(&msg["payload"], &[], &mut paths);
+        for (path, att_id) in paths {
+            let url = format!("{BASE}/messages/{mid}/attachments/{att_id}");
+            let Ok(v) = get_with_token(http, token, &url).await else {
+                continue;
+            };
+            let Some(data) = v["data"].as_str() else { continue };
+            let Ok(bytes) = B64URL.decode(data) else { continue };
+            if bytes.is_empty() || bytes.len() > MAX_BODY_BYTES {
+                continue;
+            }
+            let mut cur = &mut msg["payload"];
+            for idx in &path {
+                cur = &mut cur["parts"][*idx];
+            }
+            cur["body"]["data"] = Value::String(B64URL.encode(&bytes));
+        }
+    }
+}
+
 /// Large text bodies sometimes arrive with an empty `body.data` and the bytes
 /// behind `body.attachmentId` (no filename, no Content-ID). The sync parser only
 /// reads `body.data`, so those messages render blank / fall back to nothing.

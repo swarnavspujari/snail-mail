@@ -39,9 +39,13 @@ pub struct AppState {
     /// abandoned by a crash/quit just expire server-side (~1 week).
     drive_uploads: Mutex<HashMap<u64, DriveUpload>>,
     drive_upload_seq: std::sync::atomic::AtomicU64,
-    /// Overlap guard for the history crawl: a throttled beat can outlast the
-    /// 30s sync tick, and later ticks must skip instead of stacking beats.
+    /// Single-worker guard for the history crawl. The crawl runs its own
+    /// continuous loop now, so this stops a second worker being spawned rather
+    /// than stopping beats from stacking.
     crawl_busy: AtomicBool,
+    /// Overlap guard for semantic indexing, which kept the crawl's old
+    /// per-tick shape (a slice of embeddings every 30s).
+    embed_busy: AtomicBool,
     /// Last `sync:activity` tick of the pass currently in flight, or None when
     /// nothing is downloading. Served by `get_sync_activity` so a UI that
     /// mounts mid-pass (onboarding, a reopened window) doesn't have to wait for
@@ -2249,44 +2253,88 @@ async fn ensure_local_embedder(state: &AppState) -> Option<embed::SharedModel> {
     }
 }
 
-/// One history-crawl beat (a single listing page per account), spawned off
-/// the sync loop so a throttled beat never delays the 30s sync cadence. No
-/// mail:updated is emitted — the crawl surfaces old mail, and search reads
-/// the DB directly on the next keystroke. The same beat then embeds a slice
-/// of whatever the crawl/sync landed (semantic indexing shares the
-/// busy-guard, so beats never stack).
+/// Idle wait when every connected account's walk is finished (or none is
+/// ready yet) — long enough to cost nothing, short enough that a freshly
+/// connected account starts crawling promptly.
+const CRAWL_IDLE_MS: u64 = 20_000;
+/// Wait after a page that errored, so a persistent failure can't spin.
+const CRAWL_ERROR_MS: u64 = 5_000;
+
+/// Which gmail accounts still have crawling to do, in a stable order, paired
+/// with whether they have work. An account is skipped entirely until its first
+/// reconcile stored a baseline historyId — never race the initial backfill for
+/// the same threads.
+fn crawl_candidates(state: &AppState) -> Vec<(String, bool)> {
+    let emails: Vec<String> = store::get_accounts(&state.global().lock().unwrap())
+        .accounts
+        .iter()
+        .filter(|a| a.provider == "gmail" && !a.removing)
+        .map(|a| a.email.clone())
+        .collect();
+    emails
+        .into_iter()
+        .filter_map(|email| {
+            let db = state.account_db(&email).ok()?;
+            let conn = db.lock().unwrap();
+            if store::get_json::<String>(&conn, &format!("history:{email}")).is_none() {
+                return None; // first reconcile hasn't stored a baseline yet
+            }
+            let cur: mail::sync::CrawlCursor =
+                store::get_json(&conn, &format!("crawl:{email}")).unwrap_or_default();
+            Some((email, !cur.done))
+        })
+        .collect()
+}
+
+/// The history crawl: a loop of its own rather than one page per 30-second
+/// sync tick. The old cadence spent most of its wall clock waiting — a page of
+/// 100 threads at one fetch per 200ms took ~20s, then the walk sat idle for
+/// the rest of the beat. Now it runs continuously, one page at a time, with
+/// the page's threads fetched several at a time (see crawl_step) and an
+/// adaptive limit that halves on any 429.
+///
+/// Accounts are served ROUND-ROBIN, one page each: a plain loop over the
+/// account list would land a 60k-thread mailbox in full before a 500-thread
+/// one began. No mail:updated is emitted — the crawl surfaces old mail, and
+/// search reads the DB directly on the next keystroke.
 fn spawn_history_crawl(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
-        let state = app.state::<AppState>();
-        if state
-            .crawl_busy
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
         {
-            return;
+            let state = app.state::<AppState>();
+            if state
+                .crawl_busy
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                return; // a worker is already running
+            }
         }
-        let emails: Vec<String> = {
-            store::get_accounts(&state.global().lock().unwrap())
-                .accounts
-                .iter()
-                .filter(|a| a.provider == "gmail")
-                .map(|a| a.email.clone())
-                .collect()
-        };
-        for email in emails {
-            let Ok(db) = state.account_db(&email) else { continue };
-            // Only crawl once the account's first reconcile stored its
-            // baseline — never race the initial backfill for the same threads.
-            let ready = {
-                let conn = db.lock().unwrap();
-                store::get_json::<String>(&conn, &format!("history:{email}")).is_some()
-            };
-            if !ready {
+        let mut governor = mail::sync::Governor::default();
+        let mut last: Option<String> = None;
+        loop {
+            let state = app.state::<AppState>();
+            // The split migration owns the db files; a crawl racing it would
+            // abort the copy at verification.
+            if state.migrating.load(Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(CRAWL_IDLE_MS)).await;
                 continue;
             }
-            // The crawl reports its page as a pass ("17 of 100") — it was
-            // stderr-only before. Repaints stay off: the crawl surfaces old
-            // mail that no open list is showing.
+            let candidates = crawl_candidates(&state);
+            let Some(email) = mail::sync::next_account(&candidates, last.as_deref()) else {
+                // Everything walked (or nothing ready). Idle cheaply; a newly
+                // connected account picks up on the next pass.
+                tokio::time::sleep(std::time::Duration::from_millis(CRAWL_IDLE_MS)).await;
+                continue;
+            };
+            last = Some(email.clone());
+            let Ok(db) = state.account_db(&email) else {
+                tokio::time::sleep(std::time::Duration::from_millis(CRAWL_ERROR_MS)).await;
+                continue;
+            };
+            // The crawl reports MAILBOX progress ("2,140 of 38,902"), not
+            // position within one page — a per-page count of a mailbox-sized
+            // job reads as if it were nearly finished, over and over. Repaints
+            // stay off: the crawl surfaces old mail no open list is showing.
             let on_progress = {
                 let app = app.clone();
                 let gate = ActivityGate::new();
@@ -2297,10 +2345,18 @@ fn spawn_history_crawl(app: AppHandle) {
                 }
             };
             let splits = state.dbs.split_defs();
-            match mail::sync::crawl_step(&state.http, &state.gmail, &db, &email, &on_progress, &splits)
-                .await
-            {
-                // steady state after the walk finishes: nothing to report
+            let outcome = mail::sync::crawl_step(
+                &state.http,
+                &state.gmail,
+                &db,
+                &email,
+                &mut governor,
+                &on_progress,
+                &splits,
+            )
+            .await;
+            drop(on_progress);
+            match outcome {
                 Ok(b) if b.done && b.fetched == 0 && b.skipped == 0 && b.failed == 0 => {}
                 Ok(b) => eprintln!(
                     "[crawl:{email}] +{} indexed, {} already local, {} deferred — {} crawled total{}",
@@ -2314,19 +2370,51 @@ fn spawn_history_crawl(app: AppHandle) {
                     eprintln!("[crawl:{email}] {e}");
                     clear_sync_activity(&app, &email);
                     classify_sync_error(&app, &email, &e).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(CRAWL_ERROR_MS)).await;
                 }
             }
-            // Semantic indexing: embed whatever the crawl/sync landed. Local
-            // model by default; the optional remote provider when configured.
+            // The download indicator climbs each page and hides when the walk
+            // finishes.
+            emit_sync_progress(&app);
+            // Yield between pages so a crawl never monopolizes the runtime.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    });
+}
+
+/// Semantic indexing, on its own slow cadence. It used to ride the crawl beat,
+/// where a 4-second spawn_blocking budget per account per beat would now halve
+/// the crawl's throughput — the crawl no longer waits 30 seconds between pages
+/// for it to finish.
+fn spawn_embed_beat(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<AppState>();
+        if state
+            .embed_busy
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        let emails: Vec<String> = {
+            store::get_accounts(&state.global().lock().unwrap())
+                .accounts
+                .iter()
+                .filter(|a| a.provider == "gmail" && !a.removing)
+                .map(|a| a.email.clone())
+                .collect()
+        };
+        for email in emails {
+            let Ok(db) = state.account_db(&email) else { continue };
             let embeddings_mode = {
-                let db = state.global();
-            let conn = db.lock().unwrap();
+                let gdb = state.global();
+                let conn = gdb.lock().unwrap();
                 store::get_settings(&conn).embeddings
             };
             if embeddings_mode == "openai" {
                 let remote = {
-                    let db = state.global();
-            let conn = db.lock().unwrap();
+                    let gdb = state.global();
+                    let conn = gdb.lock().unwrap();
                     ai::resolve(&store::get_settings(&conn), Some("openai")).ok()
                 };
                 if let Some(p) = remote {
@@ -2353,10 +2441,7 @@ fn spawn_history_crawl(app: AppHandle) {
                 }
             }
         }
-        // The crawl just advanced (or confirmed done) — refresh the download
-        // indicator so it climbs each beat and hides when the walk finishes.
-        emit_sync_progress(&app);
-        state.crawl_busy.store(false, Ordering::SeqCst);
+        state.embed_busy.store(false, Ordering::SeqCst);
     });
 }
 
@@ -4487,6 +4572,7 @@ pub fn run() {
                 drive_uploads: Mutex::new(HashMap::new()),
                 drive_upload_seq: std::sync::atomic::AtomicU64::new(1),
                 crawl_busy: AtomicBool::new(false),
+                embed_busy: AtomicBool::new(false),
                 activity: Mutex::new(None),
                 data_dir: data_dir.clone(),
                 embedder: tokio::sync::Mutex::new(embed::Slot::Idle),
@@ -4875,6 +4961,9 @@ pub fn run() {
                     emit_mail_updated(&boot);
                 }
                 emit_sync_progress(&boot);
+                // The boot reconcile has stored each account's baseline, so
+                // the crawl can start without racing it for the same threads.
+                spawn_history_crawl(boot);
             });
 
             // background loop: snooze wake-ups + Gmail sync every 30s, with a
@@ -4962,11 +5051,12 @@ pub fn run() {
                     for email in &lost {
                         mark_auth_lost(&handle, email);
                     }
-                    // History crawl: one page per tick toward a fully-indexed
-                    // mailbox (guarded against overlap; skips reconcile ticks
-                    // to leave them their quota headroom).
-                    if tick % 20 != 0 {
-                        spawn_history_crawl(handle.clone());
+                    // The history crawl runs its own continuous loop (started
+                    // at boot); this only restarts it if the worker ever died.
+                    // Semantic indexing kept the per-tick shape.
+                    spawn_history_crawl(handle.clone());
+                    if tick % 2 == 0 {
+                        spawn_embed_beat(handle.clone());
                     }
                     // Calendar sync: 30s after boot, then every ~5 min — an
                     // incremental syncToken pull per calendar (initial pass

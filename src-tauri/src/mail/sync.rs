@@ -12,6 +12,7 @@
 use crate::mail::gmail::{parse_gmail_message, GmailSession};
 use crate::store;
 use crate::types::*;
+use futures_util::StreamExt;
 use rusqlite::Connection;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -458,15 +459,7 @@ pub async fn refetch_thread(
 ) -> Result<bool, String> {
     let mut v = match session.get_thread_full(http, id).await {
         Ok(v) => v,
-        Err(e) if e.contains("(404") => {
-            // gone server-side (permanent delete) — drop it locally too
-            let conn = db.lock().unwrap();
-            let existed = store::get_thread(&conn, id).is_some();
-            if existed {
-                store::delete_thread(&conn, id)?;
-            }
-            return Ok(existed);
-        }
+        Err(e) if e.contains("(404") => return apply_gone(db, id),
         Err(e) => return Err(e),
     };
 
@@ -474,6 +467,31 @@ pub async fn refetch_thread(
     // below captures them (otherwise those messages persist an empty body).
     crate::mail::gmail::hydrate_body_data(http, session, &mut v).await;
 
+    apply_thread(db, account_id, id, &v, splits)
+}
+
+/// The thread is gone server-side (permanent delete) — drop the local row.
+/// Returns whether anything changed.
+pub fn apply_gone(db: &std::sync::Mutex<Connection>, id: &str) -> Result<bool, String> {
+    let conn = db.lock().unwrap();
+    let existed = store::get_thread(&conn, id).is_some();
+    if existed {
+        store::delete_thread(&conn, id)?;
+    }
+    Ok(existed)
+}
+
+/// Apply an already-fetched thread JSON locally — the half of `refetch_thread`
+/// that needs no network. Split out so the crawl can fetch several threads at
+/// once and then land them one at a time (the db mutex serializes writes
+/// anyway, and parsing off the request path is what makes concurrency pay).
+pub fn apply_thread(
+    db: &std::sync::Mutex<Connection>,
+    account_id: &str,
+    id: &str,
+    v: &Value,
+    splits: &[Split],
+) -> Result<bool, String> {
     let history_id = v["historyId"].as_str().unwrap_or_default().to_string();
     let empty = vec![];
     let in_inbox = v["messages"]
@@ -486,7 +504,7 @@ pub async fn refetch_thread(
                 .map(|ls| ls.iter().any(|l| l.as_str() == Some("INBOX")))
                 .unwrap_or(false)
         });
-    let (mut thread, msgs) = thread_from_json(id, &v, in_inbox);
+    let (mut thread, msgs) = thread_from_json(id, v, in_inbox);
     {
         let conn = db.lock().unwrap();
         // Gmail sends user labels as opaque ids — resolve them to display
@@ -611,20 +629,36 @@ pub fn thread_from_json(id: &str, v: &Value, in_inbox: bool) -> (Thread, Vec<sto
 // Background full-history search indexing. reconcile() caps its listings, so
 // mail older than the caps never entered mail_fts and the first search for it
 // paid a live Gmail round-trip. The crawl walks the whole mailbox once,
-// newest to oldest, one listing page per beat, fetching + indexing whatever
-// isn't local yet. The cursor lives in kv so the walk survives restarts, and
-// re-anchors with before: when a persisted page token expires. Once done,
-// incremental sync keeps the index current — done is terminal.
+// newest to oldest, fetching + indexing whatever isn't local yet. The cursor
+// lives in kv so the walk survives restarts, and re-anchors with before: when
+// a persisted page token expires. Once done, incremental sync keeps the index
+// current — done is terminal.
+//
+// It used to fetch one thread per request, one listing page per 30-second
+// tick, serially: ~3.3 threads/second of wall clock, so tens of thousands of
+// threads took hours. Two things changed, and neither of them is batching.
+//
+//   * Concurrency. A page resolves ONE bearer and fetches its threads several
+//     at a time. (Batching via POST /batch was considered and dropped: it
+//     saves round-trips, not quota, and concurrency already collects most of
+//     that win for none of the multipart/partial-failure complexity.)
+//   * A loop of its own. The crawl no longer waits for the sync tick, so the
+//     duty cycle stops being the bottleneck.
+//
+// What did NOT change is format=full. `format=metadata` would make the tail
+// arrive faster, but it returns no body: old mail would be searchable by
+// subject and snippet only, and — worse — `store::vec::missing` only selects
+// rows with NO vector, so embedding a snippet-only row once means a later
+// body pass never re-embeds it. That damage is permanent.
 
 /// Gmail's default search scope (no spam/trash), minus drafts — the same
 /// population local search exposes (`hidden IS NULL`, reconcile skips drafts).
 const CRAWL_QUERY: &str = "-in:spam -in:trash -in:draft";
-/// Pause between thread fetches: ≤5 req/s keeps a crawling account far under
-/// Gmail's per-user quota (threads.get = 10 units of 15,000/min).
-const CRAWL_THROTTLE_MS: u64 = 200;
 /// Re-anchor overlap: a day of re-listed (and then history_id-skipped)
 /// threads absorbs before:'s coarse granularity at the boundary.
 const ANCHOR_OVERLAP_SECS: i64 = 86_400;
+/// How long to wait out a throttled page before trying again.
+const THROTTLE_BACKOFF_MS: u64 = 2_000;
 
 fn crawl_key(account_id: &str) -> String {
     format!("crawl:{account_id}")
@@ -673,6 +707,93 @@ fn reanchor(cur: &mut CrawlCursor) {
     cur.anchor = cur.oldest_ms.map(|ms| ms / 1000 + ANCHOR_OVERLAP_SECS);
 }
 
+/// Adaptive in-flight limit. Gmail's per-user budget is 250 quota units per
+/// second and `threads.get` costs 10 of them, so ~25/s is the hard ceiling;
+/// eight concurrent leaves the user's own traffic real headroom. A page that
+/// saw any throttling halves the limit, a clean one earns a slot back — so a
+/// global 429 slows the whole walk instead of producing a thundering herd of
+/// independent per-request retries.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Governor {
+    limit: usize,
+}
+
+impl Default for Governor {
+    fn default() -> Self {
+        Self { limit: Self::START }
+    }
+}
+
+impl Governor {
+    const MIN: usize = 1;
+    const MAX: usize = 8;
+    const START: usize = 6;
+
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
+    /// Fold one page's throttling count into the limit.
+    pub fn observe(&mut self, throttled: usize) {
+        self.limit = if throttled > 0 {
+            (self.limit / 2).max(Self::MIN)
+        } else {
+            (self.limit + 1).min(Self::MAX)
+        };
+    }
+}
+
+/// Which account gets the next slice: the first one AFTER `last` that still
+/// has work, wrapping. Round-robin so a 60k-thread mailbox can't starve a
+/// 500-thread one — with a plain loop over the account list, the first
+/// account's whole history would land before the second one began.
+pub fn next_account(accounts: &[(String, bool)], last: Option<&str>) -> Option<String> {
+    if accounts.is_empty() {
+        return None;
+    }
+    let start = last
+        .and_then(|l| accounts.iter().position(|(a, _)| a == l))
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    (0..accounts.len())
+        .map(|k| &accounts[(start + k) % accounts.len()])
+        .find(|(_, pending)| *pending)
+        .map(|(a, _)| a.clone())
+}
+
+/// What one page did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct PageOutcome {
+    /// Threads enumerated, fetched or already local.
+    pub listed: usize,
+    pub fetched: usize,
+    pub skipped: usize,
+    pub failed: usize,
+    /// Fetches that came back 429/5xx — the governor's input.
+    pub throttled: usize,
+    pub oldest_ms: Option<i64>,
+    pub next_token: Option<String>,
+}
+
+/// Fold a processed page into the cursor. Extracted from the page loop so the
+/// resume property is testable without a network: a test can drive the same
+/// function the live crawl uses across a simulated kill and assert the walk
+/// picks up where it left off rather than restarting.
+pub fn advance_cursor(cur: &mut CrawlCursor, page: &PageOutcome) {
+    if let Some(d) = page.oldest_ms {
+        cur.oldest_ms = Some(cur.oldest_ms.map_or(d, |o| o.min(d)));
+    }
+    cur.indexed += page.fetched as u64;
+    // Everything on this page was enumerated, whether it needed fetching or was
+    // already local — that's what makes `listed` a population size rather than a
+    // work count.
+    cur.listed += page.listed as u64;
+    cur.page_token = page.next_token.clone();
+    if cur.page_token.is_none() {
+        cur.done = true; // listing exhausted: full history is indexed
+    }
+}
+
 /// What one crawl beat did, for the caller's log line.
 pub struct CrawlBeat {
     pub fetched: usize,
@@ -682,14 +803,49 @@ pub struct CrawlBeat {
     pub done: bool,
 }
 
+/// The history_ids this account already has for the given thread ids — one
+/// query for the whole page instead of two per thread (the old loop also
+/// re-read `last_date` per thread; both are hoisted).
+fn known_history_ids(conn: &Connection, ids: &[String]) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    if ids.is_empty() {
+        return out;
+    }
+    let placeholders = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT id, COALESCE(history_id, ''), COALESCE(last_date, 0) FROM threads WHERE id IN ({placeholders})"
+    );
+    let Ok(mut stmt) = conn.prepare(&sql) else { return out };
+    let params = rusqlite::params_from_iter(ids.iter());
+    if let Ok(rows) = stmt.query_map(params, |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+    }) {
+        for row in rows.flatten() {
+            out.insert(row.0, format!("{}\u{1}{}", row.1, row.2));
+        }
+    }
+    out
+}
+
+/// Split a packed "history_id\u{1}last_date" value.
+fn unpack_known(v: &str) -> (&str, i64) {
+    match v.split_once('\u{1}') {
+        Some((h, d)) => (h, d.parse().unwrap_or(0)),
+        None => (v, 0),
+    }
+}
+
 /// One beat of the crawl: process a single listing page (≤100 threads), then
-/// persist the advanced cursor. Locks the session map per call — never across
-/// the whole beat — so user-triggered Gmail traffic interleaves with a crawl.
+/// persist the advanced cursor. Locks the session map only to list the page
+/// and resolve a bearer — never across the fetches — so user-triggered Gmail
+/// traffic interleaves with a crawl, and the page's threads download several
+/// at a time instead of one every 200ms.
 pub async fn crawl_step(
     http: &reqwest::Client,
     gmail: &tokio::sync::Mutex<HashMap<String, GmailSession>>,
     db: &std::sync::Mutex<Connection>,
     account_id: &str,
+    governor: &mut Governor,
     on_progress: ProgressFn<'_>,
     splits: &[Split],
 ) -> Result<CrawlBeat, String> {
@@ -709,14 +865,18 @@ pub async fn crawl_step(
     }
 
     let query = crawl_query(cur.anchor);
+    // One lock: list the page AND resolve the bearer the fetches will share.
     let listed = {
         let mut sessions = gmail.lock().await;
         let Some(session) = sessions.get_mut(account_id) else {
             return Err("account disconnected".into());
         };
-        session.list_threads_page(http, &query, cur.page_token.as_deref()).await
+        match session.list_threads_page(http, &query, cur.page_token.as_deref()).await {
+            Ok(page) => session.bearer(http).await.map(|tok| (page, tok)),
+            Err(e) => Err(e),
+        }
     };
-    let (page, next) = match listed {
+    let ((page, next), token) = match listed {
         Ok(v) => v,
         // Gmail 400s a stale page token; retrying it is hopeless. Re-anchor
         // and continue from the oldest indexed thread on the next beat.
@@ -732,91 +892,148 @@ pub async fn crawl_step(
         Err(e) => return Err(e), // transient — same cursor retries next beat
     };
 
-    let mut beat = CrawlBeat {
-        fetched: 0,
-        skipped: 0,
-        failed: 0,
-        total_indexed: cur.indexed,
-        done: false,
-    };
-    let mut page_oldest: Option<i64> = None;
-    // "X of N" within this page: the crawl fetches at most one page per beat,
-    // so the page is the pass the user is watching.
     let page_total = page.len();
-    for (i, (id, history_id)) in page.iter().enumerate() {
-        let known: Option<String> = {
-            let conn = db.lock().unwrap();
-            conn.query_row(
-                "SELECT COALESCE(history_id, '') FROM threads WHERE id = ?1",
-                [id.as_str()],
-                |r| r.get(0),
-            )
-            .ok()
-        };
-        if known.as_deref() == Some(history_id.as_str()) {
-            beat.skipped += 1;
-        } else {
-            let fetched = {
-                let mut sessions = gmail.lock().await;
-                let Some(session) = sessions.get_mut(account_id) else {
-                    return Err("account disconnected mid-beat".into());
-                };
-                refetch_thread(http, session, db, account_id, id, splits).await
-            };
-            match fetched {
-                Ok(_) => beat.fetched += 1,
-                // One bad thread must not wedge the walk — log it and move
-                // on; the live search_all path can still surface it.
-                Err(e) => {
-                    beat.failed += 1;
-                    eprintln!("[crawl:{account_id}] deferred {id}: {e}");
+    let ids: Vec<String> = page.iter().map(|(id, _)| id.clone()).collect();
+    let known = {
+        let conn = db.lock().unwrap();
+        known_history_ids(&conn, &ids)
+    };
+
+    let mut out = PageOutcome { listed: page_total, next_token: next, ..Default::default() };
+    // Already-local threads cost nothing but still count toward the walk, and
+    // their stored date still anchors a re-listing.
+    let mut to_fetch: Vec<String> = vec![];
+    for (id, history_id) in &page {
+        match known.get(id).map(|v| unpack_known(v)) {
+            Some((h, d)) if h == history_id.as_str() => {
+                out.skipped += 1;
+                if d > 0 {
+                    out.oldest_ms = Some(out.oldest_ms.map_or(d, |o: i64| o.min(d)));
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_millis(CRAWL_THROTTLE_MS)).await;
+            _ => to_fetch.push(id.clone()),
         }
-        let date: Option<i64> = {
-            let conn = db.lock().unwrap();
-            conn.query_row("SELECT last_date FROM threads WHERE id = ?1", [id.as_str()], |r| {
-                r.get(0)
-            })
-            .ok()
-        };
-        if let Some(d) = date {
-            page_oldest = Some(page_oldest.map_or(d, |o| o.min(d)));
-        }
-        on_progress(SyncTick {
-            account: account_id.to_string(),
-            stage: SyncStage::Crawl,
-            done: i + 1,
-            total: page_total,
-        });
     }
 
+    // The mailbox is the pass the user is watching, not this page. "Indexing
+    // 96 of 100" showing one page of tens of thousands was the observation
+    // that opened this whole item.
+    let estimate = {
+        let conn = db.lock().unwrap();
+        store::get_json::<i64>(&conn, &format!("threads_total:{account_id}")).unwrap_or(0)
+    };
+    let mailbox_total = estimate.max((cur.listed + page_total as u64) as i64) as usize;
+    let mut settled = out.skipped;
+    let tick = |done: usize| SyncTick {
+        account: account_id.to_string(),
+        stage: SyncStage::Crawl,
+        done: (cur.listed as usize + done).min(mailbox_total),
+        total: mailbox_total,
+    };
+    if settled > 0 {
+        on_progress(tick(settled));
+    }
+
+    // Concurrent fetch, sequential apply: the network is the bottleneck, and
+    // the db mutex serializes writes regardless.
+    let limit = governor.limit().max(1);
+    // Owned ids into each future, and the shared &Client / &str copied in:
+    // mapping over borrowed items here needs a closure that is generic over
+    // lifetimes, which a plain `|id| async move {}` is not.
+    let token_ref: &str = token.as_str();
+    let futures: Vec<_> = to_fetch
+        .into_iter()
+        .map(|id| async move {
+            let mut r = crate::mail::gmail::fetch_thread_full(http, token_ref, &id).await;
+            if let Ok(v) = r.as_mut() {
+                crate::mail::gmail::hydrate_body_data_with_token(http, token_ref, v).await;
+            }
+            (id, r)
+        })
+        .collect();
+    let mut stream = futures_util::stream::iter(futures).buffer_unordered(limit);
+
+    let mut unauthorized = false;
+    while let Some((id, res)) = stream.next().await {
+        match res {
+            Ok(v) => {
+                let date = v["messages"]
+                    .as_array()
+                    .and_then(|ms| ms.last())
+                    .and_then(|m| m["internalDate"].as_str())
+                    .and_then(|s| s.parse::<i64>().ok());
+                match apply_thread(db, account_id, &id, &v, splits) {
+                    Ok(_) => out.fetched += 1,
+                    Err(e) => {
+                        out.failed += 1;
+                        eprintln!("[crawl:{account_id}] deferred {id}: {e}");
+                    }
+                }
+                if let Some(d) = date {
+                    out.oldest_ms = Some(out.oldest_ms.map_or(d, |o: i64| o.min(d)));
+                }
+            }
+            Err(crate::mail::gmail::FetchErr::Gone) => {
+                let _ = apply_gone(db, &id);
+                out.fetched += 1; // resolved, just not by storing anything
+            }
+            Err(crate::mail::gmail::FetchErr::Throttled) => out.throttled += 1,
+            Err(crate::mail::gmail::FetchErr::Unauthorized) => {
+                out.throttled += 1;
+                unauthorized = true;
+            }
+            // One bad thread must not wedge the walk — log it and move on;
+            // the live search_all path can still surface it.
+            Err(e) => {
+                out.failed += 1;
+                eprintln!("[crawl:{account_id}] deferred {id}: {e}");
+            }
+        }
+        settled += 1;
+        on_progress(tick(settled));
+    }
+
+    governor.observe(out.throttled);
+    if out.throttled > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(THROTTLE_BACKOFF_MS)).await;
+    }
+    // A 401 means the token, not the thread. Surface it so the caller can
+    // classify a dead grant; the cursor stays put and the page retries.
+    if unauthorized {
+        return Err("Gmail API error (401): token rejected".into());
+    }
     // Every fetch failing looks like an outage, not poison threads — keep the
     // cursor unchanged so the same page retries instead of holing the index.
-    if beat.fetched == 0 && beat.failed > 0 {
-        return Err(format!("all {} fetches failed; page will retry", beat.failed));
+    if out.fetched == 0 && (out.failed > 0 || out.throttled > 0) {
+        return Err(format!(
+            "page made no progress ({} failed, {} throttled); will retry",
+            out.failed, out.throttled
+        ));
     }
 
-    if let Some(d) = page_oldest {
-        cur.oldest_ms = Some(cur.oldest_ms.map_or(d, |o| o.min(d)));
-    }
-    cur.indexed += beat.fetched as u64;
-    // Everything on this page was enumerated, whether it needed fetching or was
-    // already local — that's what makes `listed` a population size rather than a
-    // work count.
-    cur.listed += page_total as u64;
-    cur.page_token = next;
-    if cur.page_token.is_none() {
-        cur.done = true; // listing exhausted: full history is indexed
-    }
-    beat.total_indexed = cur.indexed;
-    beat.done = cur.done;
+    advance_cursor(&mut cur, &out);
     {
         let conn = db.lock().unwrap();
         store::set_json(&conn, &key, &cur)?;
     }
-    Ok(beat)
+    if cur.done {
+        // The walk is over. `done` can't be relied on to have caught `total` —
+        // threadsTotal is an estimate and may over-count — so fire the terminal
+        // tick explicitly, or the pill freezes at "38,000 of 40,000" forever.
+        on_progress(SyncTick {
+            account: account_id.to_string(),
+            stage: SyncStage::Crawl,
+            done: mailbox_total,
+            total: mailbox_total,
+        });
+    }
+    Ok(CrawlBeat {
+        fetched: out.fetched,
+        skipped: out.skipped,
+        failed: out.failed,
+        total_indexed: cur.indexed,
+        done: cur.done,
+    })
 }
 
 // ------------------------------------------------------------------ embed
@@ -1035,6 +1252,159 @@ mod tests {
         };
         store::upsert_thread(conn, ACCT, &t, &[(m, None, None, None, vec![])], &store::split_config(conn))
             .unwrap();
+    }
+
+    // ---------------------------------------------------------- governor
+
+    #[test]
+    fn governor_halves_on_throttling_and_recovers_one_slot_at_a_time() {
+        let mut g = Governor::default();
+        assert_eq!(g.limit(), 6);
+        g.observe(0);
+        g.observe(0);
+        assert_eq!(g.limit(), 8, "clean pages climb to the ceiling and stop");
+        g.observe(3);
+        assert_eq!(g.limit(), 4, "any throttling halves it");
+        g.observe(1);
+        g.observe(1);
+        g.observe(1);
+        assert_eq!(g.limit(), 1, "sustained throttling bottoms out at one, not zero");
+        g.observe(0);
+        assert_eq!(g.limit(), 2, "recovery is gradual, not a jump back to the ceiling");
+    }
+
+    // ------------------------------------------------------- round-robin
+
+    #[test]
+    fn next_account_rotates_instead_of_draining_the_first() {
+        let accounts = vec![("a".to_string(), true), ("b".to_string(), true)];
+        assert_eq!(next_account(&accounts, None).as_deref(), Some("a"));
+        assert_eq!(next_account(&accounts, Some("a")).as_deref(), Some("b"));
+        assert_eq!(next_account(&accounts, Some("b")).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn next_account_skips_finished_walks_and_wraps() {
+        let accounts = vec![
+            ("a".to_string(), false),
+            ("b".to_string(), true),
+            ("c".to_string(), false),
+        ];
+        assert_eq!(next_account(&accounts, Some("b")).as_deref(), Some("b"));
+        assert_eq!(next_account(&accounts, None).as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn next_account_answers_nothing_when_every_walk_is_done() {
+        let accounts = vec![("a".to_string(), false), ("b".to_string(), false)];
+        assert_eq!(next_account(&accounts, None), None);
+        assert_eq!(next_account(&[], None), None);
+    }
+
+    // ------------------------------------------------------ cursor folding
+
+    fn page(listed: usize, fetched: usize, oldest: Option<i64>, next: Option<&str>) -> PageOutcome {
+        PageOutcome {
+            listed,
+            fetched,
+            skipped: listed - fetched,
+            failed: 0,
+            throttled: 0,
+            oldest_ms: oldest,
+            next_token: next.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn advance_cursor_accumulates_and_terminates_on_an_exhausted_listing() {
+        let mut cur = CrawlCursor::default();
+        advance_cursor(&mut cur, &page(100, 90, Some(500), Some("tok2")));
+        assert_eq!((cur.indexed, cur.listed, cur.done), (90, 100, false));
+        assert_eq!(cur.oldest_ms, Some(500));
+
+        advance_cursor(&mut cur, &page(40, 40, Some(700), None));
+        assert_eq!((cur.indexed, cur.listed), (130, 140));
+        assert_eq!(cur.oldest_ms, Some(500), "oldest only ever moves older");
+        assert!(cur.done, "no next token means the whole history is walked");
+    }
+
+    // -------------------------------------------- multi-account resumption
+    //
+    // The property the deferred item asked for, and the one nothing covered:
+    // several accounts crawling at once must survive a kill, resume where they
+    // stopped, and not starve each other. Driven through the same
+    // advance_cursor + kv persistence the live crawl uses, with the process
+    // kill simulated by closing the connections and reopening the files.
+
+    fn temp_db(name: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("snail-crawl-test-{name}-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    /// One account's turn: read its cursor, fold a page in, persist. Exactly
+    /// what one live beat does to the cursor.
+    fn take_turn(conn: &Connection, account: &str, out: &PageOutcome) -> CrawlCursor {
+        let key = crawl_key(account);
+        let mut cur: CrawlCursor = store::get_json(conn, &key).unwrap_or_default();
+        advance_cursor(&mut cur, out);
+        store::set_json(conn, &key, &cur).unwrap();
+        cur
+    }
+
+    #[test]
+    fn two_accounts_resume_where_they_stopped_and_neither_starves() {
+        let (pa, pb) = (temp_db("a"), temp_db("b"));
+        let mut served: Vec<String> = vec![];
+        let mut last: Option<String> = None;
+        let accounts = vec![("a@x.test".to_string(), true), ("b@x.test".to_string(), true)];
+
+        {
+            let ca = store::open(&pa).unwrap();
+            let cb = store::open(&pb).unwrap();
+            // three turns before the kill: a, b, a
+            for i in 0..3 {
+                let who = next_account(&accounts, last.as_deref()).unwrap();
+                let conn = if who == "a@x.test" { &ca } else { &cb };
+                take_turn(conn, &who, &page(100, 100, Some(9_000 - i), Some("tok-next")));
+                served.push(who.clone());
+                last = Some(who);
+            }
+        } // both connections dropped — the process is gone
+
+        assert_eq!(served, vec!["a@x.test", "b@x.test", "a@x.test"], "strict rotation");
+
+        // relaunch
+        let ca = store::open(&pa).unwrap();
+        let cb = store::open(&pb).unwrap();
+        let ra: CrawlCursor = store::get_json(&ca, &crawl_key("a@x.test")).unwrap();
+        let rb: CrawlCursor = store::get_json(&cb, &crawl_key("b@x.test")).unwrap();
+
+        assert_eq!(ra.listed, 200, "A resumes at two pages in, not from zero");
+        assert_eq!(rb.listed, 100, "B resumes at one page in, not from zero");
+        assert_eq!(ra.page_token.as_deref(), Some("tok-next"));
+        assert_eq!(rb.page_token.as_deref(), Some("tok-next"));
+        assert!(!ra.done && !rb.done);
+
+        // the account mid-turn when the process died is not the one served next
+        let resumed = next_account(&accounts, last.as_deref()).unwrap();
+        assert_eq!(resumed, "b@x.test", "B is owed the next slice, not A again");
+
+        // and finishing off keeps accumulating rather than restarting
+        let fin = take_turn(&cb, "b@x.test", &page(60, 60, Some(8_000), None));
+        assert_eq!(fin.listed, 160);
+        assert_eq!(fin.indexed, 160);
+        assert!(fin.done);
+        // A's walk is untouched by B finishing
+        let still: CrawlCursor = store::get_json(&ca, &crawl_key("a@x.test")).unwrap();
+        assert_eq!(still.listed, 200);
+        assert!(!still.done);
+
+        drop(ca);
+        drop(cb);
+        let _ = std::fs::remove_file(&pa);
+        let _ = std::fs::remove_file(&pb);
     }
 
     #[test]
