@@ -193,13 +193,6 @@ fn stored_secret(name: &str) -> Option<String> {
     secrets::get(name).map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
 }
 
-const BUNDLED_CELEBRATIONS: [&str; 4] = [
-    "/inbox-zero/dawn-ridge.svg",
-    "/inbox-zero/quiet-lake.svg",
-    "/inbox-zero/night-dunes.svg",
-    "/inbox-zero/aurora-field.svg",
-];
-
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
@@ -4115,12 +4108,6 @@ async fn save_settings(app: AppHandle, state: State<'_, AppState>, settings: Set
             return Err(format!("split \"{}\": {e}", sp.name));
         }
     }
-    if let Some(dir) = &settings.celebration_dir {
-        let path = std::path::Path::new(dir);
-        if path.is_dir() {
-            let _ = app.asset_protocol_scope().allow_directory(path, false);
-        }
-    }
     let splits_changed = {
         let gdb = state.global();
         let conn = gdb.lock().unwrap();
@@ -4336,32 +4323,13 @@ async fn get_streaks(state: State<'_, AppState>) -> Result<Streaks, String> {
     Ok(store::get_streaks(&state.global().lock().unwrap()))
 }
 
-fn celebration_pool(app: &AppHandle, settings: &Settings) -> Vec<String> {
-    if let Some(dir) = &settings.celebration_dir {
-        let path = std::path::Path::new(dir);
-        if let Ok(entries) = std::fs::read_dir(path) {
-            let imgs: Vec<String> = entries
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .filter(|p| {
-                    matches!(
-                        p.extension().and_then(|x| x.to_str()).map(|s| s.to_ascii_lowercase()).as_deref(),
-                        Some("png" | "jpg" | "jpeg" | "webp" | "gif" | "svg")
-                    )
-                })
-                .filter_map(|p| p.to_str().map(str::to_string))
-                .collect();
-            if !imgs.is_empty() {
-                let _ = app.asset_protocol_scope().allow_directory(path, false);
-                return imgs;
-            }
-        }
-    }
-    BUNDLED_CELEBRATIONS.iter().map(|s| s.to_string()).collect()
-}
-
+/// Bank the streak for a split that just emptied. Idempotent per calendar day,
+/// so the caller can fire it after every triage action without inflating the
+/// count. Nothing renders the returned event any more — hitting zero reveals
+/// the rest photo rather than an overlay — but returning one is the signal the
+/// UI reloads settings on, so the streak under the photo is today's.
 #[tauri::command]
-async fn record_zero(app: AppHandle, state: State<'_, AppState>, split_id: String) -> Result<Option<ZeroEvent>, String> {
+async fn record_zero(state: State<'_, AppState>, split_id: String) -> Result<Option<ZeroEvent>, String> {
     let db = state.global();
     let conn = db.lock().unwrap();
     let mut s = store::get_streaks(&conn);
@@ -4375,22 +4343,8 @@ async fn record_zero(app: AppHandle, state: State<'_, AppState>, split_id: Strin
         s.last_zero_day = Some(today);
         store::set_json(&conn, "streaks", &s)?;
     }
-    let settings = store::get_settings(&conn);
     drop(conn);
-    let pool = celebration_pool(&app, &settings);
-    let idx = (now_ms() as usize) % pool.len();
-    Ok(Some(ZeroEvent {
-        split_id,
-        daily: s.daily,
-        weekly: s.weekly,
-        image_path: pool[idx].clone(),
-    }))
-}
-
-#[tauri::command]
-async fn list_celebration_images(app: AppHandle, state: State<'_, AppState>) -> Result<Vec<String>, String> {
-    let settings = store::get_settings(&state.global().lock().unwrap());
-    Ok(celebration_pool(&app, &settings))
+    Ok(Some(ZeroEvent { split_id, daily: s.daily, weekly: s.weekly }))
 }
 
 // ---------------------------------------------------------------- bootstrap
@@ -4550,15 +4504,6 @@ pub fn run() {
                         ),
                     );
                 });
-            }
-
-            // allow a previously-configured celebration folder
-            let settings = { store::get_settings(&dbs.global().lock().unwrap()) };
-            if let Some(dir) = &settings.celebration_dir {
-                let p = std::path::Path::new(dir);
-                if p.is_dir() {
-                    let _ = app.asset_protocol_scope().allow_directory(p, false);
-                }
             }
 
             let http = reqwest::Client::builder()
@@ -5197,7 +5142,6 @@ pub fn run() {
             ai_suggest_replies,
             get_streaks,
             record_zero,
-            list_celebration_images,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Snail Mail");

@@ -107,7 +107,6 @@ export interface Settings {
   splits: Split[];
   defaultAiProvider: AiProviderId;
   providers: AiProviderConfig[];
-  celebrationDir: string | null; // user-supplied folder of images; null = bundled
   shortcuts: Record<string, string>; // commandId -> key expression
   signatures: Record<string, string>; // account email -> signature text or HTML
   theme: "dark" | "light";
@@ -393,11 +392,13 @@ export interface SearchResult {
   lastDate: number;
 }
 
+/** Banked when a split hits zero. Nothing renders it any more — the reward is
+ *  the inbox-zero screen itself — but recordZero returning one is how the UI
+ *  knows to reload the streak the photo shows. */
 export interface ZeroEvent {
   splitId: string;
   daily: number;
   weekly: number;
-  imagePath: string; // asset path or file path to show
 }
 
 /** Background mail-download progress for the status indicator. `indexed` =

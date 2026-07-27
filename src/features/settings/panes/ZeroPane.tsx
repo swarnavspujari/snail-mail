@@ -3,7 +3,6 @@ import { Pill } from "@/components/Pill";
 import { RowGroup, SettingRow } from "@/components/SettingRow";
 import { useSettings } from "@/stores/settings";
 import { useUi } from "@/stores/ui";
-import { Pref } from "../Pref";
 
 export function ZeroPane() {
   const streaks = useSettings((s) => s.streaks);
@@ -11,9 +10,8 @@ export function ZeroPane() {
     <>
       <RowGroup
         title="Rest photo"
-        hint="When a split hits zero the list is replaced by a photo. The Rust core fetches one a day — never the web bundle."
+        hint="When a split hits zero the list is replaced by a photo — one a day, fetched by the Rust core, never the web bundle. There is nothing between you and it: hitting zero goes straight to this screen."
       >
-        <Pref id="celebrationDir" />
         <SettingRow
           label="Daily photo source"
           help="Unsplash, fetched once a day. Its access key lives in Privacy & keys — one home for every credential."

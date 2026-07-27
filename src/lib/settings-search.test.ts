@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { defaultSettings } from "./defaults";
+import type { PrefRow } from "./settings-catalog";
 import { patchFor, PREF_ROWS, prefsFor, valueTextFor } from "./settings-catalog";
 import { buildSettingsIndex, searchEntries } from "./settings-search";
 import type { ShortcutRow } from "./shortcut-edit";
@@ -148,9 +149,21 @@ describe("settings catalog", () => {
   });
 
   it("writes an empty text field back as null, not an empty string", () => {
-    const row = PREF_ROWS.find((r) => r.key === "celebrationDir")!;
-    expect(patchFor(row, "   ")).toEqual({ celebrationDir: null });
-    expect(patchFor(row, " C:\\pics ")).toEqual({ celebrationDir: "C:\\pics" });
+    // No free-text preference ships today (the last one, the inbox-zero photo
+    // folder, retired with the celebration overlay). The branch is still live
+    // for the next one, so exercise it through a stand-in row rather than
+    // letting it go untested until something silently writes "" to a
+    // nullable key.
+    const row: PrefRow = {
+      id: "standInText",
+      label: "Stand-in",
+      pane: "general",
+      section: "Appearance",
+      control: "text",
+      key: "theme",
+    };
+    expect(patchFor(row, "   ")).toEqual({ theme: null });
+    expect(patchFor(row, " midnight ")).toEqual({ theme: "midnight" });
   });
 
   it("renders the current value of a row as display text", () => {

@@ -44,11 +44,7 @@ import type {
   ZeroEvent,
 } from "./types";
 import { buildSeedData, DEMO_ACCOUNT, DEMO_ACCOUNT_2 } from "./mock-data";
-import {
-  BUNDLED_CELEBRATIONS,
-  defaultKnowledgeBase,
-  defaultSettings,
-} from "./defaults";
+import { defaultKnowledgeBase, defaultSettings } from "./defaults";
 import {
   classifySplits,
   compileSplits,
@@ -1758,15 +1754,7 @@ export class MockBackend implements Backend {
       s.lastZeroDay = today;
       this.persist();
     }
-    const img =
-      BUNDLED_CELEBRATIONS[
-        Math.floor(Math.random() * BUNDLED_CELEBRATIONS.length)
-      ];
-    return { splitId, daily: s.daily, weekly: s.weekly, imagePath: img };
-  }
-
-  async listCelebrationImages() {
-    return BUNDLED_CELEBRATIONS;
+    return { splitId, daily: s.daily, weekly: s.weekly };
   }
 
   async refreshCalendar() {
@@ -1774,13 +1762,14 @@ export class MockBackend implements Backend {
     for (const cb of this.calendarListeners) cb(null);
   }
 
-  // The Unsplash key lives in the Rust core only; the browser demo serves a
-  // bundled scene so the empty-state layout is still demoable.
+  // The Unsplash key lives in the Rust core only; the browser demo serves the
+  // bundled welcome photograph so the empty-state layout is still demoable —
+  // the same image first run puts behind the Connect screen.
   async getDailyPhoto() {
     return {
-      url: "/inbox-zero/quiet-lake.svg",
+      url: "/welcome-bg.jpg",
       blurHash: null,
-      authorName: "Snail Mail demo art",
+      authorName: "Swarnav S Pujari",
       authorLink: null,
       photoLink: null,
       downloadLocation: null,

@@ -559,7 +559,6 @@ pub fn default_settings() -> Settings {
                 has_key: false,
             },
         ],
-        celebration_dir: None,
         shortcuts,
         signatures: HashMap::new(),
         theme: "dark".into(),

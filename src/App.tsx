@@ -33,7 +33,6 @@ import { SendLaterPicker } from "@/features/pickers/SendLaterPicker";
 import { SnippetPicker } from "@/features/pickers/SnippetPicker";
 import { DraftsPicker } from "@/features/pickers/DraftsPicker";
 import { DrivePicker } from "@/features/pickers/DrivePicker";
-import { Celebration } from "@/features/zero/Celebration";
 import { SearchScreen } from "@/features/search/SearchScreen";
 import { SettingsScreen } from "@/features/settings/SettingsScreen";
 import { ShortcutsPanel } from "@/features/shortcuts/ShortcutsPanel";
@@ -79,7 +78,6 @@ export default function App() {
   const screen = useUi((s) => s.screen);
   const paletteOpen = useUi((s) => s.paletteOpen);
   const picker = useUi((s) => s.picker);
-  const celebration = useUi((s) => s.celebration);
   const compose = useUi((s) => s.compose);
   const askAiOpen = useUi((s) => s.askAiOpen);
   const shortcutsOpen = useUi((s) => s.shortcutsOpen);
@@ -290,7 +288,6 @@ export default function App() {
         return (
           u.paletteOpen ||
           u.picker !== "none" ||
-          u.celebration !== null ||
           u.drivePrompt !== null ||
           u.sharePrompt !== null ||
           cal.modal !== null ||
@@ -538,7 +535,6 @@ export default function App() {
         {picker === "drafts" && <DraftsPicker />}
         {picker === "drivePicker" && <DrivePicker />}
         {eventPopover && <EventPopover />}
-        {celebration && <Celebration />}
 
         {/* Bottom-left notification stack: the Undo Send bar sits closest to the
             corner, transient toasts stack above it. */}
