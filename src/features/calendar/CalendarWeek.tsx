@@ -98,6 +98,7 @@ export function CalendarWeek() {
   const [drag, setDrag] = useState<{ day: number; from: number; to: number } | null>(
     null
   );
+  const preview = useCalendar((s) => s.modalPreview);
   const colRefs = useRef<Record<number, HTMLDivElement | null>>({});
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -120,8 +121,9 @@ export function CalendarWeek() {
 
   useEffect(() => {
     const cal = useCalendar.getState();
-    void cal.loadRange(weekStart, 7);
-    cal.requestRefresh();
+    void cal.watchRange("week", weekStart, 7);
+    cal.requestRefresh("week");
+    return () => useCalendar.getState().unwatchRange("week");
   }, [weekStart]);
 
   useEffect(() => {
@@ -178,6 +180,25 @@ export function CalendarWeek() {
 
   const visible = (d: number): CalendarEvent[] =>
     (eventsByDay[d] ?? []).filter((e) => !hidden.has(e.calendarId));
+
+  /** Where the open modal's event would land in this day's column — the
+   *  placement preview, shown before you commit. */
+  const ghostIn = (d: number): { top: number; height: number } | null => {
+    if (!preview || preview.allDay) return null;
+    const gridEnd = d + DAY_MS;
+    // Overlap first, THEN clamp. Clamping first turns every later day into a
+    // 15-minute sliver at midnight — a real event never hits this because the
+    // store already bucketed it into its own day; the ghost isn't bucketed.
+    if (preview.endMs <= d || preview.startMs >= gridEnd) return null;
+    const s = Math.max(preview.startMs, d);
+    const e = Math.min(Math.max(preview.endMs, s + 15 * 60_000), gridEnd);
+    return {
+      top: ((s - d) / 3600_000) * PX_PER_HOUR,
+      height: Math.max(16, ((e - s) / 3600_000) * PX_PER_HOUR - 2),
+    };
+  };
+  const ghostAllDayOn = (d: number): boolean =>
+    !!preview && preview.allDay && preview.startMs < d + DAY_MS && preview.endMs > d;
 
   const weekEnd = weekStart + 6 * DAY_MS;
   const monthTitle =
@@ -304,8 +325,9 @@ export function CalendarWeek() {
             })}
           </div>
 
-          {/* all-day lane */}
-          {hasAllDay && (
+          {/* all-day lane — also opens for an all-day placement preview, so
+              the ghost has somewhere to sit on an otherwise timed week */}
+          {(hasAllDay || days.some(ghostAllDayOn)) && (
             <div className="flex items-stretch border-b border-line bg-surface pr-4">
               <div className="flex w-14 shrink-0 items-center justify-end pr-2 text-[10px] text-ink-3">
                 all-day
@@ -317,6 +339,11 @@ export function CalendarWeek() {
                     i ? "border-l border-line" : ""
                   }`}
                 >
+                  {ghostAllDayOn(d) && (
+                    <div className="cal-ghost w-full truncate rounded-[5px] py-0.5 pl-[9px] pr-1.5 text-left text-[11px] font-medium">
+                      New event
+                    </div>
+                  )}
                   {visible(d)
                     .filter((e) => e.allDay)
                     .map((e) => (
@@ -406,6 +433,18 @@ export function CalendarWeek() {
                           }}
                         />
                       )}
+                      {!drag &&
+                        (() => {
+                          const g = ghostIn(d);
+                          return g ? (
+                            <div
+                              className="cal-ghost pointer-events-none absolute left-0.5 right-0.5 z-[2] overflow-hidden rounded-[5px] py-0.5 pl-[9px] pr-1.5 text-[11.5px] font-medium leading-[15px]"
+                              style={{ top: g.top, height: g.height }}
+                            >
+                              New event
+                            </div>
+                          ) : null;
+                        })()}
                     </div>
                   );
                 })}

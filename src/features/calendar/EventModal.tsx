@@ -1,17 +1,29 @@
 // Create/edit event side panel — docks in the right-hand slot like the
 // calendar/shortcuts panels (Superhuman-style), driven by calendar.modal:
 // title, calendar (writable only), date/time or all-day, guests (contact
-// autocomplete), location, description. Saving an event with guests asks
-// whether to email them (Google sendUpdates); an If-Match 412 surfaces as a
-// "changed elsewhere" banner with Load-latest.
-import { useEffect, useRef, useState } from "react";
+// autocomplete), location, description.
+//
+// Saving is ONE commit: whether to email guests is a checkbox in the form
+// (on for a new event, off for an edit), not a second confirmation step. An
+// If-Match 412 surfaces as a "changed elsewhere" banner with Load-latest.
+//
+// The form republishes its uncommitted start/end to the calendar store on
+// every edit, so the day grid can show a ghost block where the event would
+// land — and follows the date there when it would otherwise be off screen.
+import { useEffect, useMemo, useRef, useState } from "react";
 import { backend } from "@/lib/ipc";
-import { useCalendar } from "@/stores/calendar";
+import { dayIsWatched, dayKeyOf, daysCovered, useCalendar } from "@/stores/calendar";
 import { useSettings } from "@/stores/settings";
 import { useUi } from "@/stores/ui";
 import { Kbd } from "@/components/Kbd";
-import { RecipientInput } from "@/features/compose/RecipientInput";
+import { RecipientChipGroup, RecipientChips } from "@/features/compose/RecipientChips";
+import { addrSpec } from "@/lib/recipients";
 import type { CalendarEvent, EventDraft, SendUpdates } from "@/lib/types";
+
+/** How long the date has to sit still before the calendar moves to it. Long
+ *  enough that hand-typing "2026-08-14" doesn't walk the view through August
+ *  of year 2, 20, 202… */
+const FOLLOW_DEBOUNCE_MS = 400;
 
 function msToDateStr(ms: number): string {
   const d = new Date(ms);
@@ -43,15 +55,12 @@ function nextDayMs(date: string): number {
   return new Date(y, m - 1, d + 1).getTime();
 }
 
-/** Emails out of the comma/semicolon-separated guests field ("Name <a@b>"
- *  tokens from the autocomplete reduce to the address). */
-function parseGuests(raw: string): string[] {
+/** Addresses out of the guest chips ("Name <a@b>" tokens from the
+ *  autocomplete reduce to the address), deduped case-insensitively. */
+function parseGuests(chips: string[]): string[] {
   const out: string[] = [];
-  for (const tok of raw.split(/[,;]/)) {
-    const t = tok.trim();
-    if (!t) continue;
-    const m = /<([^>]+)>/.exec(t);
-    const email = (m ? m[1] : t).trim();
+  for (const tok of chips) {
+    const email = addrSpec(tok);
     if (email && !out.some((e) => e.toLowerCase() === email.toLowerCase())) {
       out.push(email);
     }
@@ -82,16 +91,18 @@ export function EventModal() {
     msToDateStr((modal?.endMs ?? Date.now()) - (modal?.allDay ? 1 : 0))
   );
   const [endTime, setEndTime] = useState(msToTimeStr(modal?.endMs ?? Date.now()));
-  const [guests, setGuests] = useState(
-    ev && ev.attendees.length
-      ? ev.attendees.map((a) => a.email).join(", ") + ", "
-      : ""
+  const [guests, setGuests] = useState<string[]>(
+    ev ? ev.attendees.map((a) => a.email) : []
   );
+  // Whether guests get an email. Was a second confirmation step after Create;
+  // it is a field now, so saving is one click. On for a new event (an invite
+  // nobody receives is not an invite), off for an edit (a typo fix must not
+  // mail the whole guest list).
+  const [notify, setNotify] = useState(modal?.mode !== "edit");
   const [location, setLocation] = useState(ev?.location ?? "");
   const [description, setDescription] = useState(ev?.description ?? "");
   const [etag, setEtag] = useState(ev?.etag ?? null);
   const [conflict, setConflict] = useState<CalendarEvent | null>(null);
-  const [notifyStep, setNotifyStep] = useState<EventDraft | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // Google Meet: default on once the event has a guest (or already has a Meet),
@@ -113,6 +124,37 @@ export function EventModal() {
   useEffect(() => {
     titleRef.current?.focus();
   }, []);
+
+  /** The placement the form currently describes, or null while it is not a
+   *  valid range (mid-typing a date, end before start). */
+  const placement = useMemo(() => {
+    const startMs = allDay ? toMs(startDate, "00:00") : toMs(startDate, startTime);
+    const endMs = allDay ? nextDayMs(endDate) : toMs(endDate, endTime);
+    if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) {
+      return null;
+    }
+    return { startMs, endMs, allDay };
+  }, [allDay, startDate, startTime, endDate, endTime]);
+
+  // Publish it so the day grid can draw a ghost block where the event would
+  // land — placement is confirmable before you commit, not after.
+  useEffect(() => {
+    // Guarded on `modal`: closeModal clears the preview and re-renders this
+    // component one last time — republishing here would put the ghost back.
+    if (modal) useCalendar.getState().setModalPreview(placement);
+  }, [placement, modal]);
+
+  // A ghost you can't see answers nothing, so move the calendar to it — but
+  // only when the day is off screen (picking a day already in view must not
+  // yank the week), and only after the date sits still, so hand-typing
+  // "2026-08-14" doesn't walk the view through years 2 and 202 on the way.
+  useEffect(() => {
+    if (!modal || !placement) return;
+    const day = dayKeyOf(placement.startMs);
+    if (dayIsWatched(day)) return;
+    const t = setTimeout(() => useCalendar.getState().goToDay(day), FOLLOW_DEBOUNCE_MS);
+    return () => clearTimeout(t);
+  }, [placement, modal]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -153,6 +195,10 @@ export function EventModal() {
     };
   };
 
+  // Guests present now, or removed during this edit — either way they get a
+  // say in notifications, so the checkbox stays visible.
+  const guestsInvolved = parseGuests(guests).length > 0 || (ev?.attendees.length ?? 0) > 0;
+
   const submit = () => {
     const draft = buildDraft();
     if (typeof draft === "string") {
@@ -160,18 +206,12 @@ export function EventModal() {
       return;
     }
     setError(null);
-    // guests (added, kept, or removed) get a say in notifications
-    const hadGuests = (ev?.attendees.length ?? 0) > 0;
-    if (draft.attendees.length > 0 || hadGuests) {
-      setNotifyStep(draft);
-    } else {
-      void save(draft, "none");
-    }
+    // One commit: the notify choice is already in the form.
+    void save(draft, guestsInvolved && notify ? "all" : "none");
   };
 
   const save = async (draft: EventDraft, sendUpdates: SendUpdates) => {
     setSaving(true);
-    setNotifyStep(null);
     try {
       if (editing && ev) {
         const res = await backend.updateEvent(
@@ -196,6 +236,19 @@ export function EventModal() {
             : "Event created"
         );
       }
+      // Forget every day the event touched — the span it LEAVES as well as the
+      // one it lands on, or a moved event stays drawn where it used to be.
+      // calendar:updated alone only re-reads what a view is currently
+      // watching; this is what makes a write land on a day you'll navigate
+      // back to later.
+      void useCalendar
+        .getState()
+        .invalidateDays([
+          ...new Set([
+            ...(ev ? daysCovered(ev.startMs, ev.endMs) : []),
+            ...daysCovered(draft.startMs, draft.endMs),
+          ]),
+        ]);
       useCalendar.getState().closeModal();
     } catch (e) {
       setError(String(e));
@@ -212,11 +265,7 @@ export function EventModal() {
     setStartTime(msToTimeStr(conflict.startMs));
     setEndDate(msToDateStr(conflict.endMs - (conflict.allDay ? 1 : 0)));
     setEndTime(msToTimeStr(conflict.endMs));
-    setGuests(
-      conflict.attendees.length
-        ? conflict.attendees.map((a) => a.email).join(", ") + ", "
-        : ""
-    );
+    setGuests(conflict.attendees.map((a) => a.email));
     setLocation(conflict.location ?? "");
     setDescription(conflict.description ?? "");
     setEtag(conflict.etag);
@@ -335,12 +384,23 @@ export function EventModal() {
           <div>
             <label className={labelCls}>Guests</label>
             <div className="flex rounded-md border border-line bg-surface px-2.5 py-1.5 focus-within:border-accent/60">
-              <RecipientInput
-                value={guests}
-                onChange={setGuests}
-                placeholder="Add guests (email, email…)"
-              />
+              <RecipientChipGroup
+                lists={{ guests }}
+                onChange={(p) => p.guests && setGuests(p.guests)}
+              >
+                <RecipientChips field="guests" placeholder="Add guests" />
+              </RecipientChipGroup>
             </div>
+            {guestsInvolved && (
+              <label className="mt-2 flex items-center gap-1.5 text-[12.5px] text-ink-2">
+                <input
+                  type="checkbox"
+                  checked={notify}
+                  onChange={(e) => setNotify(e.target.checked)}
+                />
+                Email {editing ? "the update" : "invites"} to guests
+              </label>
+            )}
             <label className="mt-2 flex items-center gap-1.5 text-[12.5px] text-ink-2">
               <input
                 type="checkbox"
@@ -376,46 +436,28 @@ export function EventModal() {
         {error && <div className="mt-3 text-[12px] text-bad">{error}</div>}
       </div>
 
-      <div className="border-t border-line px-4 py-3">
-        {notifyStep ? (
-          <div className="space-y-2">
-            <span className="block text-[12.5px] text-ink-2">
-              Send invites/updates to guests?
-            </span>
-            <div className="flex items-center justify-end gap-2">
-              <button
-                className="rounded-md border border-line-strong px-3 py-1.5 text-[12.5px] text-ink-2 hover:bg-hover"
-                onClick={() => void save(notifyStep, "none")}
-                disabled={saving}
-              >
-                Don't send
-              </button>
-              <button
-                className="rounded-md bg-accent px-3 py-1.5 text-[12.5px] font-medium text-on-accent hover:opacity-90"
-                onClick={() => void save(notifyStep, "all")}
-                disabled={saving}
-              >
-                Send
-              </button>
-            </div>
-          </div>
-        ) : (
-          <div className="flex items-center justify-end gap-2">
-            <button
-              className="rounded-md border border-line-strong px-3 py-1.5 text-[12.5px] text-ink-2 hover:bg-hover"
-              onClick={() => useCalendar.getState().closeModal()}
-            >
-              Cancel
-            </button>
-            <button
-              className="rounded-md bg-accent px-3 py-1.5 text-[12.5px] font-medium text-on-accent hover:opacity-90 disabled:opacity-50"
-              onClick={submit}
-              disabled={saving}
-            >
-              {saving ? "Saving…" : editing ? "Save" : "Create"}
-            </button>
-          </div>
-        )}
+      <div className="flex items-center justify-end gap-2 border-t border-line px-4 py-3">
+        <button
+          className="rounded-md border border-line-strong px-3 py-1.5 text-[12.5px] text-ink-2 hover:bg-hover"
+          onClick={() => useCalendar.getState().closeModal()}
+        >
+          Cancel
+        </button>
+        <button
+          className="rounded-md bg-accent px-3 py-1.5 text-[12.5px] font-medium text-on-accent hover:opacity-90 disabled:opacity-50"
+          onClick={submit}
+          disabled={saving}
+        >
+          {saving
+            ? "Saving…"
+            : editing
+              ? guestsInvolved && notify
+                ? "Save & notify"
+                : "Save"
+              : guestsInvolved && notify
+                ? "Create & invite"
+                : "Create"}
+        </button>
       </div>
     </aside>
   );

@@ -11,24 +11,13 @@
 // focus a field, and Tab then walks To → Cc → Bcc → Subject → body.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useUi } from "@/stores/ui";
-import { RecipientInput } from "./RecipientInput";
+import { displayLabel, type Recipients } from "@/lib/recipients";
+import { RecipientChipGroup, RecipientChips } from "./RecipientChips";
 
 type Field = "to" | "cc" | "bcc" | "subject";
 
-/** "Name <email>" → the friendly name, else the bare address. */
-function displayName(addr: string): string {
-  const m = addr.match(/^(.*?)<(.+?)>$/);
-  if (m) return m[1].trim().replace(/^["']|["']$/g, "") || m[2].trim();
-  return addr.trim();
-}
-
-function summarize(raw: string): string {
-  return raw
-    .split(/[,;]/)
-    .map((s) => s.trim())
-    .filter(Boolean)
-    .map(displayName)
-    .join(", ");
+function summarize(list: Recipients): string {
+  return list.map(displayLabel).join(", ");
 }
 
 function FieldRow({
@@ -45,9 +34,11 @@ function FieldRow({
   return (
     <div
       data-field={field}
-      className="flex items-center gap-2 border-b border-line px-4 py-2"
+      // items-start, not items-center: a full To row wraps onto several lines
+      // of chips and the label has to stay on the first one.
+      className="flex items-start gap-2 border-b border-line px-4 py-2"
     >
-      <label className="w-14 shrink-0 text-[12.5px] font-medium text-ink-2">
+      <label className="w-14 shrink-0 py-[3px] text-[12.5px] font-medium text-ink-2">
         {label}
       </label>
       {children}
@@ -116,10 +107,10 @@ export function RecipientFields({ variant }: { variant: "modal" | "dock" }) {
   const ccBccRows = (
     <>
       <FieldRow field="cc" label="Cc">
-        <RecipientInput value={compose.cc} onChange={(cc) => patch({ cc })} />
+        <RecipientChips field="cc" />
       </FieldRow>
       <FieldRow field="bcc" label="Bcc">
-        <RecipientInput value={compose.bcc} onChange={(bcc) => patch({ bcc })} />
+        <RecipientChips field="bcc" />
       </FieldRow>
     </>
   );
@@ -135,14 +126,23 @@ export function RecipientFields({ variant }: { variant: "modal" | "dock" }) {
     </FieldRow>
   );
 
+  // One group across all three rows, so a chip dragged out of To can land in
+  // Cc or Bcc — a drop rewrites two lists at once, hence the whole-patch
+  // callback rather than three independent onChanges.
+  const lists = useMemo(
+    () => ({ to: compose.to, cc: compose.cc, bcc: compose.bcc }),
+    [compose.to, compose.cc, compose.bcc]
+  );
+
   // ---- dock: summary ↔ four rows -------------------------------------------
   if (variant === "dock") {
     return (
+      <RecipientChipGroup lists={lists} onChange={patch}>
       <div ref={rootRef}>
         {expanded ? (
           <>
             <FieldRow field="to" label="To">
-              <RecipientInput value={compose.to} onChange={(to) => patch({ to })} />
+              <RecipientChips field="to" />
             </FieldRow>
             {ccBccRows}
             {subjectRow}
@@ -157,11 +157,13 @@ export function RecipientFields({ variant }: { variant: "modal" | "dock" }) {
           </button>
         )}
       </div>
+      </RecipientChipGroup>
     );
   }
 
   // ---- modal: To + Subject always; Cc/Bcc behind a chevron -----------------
   return (
+    <RecipientChipGroup lists={lists} onChange={patch}>
     <div ref={rootRef}>
       <FieldRow
         field="to"
@@ -190,14 +192,11 @@ export function RecipientFields({ variant }: { variant: "modal" | "dock" }) {
           </button>
         }
       >
-        <RecipientInput
-          value={compose.to}
-          onChange={(to) => patch({ to })}
-          autoFocus
-        />
+        <RecipientChips field="to" autoFocus />
       </FieldRow>
       {expanded && ccBccRows}
       {subjectRow}
     </div>
+    </RecipientChipGroup>
   );
 }

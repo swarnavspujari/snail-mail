@@ -97,6 +97,7 @@ export function CalendarPanel() {
   const keyHints = useSettings((s) => s.settings.showKeyHints);
   const [nowTick, setNowTick] = useState(Date.now());
   const [drag, setDrag] = useState<{ from: number; to: number } | null>(null);
+  const preview = useCalendar((s) => s.modalPreview);
   const gridRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const dayStart = useMemo(() => startOfToday() + dayOffset * DAY_MS, [dayOffset]);
@@ -105,8 +106,9 @@ export function CalendarPanel() {
 
   useEffect(() => {
     const cal = useCalendar.getState();
-    void cal.loadRange(dayStart, 1);
-    cal.requestRefresh();
+    void cal.watchRange("panel", dayStart, 1);
+    cal.requestRefresh("panel");
+    return () => useCalendar.getState().unwatchRange("panel");
   }, [dayStart]);
 
   useEffect(() => {
@@ -164,6 +166,28 @@ export function CalendarPanel() {
     window.addEventListener("mousemove", move);
     window.addEventListener("mouseup", up);
   };
+
+  // Where the open modal's event would land, if it lands on this day. Timed
+  // previews get a ghost in the grid; an all-day one rides the all-day strip.
+  const ghost = useMemo(() => {
+    if (!preview || preview.allDay) return null;
+    const gridStart = dayStart + FIRST_HOUR * 3600_000;
+    const gridEnd = dayStart + LAST_HOUR * 3600_000;
+    // Overlap first, THEN clamp — clamping first draws a sliver on every
+    // other day (a real event never hits this; the store buckets those).
+    if (preview.endMs <= gridStart || preview.startMs >= gridEnd) return null;
+    const s = Math.max(preview.startMs, gridStart);
+    const e = Math.min(Math.max(preview.endMs, s + 15 * 60_000), gridEnd);
+    return {
+      top: ((s - gridStart) / 3600_000) * PX_PER_HOUR,
+      height: Math.max(20, ((e - s) / 3600_000) * PX_PER_HOUR - 2),
+    };
+  }, [preview, dayStart]);
+  const ghostAllDay =
+    !!preview &&
+    preview.allDay &&
+    preview.startMs < dayStart + DAY_MS &&
+    preview.endMs > dayStart;
 
   const dayEvents = (events[dayStart] ?? []).filter(
     (e) => !hidden.has(e.calendarId)
@@ -258,8 +282,13 @@ export function CalendarPanel() {
           Calendar surface's own settings — per-calendar visibility lives in
           Settings -> Mail, which is where it was already editable. */}
 
-      {allDay.length > 0 && (
+      {(allDay.length > 0 || ghostAllDay) && (
         <div className="space-y-1 px-4 pb-2 pt-2">
+          {ghostAllDay && (
+            <div className="cal-ghost block w-full truncate rounded-md py-1 pl-[11px] pr-2 text-left text-[12px] font-medium">
+              New event
+            </div>
+          )}
           {allDay.map((e) => (
             <button
               key={e.id}
@@ -325,7 +354,17 @@ export function CalendarPanel() {
                   style={{ top: dragTop, height: Math.max(dragHeight, 12) }}
                 />
               )}
-              {timed.length === 0 && !drag && (
+              {/* Where the event being composed would land — visible before
+                  you commit it, so placement is confirmable, not guessed. */}
+              {ghost && !drag && (
+                <div
+                  className="cal-ghost pointer-events-none absolute left-1 right-1 overflow-hidden rounded-md py-1 pl-[11px] pr-2 text-[12px] font-medium"
+                  style={{ top: ghost.top, height: ghost.height }}
+                >
+                  New event
+                </div>
+              )}
+              {timed.length === 0 && !drag && !ghost && (
                 <div className="pointer-events-none pt-10 text-center text-[12px] text-ink-3">
                   Nothing scheduled.
                 </div>

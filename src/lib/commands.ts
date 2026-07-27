@@ -118,9 +118,9 @@ export async function startReply(
   const base: ComposeState = {
     mode,
     threadId: id,
-    to: "",
-    cc: "",
-    bcc: "",
+    to: [],
+    cc: [],
+    bcc: [],
     attachments: [],
     driveLinks: [],
     draftId: null,
@@ -137,7 +137,7 @@ export async function startReply(
     quote: replyTrailerHtml(target),
   };
   if (mode === "reply") {
-    base.to = target.from;
+    base.to = [target.from];
   } else if (mode === "replyAll") {
     const others = new Set<string>();
     others.add(target.from);
@@ -145,8 +145,8 @@ export async function startReply(
       if (a.toLowerCase() !== me) others.add(a);
     }
     const [first, ...rest] = [...others];
-    base.to = first ?? "";
-    base.cc = rest.join(", ");
+    base.to = first ? [first] : [];
+    base.cc = rest;
   }
   // The composer docks inline in the reader, so make sure the thread is open
   // (e.g. when replying straight from a list selection).
@@ -179,9 +179,9 @@ export async function startIntroReply() {
   ui().startCompose({
     mode: "replyAll",
     threadId: id,
-    to: to.join(", "),
-    cc: "",
-    bcc: bcc.join(", "),
+    to,
+    cc: [],
+    bcc,
     attachments: [],
     driveLinks: [],
     draftId: null,
@@ -323,9 +323,9 @@ export function allCommands(): Command[] {
         return ui().startCompose({
           mode: "new",
           threadId: null,
-          to: "",
-          cc: "",
-          bcc: "",
+          to: [],
+          cc: [],
+          bcc: [],
           subject: "",
           body: sig ? `<p></p>${sig}` : "",
           quote: "",
@@ -454,9 +454,9 @@ export function allCommands(): Command[] {
           ui().startCompose({
             mode: "new",
             threadId: null,
-            to: r.target,
-            cc: "",
-            bcc: "",
+            to: [r.target],
+            cc: [],
+            bcc: [],
             subject: "Unsubscribe",
             body: "<p>Please unsubscribe me from this list.</p>",
             quote: "",

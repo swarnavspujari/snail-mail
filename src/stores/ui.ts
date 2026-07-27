@@ -3,6 +3,7 @@ import { backend } from "@/lib/ipc";
 import { sanitizeUserHtml } from "@/lib/sanitize";
 import { splitThreads, useMail, visibleThreads } from "./mail";
 import { activeSignature, useSettings } from "./settings";
+import type { Recipients } from "@/lib/recipients";
 import type { MailAttachment, MigrationProgress, OutgoingMail, SyncProgress, ThreadId, ZeroEvent } from "@/lib/types";
 
 export type Screen = "mail" | "settings" | "search" | "calendar";
@@ -15,9 +16,13 @@ export type ComposeMode = "new" | "reply" | "replyAll" | "forward";
 export interface ComposeState {
   mode: ComposeMode;
   threadId: ThreadId | null;
-  to: string;
-  cc: string;
-  bcc: string;
+  /** One token per recipient ("Name <a@b.c>" or a bare address), never a
+   *  comma-joined string: chips exist to remove exactly that ambiguity, and a
+   *  display name containing a comma has no faithful encoding in one. Legacy
+   *  string drafts normalize on read — see lib/recipients. */
+  to: Recipients;
+  cc: Recipients;
+  bcc: Recipients;
   subject: string;
   body: string; // rich HTML from the WYSIWYG editor (signature lives inside it)
   /** Read-only quoted context appended at send (new-message compose only; a
@@ -177,7 +182,7 @@ export function htmlBodyIsBlank(html: string): boolean {
 export function composeHasContent(c: ComposeState): boolean {
   if (!htmlBodyIsBlank(c.body)) return true;
   if (c.attachments.length > 0) return true;
-  if (c.mode === "new") return !!(c.to.trim() || c.subject.trim());
+  if (c.mode === "new") return c.to.length > 0 || !!c.subject.trim();
   return false;
 }
 
@@ -186,11 +191,8 @@ export function composeHasContent(c: ComposeState): boolean {
  *  (build_rfc822 emits multipart/alternative when bodyHtml is set) plus a
  *  plain-text fallback. */
 export function outgoingFromCompose(c: ComposeState): OutgoingMail {
-  const split = (raw: string) =>
-    raw
-      .split(/[,;]/)
-      .map((s) => s.trim())
-      .filter(Boolean);
+  // Recipients are already tokens — the old split on [,;] is gone, and with it
+  // the reason autocomplete had to discard a display name containing a comma.
   // `quote` is now rich HTML (signature + attribution + the original message),
   // so it passes through as markup — sanitized, never escaped.
   const quoteHtml = c.quote.trim() ? sanitizeUserHtml(c.quote) : "";
@@ -208,9 +210,9 @@ export function outgoingFromCompose(c: ComposeState): OutgoingMail {
 
   return {
     threadId: c.threadId,
-    to: split(c.to),
-    cc: split(c.cc),
-    bcc: split(c.bcc ?? ""),
+    to: [...c.to],
+    cc: [...c.cc],
+    bcc: [...(c.bcc ?? [])],
     subject: c.subject || "(no subject)",
     bodyText,
     bodyHtml: htmlParts.join(""),

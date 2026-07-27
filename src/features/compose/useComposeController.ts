@@ -9,6 +9,7 @@ import { backend } from "@/lib/ipc";
 import { pushTriageUndo } from "@/lib/commands";
 import { pushUndo } from "@/lib/undo";
 import { sanitizeUserHtml } from "@/lib/sanitize";
+import { addrSpec } from "@/lib/recipients";
 import { useMail } from "@/stores/mail";
 import { activeCapabilities, useSettings } from "@/stores/settings";
 import {
@@ -22,13 +23,6 @@ import {
 import type { DriveShareMode, MailAttachment, OutgoingMail } from "@/lib/types";
 
 const MAX_ATTACH_TOTAL = 25_000_000; // Gmail's raw-message ceiling
-
-function splitAddresses(raw: string): string[] {
-  return raw
-    .split(/[,;]/)
-    .map((s) => s.trim())
-    .filter(Boolean);
-}
 
 /** Plain-text of the user's message, for the optimistic row's snippet fallback
  *  (the card renders the HTML; this is only used when there's no HTML). */
@@ -140,13 +134,6 @@ function promptShareMode(count: number): Promise<DriveShareMode | "cancel"> {
   });
 }
 
-/** The bare addr-spec of a recipient token — Drive's permissions API takes
- *  addresses only, but recipients arrive as "Name <email>" from autocomplete. */
-function addrSpec(token: string): string {
-  const m = token.match(/<([^>]+)>/);
-  return (m ? m[1] : token).trim();
-}
-
 /** Share-on-send, shared by Send and Send Later: chips still present in the
  *  body (the user may have deleted some) get a share dialog before the mail
  *  moves. Per-file failures warn but never block the send — Gmail behaves
@@ -235,7 +222,7 @@ export function useComposeController() {
     const send = async (markDone: boolean) => {
       const c = useUi.getState().compose;
       if (!c || sending) return;
-      const to = splitAddresses(c.to);
+      const to = [...c.to];
       if (to.length === 0) {
         setError("Add at least one recipient.");
         return;
@@ -281,7 +268,7 @@ export function useComposeController() {
             from: useSettings.getState().accounts.active ?? "",
             fromName: "You",
             to,
-            cc: splitAddresses(c.cc),
+            cc: [...c.cc],
             subject: c.subject || "(no subject)",
             bodyHtml: sanitizeUserHtml(c.body).trim() || null,
             bodyText: plainMessageText(c.body),

@@ -2,11 +2,21 @@
 // on reopen/navigation. Reads are local (SQLite / demo fixtures); freshness
 // arrives via refreshCalendar + the calendar:updated event. Event modal +
 // popover state lives here too (they belong to the calendar views).
+//
+// Visible ranges are a REGISTRY, not a single slot: the calendar screen mounts
+// the week grid (7 days) and the day panel (1 day) at the same time, and a
+// single activeStart/activeDays pair meant whichever mounted last won — so
+// every calendar:updated re-read one day and left the week stale. Each view
+// registers its own range under a key; updates re-read all of them.
 import { create } from "zustand";
 import { backend } from "@/lib/ipc";
 import type { CalendarEvent, CalendarInfo } from "@/lib/types";
 
 export const DAY_MS = 24 * 3600_000;
+
+/** Longest span a single event may invalidate. A decade-long entry (they
+ *  exist) must not turn one write into thousands of cache keys. */
+const MAX_SPAN_DAYS = 400;
 
 // One requestRefresh per range per window (see requestRefresh below).
 const REFRESH_THROTTLE_MS = 30_000;
@@ -23,12 +33,65 @@ export function startOfToday(): number {
   return d.getTime();
 }
 
+/** Snap an instant onto the day-key lattice the cache uses (`startOfToday() +
+ *  n * DAY_MS`, the same arithmetic both views derive their columns from), so
+ *  an invalidation key always names a real bucket. */
+export function dayKeyOf(ms: number): number {
+  const base = startOfToday();
+  return base + Math.floor((ms - base) / DAY_MS) * DAY_MS;
+}
+
+/** The day keys an event occupies. `endMs` is exclusive both for all-day
+ *  events (model-level) and timed ones, so an event ending exactly at midnight
+ *  does not claim the next day. */
+export function daysCovered(startMs: number, endMs: number): number[] {
+  const first = dayKeyOf(startMs);
+  const last = dayKeyOf(Math.max(startMs, endMs - 1));
+  const out: number[] = [];
+  for (let d = first; d <= last && out.length < MAX_SPAN_DAYS; d += DAY_MS) {
+    out.push(d);
+  }
+  return out;
+}
+
+/** One view's visible range. */
+export interface WatchedRange {
+  start: number;
+  days: number;
+}
+
+/** Ranges to actually re-read: a range wholly inside another is dropped, so
+ *  the panel's single day doesn't cost a second query when the week that
+ *  contains it is already being re-read. */
+export function distinctRanges(ranges: WatchedRange[]): WatchedRange[] {
+  const covers = (a: WatchedRange, b: WatchedRange) =>
+    a.start <= b.start && a.start + a.days * DAY_MS >= b.start + b.days * DAY_MS;
+  return ranges.filter(
+    (r, i) =>
+      !ranges.some((other, j) => j !== i && covers(other, r) && (j < i || !covers(r, other)))
+  );
+}
+
+/** Is this day key inside any of these ranges? */
+export function rangesCover(ranges: WatchedRange[], day: number): boolean {
+  return ranges.some((r) => day >= r.start && day < r.start + r.days * DAY_MS);
+}
+
 /** The create/edit event modal. */
 export interface EventModalState {
   mode: "create" | "edit";
   /** Edit target (carries id/etag/calendarId + guest context); null = create. */
   event: CalendarEvent | null;
   /** Prefill for create (from a clicked/dragged slot or "New event"). */
+  startMs: number;
+  endMs: number;
+  allDay: boolean;
+}
+
+/** The modal's UNCOMMITTED placement, republished on every start/end edit so
+ *  the day grid can show a ghost block where the event would land. Never
+ *  persisted and never clickable — it is not an event yet. */
+export interface EventPreview {
   startMs: number;
   endMs: number;
   allDay: boolean;
@@ -49,12 +112,12 @@ interface CalendarState {
   error: string | null;
   /** Days from today for the focused day (panel + week view selection). */
   dayOffset: number;
-  /** The range views are currently showing, revalidated on updates. */
-  activeStart: number;
-  activeDays: number;
+  /** Ranges the mounted views are showing, keyed by view ("week", "panel"). */
+  watchers: Record<string, WatchedRange>;
   /** The account's calendars (modal selector; owner/writer = writable). */
   calendars: CalendarInfo[];
   modal: EventModalState | null;
+  modalPreview: EventPreview | null;
   popover: EventPopoverState | null;
 
   shiftDay: (delta: number) => void;
@@ -65,15 +128,25 @@ interface CalendarState {
    *  already in the cache are skipped unless `force` (the calendar:updated
    *  reconcile path) — navigation over loaded days is a pure cache paint. */
   loadRange: (dayStart: number, days: number, opts?: { force?: boolean }) => Promise<void>;
-  /** Ask the backend for fresh data around the active range. */
-  requestRefresh: () => void;
-  /** calendar:updated landed — re-read the active range / surface errors. */
+  /** Register (or move) a view's visible range and load it. */
+  watchRange: (key: string, dayStart: number, days: number) => Promise<void>;
+  /** The view unmounted — stop re-reading its range. */
+  unwatchRange: (key: string) => void;
+  /** Ask the backend for fresh data around a watched range. */
+  requestRefresh: (key: string) => void;
+  /** calendar:updated landed — re-read every watched range / surface errors. */
   handleUpdated: (error: string | null) => void;
+  /** A local write changed these days: forget them, then re-read whichever
+   *  watched ranges cover them. Days nobody is watching just become unloaded
+   *  and refetch on navigation — which is the half the optimistic insert and
+   *  the single-range reconcile both missed. */
+  invalidateDays: (days: number[]) => Promise<void>;
   /** Refresh the calendarList for the modal's selector. */
   loadCalendars: () => Promise<void>;
   openCreate: (startMs: number, endMs: number, allDay?: boolean) => void;
   openEdit: (event: CalendarEvent) => void;
   closeModal: () => void;
+  setModalPreview: (p: EventPreview | null) => void;
   openPopover: (event: CalendarEvent, x: number, y: number) => void;
   closePopover: () => void;
 }
@@ -83,10 +156,10 @@ export const useCalendar = create<CalendarState>((set, get) => ({
   loadedDays: {},
   error: null,
   dayOffset: 0,
-  activeStart: startOfToday(),
-  activeDays: 1,
+  watchers: {},
   calendars: [],
   modal: null,
+  modalPreview: null,
   popover: null,
 
   shiftDay: (delta) => set((s) => ({ dayOffset: s.dayOffset + delta })),
@@ -95,7 +168,6 @@ export const useCalendar = create<CalendarState>((set, get) => ({
     set({ dayOffset: Math.round((dayStartMs - startOfToday()) / DAY_MS) }),
 
   loadRange: async (dayStart, days, opts) => {
-    set({ activeStart: dayStart, activeDays: days });
     // Trim already-loaded days off both ends of the range; a fully cached
     // range is a no-op (the views paint straight from eventsByDay).
     let from = dayStart;
@@ -124,18 +196,33 @@ export const useCalendar = create<CalendarState>((set, get) => ({
     }
   },
 
-  requestRefresh: () => {
-    const s = get();
+  watchRange: async (key, dayStart, days) => {
+    set((s) => ({ watchers: { ...s.watchers, [key]: { start: dayStart, days } } }));
+    await get().loadRange(dayStart, days);
+  },
+
+  unwatchRange: (key) =>
+    set((s) => {
+      if (!(key in s.watchers)) return {};
+      const watchers = { ...s.watchers };
+      delete watchers[key];
+      return { watchers };
+    }),
+
+  requestRefresh: (key) => {
+    const range = get().watchers[key];
+    if (!range) return;
     // One background sync per range per window: day/week nav shouldn't spam
     // the network (the core throttles too; the mock echoes synchronously).
-    // Freshness after writes is untouched — that flows through
-    // calendar:updated → handleUpdated, which always re-reads.
-    const key = `${s.activeStart}:${s.activeDays}`;
-    const last = refreshRequestedAt.get(key) ?? 0;
+    // Keyed by the RANGE, not the view — the panel and the week asking for the
+    // same span is still one request. Freshness after writes is untouched:
+    // that flows through calendar:updated / invalidateDays, which re-read.
+    const throttleKey = `${range.start}:${range.days}`;
+    const last = refreshRequestedAt.get(throttleKey) ?? 0;
     if (Date.now() - last < REFRESH_THROTTLE_MS) return;
-    refreshRequestedAt.set(key, Date.now());
+    refreshRequestedAt.set(throttleKey, Date.now());
     void backend
-      .refreshCalendar(s.activeStart, s.activeStart + s.activeDays * DAY_MS)
+      .refreshCalendar(range.start, range.start + range.days * DAY_MS)
       .catch(() => {});
   },
 
@@ -144,8 +231,28 @@ export const useCalendar = create<CalendarState>((set, get) => ({
       set({ error });
       return;
     }
-    const s = get();
-    void s.loadRange(s.activeStart, s.activeDays, { force: true });
+    for (const r of distinctRanges(Object.values(get().watchers))) {
+      void get().loadRange(r.start, r.days, { force: true });
+    }
+  },
+
+  invalidateDays: async (days) => {
+    if (days.length === 0) return;
+    set((s) => {
+      const loadedDays = { ...s.loadedDays };
+      const eventsByDay = { ...s.eventsByDay };
+      for (const d of days) {
+        delete loadedDays[d];
+        delete eventsByDay[d];
+      }
+      return { loadedDays, eventsByDay };
+    });
+    // The days are gone from the cache, so a plain (unforced) loadRange over a
+    // watched range refetches exactly them and nothing else.
+    const touched = distinctRanges(Object.values(get().watchers)).filter((r) =>
+      days.some((d) => d >= r.start && d < r.start + r.days * DAY_MS)
+    );
+    await Promise.all(touched.map((r) => get().loadRange(r.start, r.days)));
   },
 
   loadCalendars: async () => {
@@ -161,6 +268,7 @@ export const useCalendar = create<CalendarState>((set, get) => ({
     set({
       popover: null,
       modal: { mode: "create", event: null, startMs, endMs, allDay },
+      modalPreview: { startMs, endMs, allDay },
     });
   },
 
@@ -175,10 +283,22 @@ export const useCalendar = create<CalendarState>((set, get) => ({
         endMs: event.endMs,
         allDay: event.allDay,
       },
+      modalPreview: {
+        startMs: event.startMs,
+        endMs: event.endMs,
+        allDay: event.allDay,
+      },
     });
   },
 
-  closeModal: () => set({ modal: null }),
+  closeModal: () => set({ modal: null, modalPreview: null }),
+  setModalPreview: (p) => set({ modalPreview: p }),
   openPopover: (event, x, y) => set({ popover: { event, x, y } }),
   closePopover: () => set({ popover: null }),
 }));
+
+/** Is this day key on screen in any mounted calendar view? Drives whether the
+ *  placement preview needs to move the view to itself. */
+export function dayIsWatched(day: number): boolean {
+  return rangesCover(Object.values(useCalendar.getState().watchers), day);
+}

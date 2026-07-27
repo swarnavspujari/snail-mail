@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { backend } from "@/lib/ipc";
+import { displayLabel, normalizeRecipients } from "@/lib/recipients";
 import { useUi, type ComposeState } from "@/stores/ui";
 import { PickerShell, type PickerItem } from "./PickerShell";
 import type { DraftEntry } from "@/lib/types";
@@ -31,7 +32,11 @@ export function DraftsPicker() {
       /* corrupt draft rows are shown raw and can be discarded in compose */
     }
     const subject = parsed?.subject?.trim() || "(no subject)";
-    const to = parsed?.to?.trim();
+    // normalize, don't read: a draft written before recipients became arrays
+    // still holds a comma-separated string, and calling .trim() on the array
+    // that replaced it threw — taking out the picker, and with it access to
+    // every draft.
+    const to = normalizeRecipients(parsed?.to).map(displayLabel).join(", ");
     return {
       label: subject,
       detail: `${to ? `to ${to} · ` : ""}${fmtWhen(d.updatedAt)}`,
@@ -43,8 +48,11 @@ export function DraftsPicker() {
         }
         useUi.getState().startCompose({
           ...parsed,
-          // Drafts saved before Bcc/Drive links existed lack those fields.
-          bcc: parsed.bcc ?? "",
+          // Drafts saved before Bcc/Drive links existed lack those fields;
+          // ones saved before chips hold recipients as a single string.
+          to: normalizeRecipients(parsed.to),
+          cc: normalizeRecipients(parsed.cc),
+          bcc: normalizeRecipients(parsed.bcc),
           attachments: parsed.attachments ?? [],
           driveLinks: parsed.driveLinks ?? [],
           draftId: d.id,

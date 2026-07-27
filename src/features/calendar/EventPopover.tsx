@@ -5,7 +5,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { backend, openExternal } from "@/lib/ipc";
 import { assignCalendarHues, calendarHue, hueVar } from "@/lib/calendar-view";
-import { useCalendar } from "@/stores/calendar";
+import { daysCovered, useCalendar } from "@/stores/calendar";
 import { useUi } from "@/stores/ui";
 import type { CalendarEvent, RsvpResponse } from "@/lib/types";
 
@@ -116,6 +116,9 @@ export function EventPopover() {
         useUi.getState().showToast("This event changed elsewhere — review and retry");
         return;
       }
+      // Forget the days it occupied, or the block stays drawn on any day a
+      // view isn't currently watching (calendar:updated only re-reads those).
+      void useCalendar.getState().invalidateDays(daysCovered(e.startMs, e.endMs));
       useCalendar.getState().closePopover();
       useUi.getState().showToast(notify ? "Event deleted — guests notified" : "Event deleted");
     } catch (err) {

@@ -352,6 +352,37 @@ body {
     border-color: color-mix(in oklab, var(--ev) 52%, transparent);
     background: color-mix(in oklab, var(--ev) 30%, var(--bg-surface));
   }
+  /* Placement preview for the event being composed. Deliberately unlike a
+     real block — dashed, hatched, no left rule — so an uncommitted ghost is
+     never mistaken for something already on the calendar. */
+  .cal-ghost {
+    border: 1px dashed color-mix(in oklab, var(--accent) 70%, transparent);
+    background: repeating-linear-gradient(
+      45deg,
+      color-mix(in oklab, var(--accent) 16%, var(--bg-surface)),
+      color-mix(in oklab, var(--accent) 16%, var(--bg-surface)) 6px,
+      color-mix(in oklab, var(--accent) 8%, var(--bg-surface)) 6px,
+      color-mix(in oklab, var(--accent) 8%, var(--bg-surface)) 12px
+    );
+    color: var(--accent-strong);
+  }
+}
+
+/* Recipient chips (To/Cc/Bcc, event guests). The whole chip turns
+   destructive while the × is hovered — the click is legible before it
+   lands, not after. */
+.fm-chip:has(.fm-chip-x:hover) {
+  border-color: color-mix(in oklab, var(--danger) 55%, transparent);
+  background: color-mix(in oklab, var(--danger) 16%, var(--bg-surface));
+}
+.fm-chip:has(.fm-chip-x:hover) .fm-chip-x {
+  color: var(--danger);
+}
+.fm-chip-x:hover {
+  color: var(--danger);
+}
+.fm-chip:active {
+  cursor: grabbing;
 }
 
 /* Keycap hint chips used in palette + shortcut help */

@@ -250,7 +250,11 @@ export default function App() {
       useCalendar.getState().handleUpdated(err)
     );
     // returning to the app → an incremental calendar pull (throttled in core)
-    const onFocus = () => useCalendar.getState().requestRefresh();
+    // for every range a mounted view is showing, not just one of them
+    const onFocus = () => {
+      const cal = useCalendar.getState();
+      for (const key of Object.keys(cal.watchers)) cal.requestRefresh(key);
+    };
     window.addEventListener("focus", onFocus);
     return () => {
       clearTimeout(timer);
@@ -540,8 +544,13 @@ export default function App() {
           calendar panels) so it stays put across the mail and calendar
           screens — opened from a slot click/drag or B, driven by
           calendar.modal. */}
+      {/* startMs is part of the key: every create shares the id "new", so
+          without it, clicking a second slot while a create panel is open
+          re-used the panel and kept the FIRST slot's time in the form. */}
       {eventModal && (
-        <EventModal key={`${eventModal.mode}-${eventModal.event?.id ?? "new"}`} />
+        <EventModal
+          key={`${eventModal.mode}-${eventModal.event?.id ?? "new"}-${eventModal.startMs}`}
+        />
       )}
       {shortcutsOpen && <ShortcutsPanel />}
       </div>
