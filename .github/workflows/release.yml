@@ -26,13 +26,84 @@ permissions:
   contents: write
 
 jobs:
-  # Secrets cannot be read in a job-level `if:`, so the presence check has to
-  # happen inside a job and come back out as an output.
-  gate:
+  # Everything that can be known BEFORE spending ~20 minutes compiling Rust.
+  #
+  # v0.28.0 built for 19 minutes and then died on `POST /releases` with
+  # "Resource not accessible by integration", three times. Every check below
+  # takes seconds and every one of them fails the run before a single crate is
+  # compiled — the point is not that these problems are likely, it is that
+  # discovering them at the END costs 20 minutes and a re-tag each time.
+  #
+  # Secrets also cannot be read in a job-level `if:`, so the macOS presence
+  # check has to happen inside a job and come back out as an output.
+  preflight:
     runs-on: ubuntu-latest
     outputs:
       macos: ${{ steps.check.outputs.macos }}
     steps:
+      - uses: actions/checkout@v5
+
+      # The failure that started this. A token that cannot create a release
+      # cannot be discovered any other way — the job's own "Set up job" log
+      # prints `Contents: write` even when the grant is capped, because that
+      # line reports what the workflow REQUESTED.
+      - name: the token can actually publish a release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # A draft against a tag that does not exist creates no tag and is
+          # invisible publicly, so this is a canary with no side effects.
+          if id=$(gh api -X POST "repos/$REPO/releases" \
+                    -f tag_name=zz-preflight-canary -F draft=true --jq .id 2>/dev/null); then
+            gh api -X DELETE "repos/$REPO/releases/$id"
+            echo "GITHUB_TOKEN can create releases."
+          else
+            echo "::error::GITHUB_TOKEN cannot create a release, so this build would be thrown away at the end." >&2
+            echo "::error::Set Settings -> Actions -> General -> Workflow permissions to 'Read and write', then DELETE AND RE-PUSH the tag." >&2
+            echo "::error::A 'gh run rerun' will NOT pick the change up: a re-run reuses the grants minted when the run was created." >&2
+            exit 1
+          fi
+
+      # Cutting vX.Y.Z from a tree that still says X.Y.(Z-1) produces an
+      # installer whose filename, About pane and updater feed all disagree with
+      # the tag. Concurrent sessions share this version namespace, so a bump
+      # can also be silently taken by someone else between writing and tagging.
+      - name: the tag matches the version in the tree
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          fail=0
+          check() { # <label> <actual>
+            if [ "$2" != "$tag" ]; then
+              echo "::error::$1 says '$2' but the tag says '$tag'" >&2
+              fail=1
+            else
+              echo "  ok  $1 = $2"
+            fi
+          }
+          check "package.json"            "$(node -p 'require("./package.json").version')"
+          check "package-lock.json"       "$(node -p 'require("./package-lock.json").version')"
+          check "package-lock (packages)" "$(node -p 'require("./package-lock.json").packages[""].version')"
+          check "tauri.conf.json"         "$(node -p 'require("./src-tauri/tauri.conf.json").version')"
+          check "Cargo.toml"              "$(sed -n 's/^version = "\(.*\)"/\1/p' src-tauri/Cargo.toml | head -1)"
+          check "Cargo.lock"              "$(awk '/^name = "snail-mail"$/{getline; sub(/^version = "/,""); sub(/"$/,""); print; exit}' src-tauri/Cargo.lock)"
+          [ "$fail" -eq 0 ] || exit 1
+
+      # Re-tagging over a release that already has assets would upload a second
+      # set beside the first rather than replacing them.
+      - name: this tag has not already been released
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets | length' 2>/dev/null | grep -qv '^0$'; then
+            echo "::error::A release for $GITHUB_REF_NAME already exists WITH assets. Delete it first, or bump the version." >&2
+            exit 1
+          fi
+          echo "no published release for $GITHUB_REF_NAME yet."
+
       - name: is macOS signing configured?
         id: check
         env:
@@ -73,6 +144,7 @@ jobs:
           fi
 
   release-windows:
+    needs: preflight
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
@@ -142,26 +214,112 @@ jobs:
           # can paste their own in Settings -> Privacy & keys.
           SNAIL_UNSPLASH_ACCESS_KEY: ${{ secrets.SNAIL_UNSPLASH_ACCESS_KEY }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: "Snail Mail ${{ github.ref_name }}"
-          # v0.26.0 stopped installing updates unattended (DECISIONS #154), so
-          # "update themselves automatically" is no longer true of anything
-          # from that release onward — it downloads, then waits for you.
-          releaseBody: |
-            Snail Mail ${{ github.ref_name }} — download the Windows installer
-            below (`Snail.Mail_*_x64-setup.exe`). Existing installs download
-            this in the background and offer to install it; if you never click,
-            it installs when you next quit the app.
-          releaseDraft: false
-          prerelease: false
-          includeUpdaterJson: true
+          # BUILD ONLY — no tagName/releaseId, so the action never touches the
+          # Releases API. Its own create call returns 403 "Resource not
+          # accessible by integration" on this repo, while the identical
+          # POST /releases succeeds from the same runner with the same
+          # GITHUB_TOKEN via gh and via octokit (proven with a probe workflow
+          # across four variables: repo permission default, fresh vs re-run,
+          # dispatch vs tag push, ubuntu vs windows). Publishing below uses the
+          # call that demonstrably works, and as a bonus this workflow now owns
+          # latest.json outright, which is what the macOS job has to patch.
+          includeUpdaterJson: false
+
+      # Deterministic asset names. GitHub rewrites spaces to dots on upload, so
+      # renaming here makes the download URL predictable rather than inferred —
+      # latest.json below has to embed that exact URL.
+      - name: stage the installer under its published name
+        id: stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          exe=$(ls src-tauri/target/release/bundle/nsis/*_x64-setup.exe | head -1)
+          name="Snail.Mail_${version}_x64-setup.exe"
+          cp "$exe" "$name"
+          cp "$exe.sig" "$name.sig"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          ls -l "$name" "$name.sig"
+
+      # The updater feed, written by hand to the same shape tauri-action
+      # produced for v0.27.0 — including the `windows-x86_64-nsis` alias beside
+      # `windows-x86_64`, because clients pinned to either key must keep
+      # resolving. Getting this wrong silently strands every existing install,
+      # so it is verified after upload rather than assumed.
+      - name: build latest.json
+        shell: bash
+        env:
+          NAME: ${{ steps.stage.outputs.name }}
+          VERSION: ${{ steps.stage.outputs.version }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # node, not jq: node is guaranteed here (setup-node ran), whereas jq
+          # is a runner-image convenience. Discovering it missing would cost
+          # another full build to find out.
+          node -e '
+            const fs = require("fs");
+            const { NAME, VERSION, REPO, GITHUB_REF_NAME: TAG } = process.env;
+            const platform = {
+              signature: fs.readFileSync(NAME + ".sig", "utf8").trim(),
+              url: `https://github.com/${REPO}/releases/download/${TAG}/${NAME}`,
+            };
+            fs.writeFileSync("latest.json", JSON.stringify({
+              version: VERSION,
+              notes: [
+                `Snail Mail ${TAG} — download the Windows installer below (\`${NAME}\`).`,
+                "Existing installs download this in the background and offer to install it;",
+                "if you never click, it installs when you next quit the app.",
+              ].join("\n"),
+              pub_date: new Date().toISOString(),
+              // Both keys, same artifact: clients pinned to either must resolve.
+              platforms: { "windows-x86_64": platform, "windows-x86_64-nsis": platform },
+            }, null, 2));
+          '
+          node -e 'const f=require("./latest.json");
+                   const k=Object.keys(f.platforms);
+                   if(!f.version||!k.length) { console.error("empty feed"); process.exit(1); }
+                   console.log("feed:", f.version, k.join(", "));'
+
+      - name: publish the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NAME: ${{ steps.stage.outputs.name }}
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" \
+            --title "Snail Mail $GITHUB_REF_NAME" \
+            --notes "$(node -p 'require("./latest.json").notes')" \
+            --verify-tag \
+            "$NAME" "$NAME.sig" latest.json
+
+      # An updater feed that 404s or lists the wrong version is invisible until
+      # nobody's app updates, so assert it end to end from the public URL.
+      - name: the published feed is the one clients will read
+        shell: bash
+        env:
+          VERSION: ${{ steps.stage.outputs.version }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          curl -sSL --retry 5 --retry-delay 3 -o feed.json \
+            "https://github.com/$REPO/releases/latest/download/latest.json"
+          got=$(node -p 'require("./feed.json").version')
+          [ "$got" = "$VERSION" ] \
+            || { echo "::error::latest.json says $got, expected $VERSION" >&2; exit 1; }
+          url=$(node -p 'require("./feed.json").platforms["windows-x86_64"].url')
+          code=$(curl -sSL -o /dev/null -w '%{http_code}' "$url")
+          [ "$code" = "200" ] || { echo "::error::installer URL in the feed returned $code: $url" >&2; exit 1; }
+          echo "feed ok: version $VERSION, installer reachable"
 
   # Universal (Intel + Apple silicon) .app and .dmg, Developer ID signed and
   # notarized. Runs after Windows because it PATCHES that job's latest.json
   # rather than writing its own — see the merge step.
   release-macos:
-    needs: [gate, release-windows]
-    if: needs.gate.outputs.macos == 'true'
+    needs: [preflight, release-windows]
+    if: needs.preflight.outputs.macos == 'true'
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v5
@@ -198,33 +356,43 @@ jobs:
           SNAIL_GMAIL_CLIENT_SECRET: ${{ secrets.SNAIL_GMAIL_CLIENT_SECRET }}
           SNAIL_UNSPLASH_ACCESS_KEY: ${{ secrets.SNAIL_UNSPLASH_ACCESS_KEY }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseDraft: false
-          prerelease: false
-          # Deliberately false. Both jobs writing latest.json means the second
-          # one to finish REPLACES the first's platform map, silently cutting
-          # the other OS off from updates. The next step merges instead.
+          # Build only, same as the Windows job — the action's Releases calls
+          # are the part that 403s here. Publishing is `gh` below.
           includeUpdaterJson: false
           args: --target universal-apple-darwin
 
-      - name: add macOS to the updater feed
+      - name: stage the macOS artifacts under their published names
+        id: stage
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          bundle=src-tauri/target/universal-apple-darwin/release/bundle
+          dmg=$(ls "$bundle"/dmg/*.dmg | head -1)
+          tgz=$(ls "$bundle"/macos/*.app.tar.gz | head -1)
+          dmg_name="Snail.Mail_${version}_universal.dmg"
+          tgz_name="Snail.Mail_${version}_universal.app.tar.gz"
+          cp "$dmg" "$dmg_name"
+          cp "$tgz" "$tgz_name"
+          cp "$tgz.sig" "$tgz_name.sig"
+          echo "dmg=$dmg_name" >> "$GITHUB_OUTPUT"
+          echo "tgz=$tgz_name" >> "$GITHUB_OUTPUT"
+
+      - name: add macOS to the release and the updater feed
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+          DMG: ${{ steps.stage.outputs.dmg }}
+          TGZ: ${{ steps.stage.outputs.tgz }}
         run: |
           set -euo pipefail
-          bundle=src-tauri/target/universal-apple-darwin/release/bundle/macos
-          sig_path=$(ls "$bundle"/*.app.tar.gz.sig | head -1)
-          sig=$(cat "$sig_path")
-          # Ask the release what it actually named the asset rather than
-          # reconstructing it — the bundler's naming has changed before.
-          url=$(gh release view "$TAG" --json assets \
-                --jq '.assets[] | select(.name | endswith(".app.tar.gz")) | .url' | head -1)
-          if [ -z "$url" ]; then
-            echo "::error::no .app.tar.gz asset on $TAG — the updater feed would advertise macOS with no artifact" >&2
-            exit 1
-          fi
+          gh release upload "$TAG" "$DMG" "$TGZ" "$TGZ.sig" --clobber
+          # PATCH the Windows job's feed rather than writing one: two jobs each
+          # emitting latest.json means the second replaces the first's platform
+          # map and silently cuts the other OS off from updates.
           gh release download "$TAG" --pattern latest.json --clobber
+          sig=$(cat "$TGZ.sig")
+          url="https://github.com/$REPO/releases/download/$TAG/$TGZ"
           # One universal binary serves both architectures, so both keys point
           # at the same artifact. The updater looks up exactly these names.
           jq --arg url "$url" --arg sig "$sig" \

@@ -6,6 +6,22 @@ on:
   pull_request:
 
 jobs:
+  # release.yml only ever runs on a `v*` tag, so until now the first execution
+  # of any change to it WAS a release — a shell typo or a bad expression cost a
+  # tag and a 20-minute build to discover. actionlint parses every workflow
+  # here (expressions, `needs`/`outputs` references, and shellcheck over each
+  # `run:` block) on every push, where it costs seconds.
+  workflows:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: actionlint
+        # Pinned by digest-bearing tag rather than :latest — a linter that
+        # silently changes what it rejects would fail unrelated PRs.
+        uses: docker://rhysd/actionlint:1.7.7
+        with:
+          args: -color
+
   windows:
     runs-on: windows-latest
     steps:
