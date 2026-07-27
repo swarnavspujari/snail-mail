@@ -32,6 +32,10 @@ const KV_HOURLY: &str = "unsplash:hourly";
 pub const DAY_MS: i64 = 86_400_000;
 const HOUR_MS: i64 = 3_600_000;
 const HOURLY_CAP: usize = 50;
+/// The photo turns over at 12:01 AM local, not at midnight sharp — a minute of
+/// slack keeps the rotation off the exact instant every other daily rollover in
+/// the OS fires, and reads as "the new day" rather than "the stroke of".
+const ROTATE_AT_MS_PAST_MIDNIGHT: i64 = 60_000;
 // Unsplash's API terms require every photo/photographer link to carry the
 // app's own utm_source. This still said `fission_mail` two rebrands later, so
 // every attribution link credited an application name that no longer exists —
@@ -51,6 +55,25 @@ pub fn access_key() -> Option<String> {
     crate::secrets::get(crate::secrets::UNSPLASH_ACCESS_KEY)
         .filter(|k| !k.trim().is_empty())
         .or_else(|| BAKED_ACCESS_KEY.map(str::to_string))
+}
+
+/// Which "photo day" an instant belongs to, in the user's LOCAL time, with the
+/// boundary at 12:01 AM. Two instants sharing a number share a photo.
+///
+/// The cache used to expire on a rolling `now - fetched_at >= 24h`, which ties
+/// the rotation to whenever the last fetch happened to land: first open the app
+/// at 3pm and the photo changes at 3pm, every day, drifting later each time it
+/// is missed. A wall-clock boundary is what "a new photo each day" means.
+pub fn photo_day(ms: i64) -> i64 {
+    use chrono::{Datelike, Local, LocalResult, TimeZone};
+    let at = ms - ROTATE_AT_MS_PAST_MIDNIGHT;
+    match Local.timestamp_millis_opt(at) {
+        LocalResult::Single(dt) => i64::from(dt.date_naive().num_days_from_ce()),
+        // A fixed instant maps unambiguously into any real zone, so this is
+        // unreachable — but don't invent a day number if it ever isn't. UTC
+        // days still rotate once a day, just not on the user's midnight.
+        _ => at.div_euclid(DAY_MS),
+    }
 }
 
 /// Local rate cap: true when another API request is allowed right now.
@@ -134,7 +157,43 @@ pub async fn fetch_daily(
 
 #[cfg(test)]
 mod tests {
-    use super::UTM;
+    use super::{photo_day, DAY_MS, UTM};
+    use chrono::{Local, TimeZone};
+
+    /// Local millis for a wall-clock time today-ish, so the assertions below
+    /// read in the timezone the rotation actually happens in.
+    fn local(y: i32, m: u32, d: u32, h: u32, min: u32) -> i64 {
+        Local
+            .with_ymd_and_hms(y, m, d, h, min, 0)
+            .single()
+            .expect("unambiguous local time")
+            .timestamp_millis()
+    }
+
+    #[test]
+    fn the_day_turns_over_at_12_01_am_local() {
+        let before = local(2026, 7, 27, 0, 0); // 12:00 AM — still yesterday's
+        let at = local(2026, 7, 27, 0, 1); // 12:01 AM — the new photo
+        assert_eq!(photo_day(before), photo_day(local(2026, 7, 26, 23, 59)));
+        assert_ne!(photo_day(at), photo_day(before));
+    }
+
+    #[test]
+    fn one_calendar_day_is_one_photo() {
+        let morning = local(2026, 7, 27, 9, 0);
+        let night = local(2026, 7, 27, 23, 30);
+        assert_eq!(photo_day(morning), photo_day(night));
+    }
+
+    /// The bug this replaced: a photo fetched at 3pm was "fresh" until 3pm the
+    /// next day, so the rotation tracked the last fetch instead of the date.
+    #[test]
+    fn a_fetch_late_in_the_day_still_rotates_at_the_next_boundary() {
+        let fetched = local(2026, 7, 26, 15, 0);
+        let next_morning = local(2026, 7, 27, 7, 0);
+        assert!(next_morning - fetched < DAY_MS, "under 24h apart");
+        assert_ne!(photo_day(fetched), photo_day(next_morning));
+    }
 
     /// Unsplash's API terms require attribution links to carry the app's own
     /// utm_source. This string said `fission_mail` through two rebrands — it

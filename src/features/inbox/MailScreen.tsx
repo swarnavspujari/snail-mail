@@ -1,14 +1,19 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { runCommandById } from "@/lib/commands";
-import { splitThreads, useMail } from "@/stores/mail";
+import { splitCountOf, splitThreads, useMail } from "@/stores/mail";
 import { useSettings } from "@/stores/settings";
-import { CalendarPanel } from "@/features/calendar/CalendarPanel";
+import { DayPanel } from "@/features/calendar/DayPanel";
 import { FolderSidebar } from "@/components/FolderSidebar";
 import { useUi } from "@/stores/ui";
 import { IconButton } from "@/components/Button";
 import { HoverHint } from "@/components/HoverHint";
 import { Kbd } from "@/components/Kbd";
 import { Label } from "@/components/Label";
+import {
+  draftRecipientLabel,
+  draftsByThread,
+  type ThreadDraft,
+} from "@/lib/thread-drafts";
 import type { Thread } from "@/lib/types";
 
 // Sender status dots — unread markers cycle so threads are tellable apart
@@ -38,9 +43,10 @@ function SplitTabs({ overlay }: { overlay?: boolean }) {
   const activeAccount = useSettings((s) => s.accounts.active);
   const keyHints = useSettings((s) => s.settings.showKeyHints);
 
-  // Backend SQL counts cover the whole mailbox; the local list length is the
-  // fallback until the first refresh lands.
-  const countOf = (id: string) => splitCounts[id] ?? splitThreads(inbox, id).length;
+  // Local list while it's complete (moves with optimistic triage, so the badge
+  // hits zero in the same frame the inbox empties), backend SQL once it's
+  // truncated. See splitCountOf.
+  const countOf = (id: string) => splitCountOf(inbox, splitCounts, id);
   const shown = splits
     .filter((sp) => sp.accountId == null || sp.accountId === activeAccount)
     .filter((sp) => !sp.hideWhenEmpty || countOf(sp.id) > 0);
@@ -109,11 +115,14 @@ function Row({
   index,
   selected,
   checked,
+  draft,
 }: {
   t: Thread;
   index: number;
   selected: boolean;
   checked: boolean;
+  /** An unsent draft on this conversation, if there is one. */
+  draft?: ThreadDraft;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const [hovered, setHovered] = useState(false);
@@ -154,16 +163,28 @@ function Row({
         />
       )}
       <div className="w-44 shrink-0 truncate">
-        <span
-          className={
-            t.unread ? "font-semibold text-ink" : selected ? "text-ink-2" : "text-ink-2"
-          }
-        >
-          {t.participants
-            .map((p) => p.replace(/\s*<[^>]*>/, ""))
-            .slice(0, 2)
-            .join(", ")}
-        </span>
+        {draft ? (
+          // An unsent draft owns the row's sender column, Superhuman-style —
+          // the useful thing about this conversation is that YOU owe it a
+          // reply, not who last wrote in it.
+          <>
+            <span className="font-semibold text-ok">Draft</span>
+            {draftRecipientLabel(draft.to) && (
+              <span className="text-ink-2"> to {draftRecipientLabel(draft.to)}</span>
+            )}
+          </>
+        ) : (
+          <span
+            className={
+              t.unread ? "font-semibold text-ink" : selected ? "text-ink-2" : "text-ink-2"
+            }
+          >
+            {t.participants
+              .map((p) => p.replace(/\s*<[^>]*>/, ""))
+              .slice(0, 2)
+              .join(", ")}
+          </span>
+        )}
         {t.messageCount > 1 && (
           <span className="ml-1.5 text-[11px] text-ink-3">{t.messageCount}</span>
         )}
@@ -177,7 +198,11 @@ function Row({
         >
           {t.subject}
         </span>
-        <span className="truncate text-[12.5px] text-ink-3">{t.snippet}</span>
+        {/* The draft you're mid-way through is more use than the snippet of
+            the message you already read. */}
+        <span className="truncate text-[12.5px] text-ink-3">
+          {draft?.preview || t.snippet}
+        </span>
       </div>
       {hovered ? (
         <div
@@ -283,6 +308,8 @@ export function MailScreen() {
   const splits = useSettings((s) => s.settings.splits);
   const calendarOpen = useSettings((s) => s.settings.calendarOpen);
   const sidebarOpen = useSettings((s) => s.settings.sidebarOpen);
+  const drafts = useMail((s) => s.drafts);
+  const draftByThread = useMemo(() => draftsByThread(drafts), [drafts]);
   const loaded = useMail((s) => s.loaded);
   const loadingOlder = useMail((s) => s.loadingOlder);
   const noMoreOlder = useMail((s) => s.noMoreOlder);
@@ -360,6 +387,7 @@ export function MailScreen() {
               index={i}
               selected={i === selectedIndex}
               checked={selectedIds.has(t.id)}
+              draft={draftByThread.get(t.id)}
             />
           ))}
           {pagedView && threads.length > 0 && (
@@ -386,7 +414,7 @@ export function MailScreen() {
         </div>
         )}
       </div>
-      {calendarOpen && <CalendarPanel />}
+      {calendarOpen && <DayPanel />}
     </div>
   );
 }

@@ -1,10 +1,15 @@
 // Empty inbox / empty split rest state: a calm daily Unsplash photo behind
 // the inbox-zero copy, with the guideline-required attribution. The photo is
 // hotlinked (blur-hash placeholder while it loads) and falls back to the
-// 24h byte cache offline; showing it fires the download event exactly once.
-import { useEffect, useRef, useState } from "react";
+// byte cache offline; showing it fires the download event exactly once.
+//
+// It turns over at 12:01 AM local. The core enforces that boundary on the
+// cache (unsplash.rs `photo_day`); this component has to actually go and ASK
+// at the boundary, because an app sitting at inbox zero never remounts.
+import { useCallback, useEffect, useRef, useState } from "react";
 import { backend, openExternal } from "@/lib/ipc";
 import { decodeBlurHash } from "@/lib/blurhash";
+import { msUntilNextRotation, photoIsStale } from "@/lib/daily-photo";
 import { useSettings } from "@/stores/settings";
 import type { DailyPhoto } from "@/lib/types";
 
@@ -44,18 +49,56 @@ export function RestState({ labelOffset = 10 }: { labelOffset?: number }) {
   const [hotlinkFailed, setHotlinkFailed] = useState(false);
   const streak = useSettings((s) => s.streaks.daily);
 
-  useEffect(() => {
-    let stale = false;
-    backend
+  // Kept in a ref as well as state so the rotation effects below can read the
+  // current photo without re-subscribing (and re-arming the timer) on every
+  // fetch — the timer must survive its own result landing.
+  const photoRef = useRef<DailyPhoto | null>(null);
+  const load = useCallback(() => {
+    void backend
       .getDailyPhoto()
       .then((p) => {
-        if (!stale) setPhoto(p);
+        if (!p) return;
+        // Same photo (the core says the day hasn't turned) — leave the loaded
+        // <img> alone rather than restarting its fade for no reason.
+        if (photoRef.current?.url === p.url) return;
+        photoRef.current = p;
+        setPhoto(p);
+        setImgLoaded(false);
+        setHotlinkFailed(false);
       })
       .catch(() => {});
-    return () => {
-      stale = true;
-    };
   }, []);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  // Ask again at the next local 12:01 AM, then re-arm from the new "now" —
+  // which is also what keeps this correct across DST and across a machine that
+  // was asleep when the timer was due.
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout>;
+    const arm = () => {
+      timer = setTimeout(() => {
+        load();
+        arm();
+      }, msUntilNextRotation(new Date()));
+    };
+    arm();
+    return () => clearTimeout(timer);
+  }, [load]);
+
+  // A suspended laptop's timers do not fire on schedule, so the boundary can
+  // pass with nothing running. Waking the window re-checks the date and only
+  // refetches when the day genuinely moved on.
+  useEffect(() => {
+    const onFocus = () => {
+      const p = photoRef.current;
+      if (!p || photoIsStale(p.fetchedAt, Date.now())) load();
+    };
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, [load]);
 
   const src =
     photo && hotlinkFailed ? (photo.cachedDataUri ?? photo.url) : photo?.url;

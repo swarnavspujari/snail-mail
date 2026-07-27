@@ -8,6 +8,10 @@ How Snail Mail gets onto a tester's machine and stays current.
   NSIS installer on `windows-latest` and publishes a GitHub Release with:
   - `Snail Mail_<version>_x64-setup.exe` — what testers download
   - `Snail Mail_<version>_x64-setup.exe.sig` + `latest.json` — the update feed
+- The same tag also builds a **universal macOS `.dmg`** — signed with a
+  Developer ID certificate and notarized by Apple — *once the six `APPLE_*`
+  repo secrets exist*. Until they do, that job skips itself and Windows ships
+  exactly as before. See "Signing the macOS build" below.
 - The app checks `releases/latest/download/latest.json` at boot and every 4
   hours, downloads in the background, and shows **"Update ready — Restart"**
   in the header. Updater artifacts are signed with a minisign key
@@ -76,6 +80,126 @@ prompt once a modest number of installs accrue reputation.
 
 Both the NSIS installer *and* the app binary get signed; the updater keeps
 working unchanged (its minisign signature is independent of Authenticode).
+
+## Signing the macOS build
+
+macOS is not Windows-with-a-scarier-dialog. An unsigned `.exe` warns; an
+unsigned or un-notarized `.app` that arrives over the internet is **refused
+outright** by Gatekeeper — "damaged and can't be opened", with no override a
+normal person will find. So there is no useful "ship it unsigned for now" step
+here, which is why `release-macos` skips itself until it can do the job
+properly.
+
+Two separate things have to happen, and Tauri does both when the env is set:
+
+1. **Sign** the app with a *Developer ID Application* certificate.
+2. **Notarize** — upload the signed bundle to Apple, get a ticket back, staple
+   it into the app so Gatekeeper can verify offline.
+
+### What you need to do (~30 min, all of it from Windows)
+
+You do **not** need a Mac. Git Bash ships OpenSSL, which is enough to create
+the key, the request, and the `.p12`.
+
+**1. Find your Team ID.** <https://developer.apple.com/account> → Membership
+details. Ten characters, e.g. `A1B2C3D4E5`.
+
+**2. Make a private key and a certificate signing request.** In Git Bash, in a
+scratch folder (not the repo):
+
+```bash
+openssl genrsa -out developerID.key 2048
+openssl req -new -key developerID.key -out developerID.csr -subj "/emailAddress=ssp@pujariventurepartners.com/CN=Swarnav S Pujari/C=US"
+```
+
+**Back up `developerID.key`.** Lose it and the certificate is dead — you cannot
+re-download a usable one, only revoke and start over.
+
+**3. Get the certificate.** <https://developer.apple.com/account/resources/certificates/list>
+→ **+** → **Developer ID Application** → *Profile Type: G2 Sub-CA* → upload
+`developerID.csr` → Continue → **Download**. You get `developerID_application.cer`.
+
+> Only the Account Holder can create a Developer ID certificate. On a solo
+> individual account that is you. Apple caps you at a handful of them, so do
+> not create spares "to test".
+
+**4. Build the `.p12`** — key + certificate + Apple's intermediate, which
+notarization needs in the chain:
+
+```bash
+openssl x509 -inform DER -in developerID_application.cer -out developerID.pem
+curl -O https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer
+openssl x509 -inform DER -in DeveloperIDG2CA.cer -out DeveloperIDG2CA.pem
+openssl pkcs12 -export -inkey developerID.key -in developerID.pem \
+  -certfile DeveloperIDG2CA.pem -out developerID.p12 -legacy
+```
+
+It asks for an export password — invent one, keep it, it becomes
+`APPLE_CERTIFICATE_PASSWORD`. (`-legacy` matters: without it OpenSSL 3 uses
+AES-256 encryption that macOS's `security import` cannot read.)
+
+**5. Read the exact identity string** the certificate carries — this has to
+match character for character:
+
+```bash
+openssl x509 -in developerID.pem -noout -subject
+```
+
+Take the `CN=` value, e.g. `Developer ID Application: Swarnav S Pujari (A1B2C3D4E5)`.
+
+**6. Base64 the `.p12`** (GitHub secrets are text):
+
+```bash
+base64 -w0 developerID.p12 > developerID.p12.b64
+```
+
+**7. Make an app-specific password** for notarization —
+<https://appleid.apple.com> → Sign-In and Security → App-Specific Passwords →
+**+**. Looks like `abcd-efgh-ijkl-mnop`. This is *not* your Apple ID password,
+and notarization will not accept the real one.
+
+**8. Add six repo secrets** at
+<https://github.com/swarnavspujari/snail-mail/settings/secrets/actions>:
+
+| Secret | Value |
+|---|---|
+| `APPLE_CERTIFICATE` | contents of `developerID.p12.b64` (step 6) |
+| `APPLE_CERTIFICATE_PASSWORD` | the export password from step 4 |
+| `APPLE_SIGNING_IDENTITY` | the `CN=` string from step 5 |
+| `APPLE_ID` | your Apple ID email |
+| `APPLE_PASSWORD` | the app-specific password from step 7 |
+| `APPLE_TEAM_ID` | the Team ID from step 1 |
+
+**9. Tag a release as usual.** Nothing in the repo needs editing — the `gate`
+job sees all six and `release-macos` runs. Set *all six or none*: a partial set
+fails the workflow on purpose, because a silent skip is indistinguishable from
+"not set up yet".
+
+**10. Check the first one.** The macOS job self-verifies (`codesign --verify
+--deep --strict`, `spctl --assess`, `xcrun stapler validate`) and fails if any
+of them do — but the first release is worth confirming by hand: download the
+`.dmg` on a Mac, open it, and make sure no Gatekeeper dialog appears at all.
+Also open the release's `latest.json` and confirm it lists **all three**
+platforms (`windows-x86_64`, `darwin-x86_64`, `darwin-aarch64`) — the macOS job
+patches that file rather than overwriting it, and that merge is the one part of
+this that has never run against a real release.
+
+### What that buys, and what it costs
+
+- $99/yr Apple Developer Program (already paid).
+- Notarization adds ~2–10 min to the release; Apple's service is occasionally
+  slow, and a timeout fails the job rather than shipping something broken.
+- Certificates last 5 years. Diary the expiry — an expired Developer ID
+  breaks *new* releases, though already-notarized builds keep working.
+
+### If you would rather use an App Store Connect API key
+
+Apple's newer notarization credential, and it does not expire the way an
+app-specific password can be revoked. Swap `APPLE_ID` / `APPLE_PASSWORD` /
+`APPLE_TEAM_ID` for `APPLE_API_ISSUER`, `APPLE_API_KEY` and
+`APPLE_API_KEY_PATH` in `release-macos`, and update the `gate` job's list to
+match. Not the default here only because it needs a `.p8` file written to disk
+in CI, which is more moving parts for one person shipping to two machines.
 
 ## Cutting a release
 

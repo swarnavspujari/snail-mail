@@ -16,7 +16,7 @@ import {
 } from "@/lib/calendar-view";
 import { DAY_MS, startOfToday, useCalendar } from "@/stores/calendar";
 import { useSettings } from "@/stores/settings";
-import { rsvpClasses } from "./CalendarPanel";
+import { rsvpClasses } from "./DayAgenda";
 import type { CalendarEvent } from "@/lib/types";
 
 const PX_PER_HOUR = 48;

@@ -18,7 +18,7 @@ import { UndoToast } from "@/components/UndoToast";
 import { UndoSendBar } from "@/components/UndoSendBar";
 import { SyncActivityPill } from "@/components/SyncActivityPill";
 import { MailScreen } from "@/features/inbox/MailScreen";
-import { CalendarPanel } from "@/features/calendar/CalendarPanel";
+import { CalendarSidebar } from "@/features/calendar/CalendarSidebar";
 import { CalendarWeek } from "@/features/calendar/CalendarWeek";
 import { EventModal } from "@/features/calendar/EventModal";
 import { EventPopover } from "@/features/calendar/EventPopover";
@@ -229,6 +229,14 @@ export default function App() {
       }, 400);
     };
     const unMail = backend.onMailUpdated(debouncedRefresh);
+    // A composer closing is the moment a draft appears in (or leaves) a
+    // thread: Esc saves one, Send consumes it, Discard deletes it. The
+    // autosave writes while the dock is open, but nothing renders the row
+    // until then — the dock IS the draft while it's up.
+    const unCompose = useUi.subscribe((s, prev) => {
+      if (prev.compose !== null && s.compose === null)
+        void useMail.getState().loadDrafts();
+    });
     // background history download → the "Downloading mail history… N%" strip
     const unSync = backend.onSyncProgress((p) =>
       useUi.getState().setSyncProgress(p)
@@ -262,6 +270,7 @@ export default function App() {
     return () => {
       clearTimeout(timer);
       unMail();
+      unCompose();
       unSync();
       unMigration();
       unImages();
@@ -540,9 +549,11 @@ export default function App() {
           </div>
         )}
       </main>
-      {/* The week view carries the calendar-management panel beside it
-          (design: week grid + mini-month + calendars list side by side). */}
-      {screen === "calendar" && <CalendarPanel />}
+      {/* The week view carries the calendar-management column beside it
+          (design: week grid + mini-month + calendars list side by side). It is
+          NOT the mail screen's day panel — sharing one component meant a
+          simplification aimed at that panel silently stripped this column. */}
+      {screen === "calendar" && <CalendarSidebar />}
       {/* The event editor docks in the right-hand slot (like the shortcuts /
           calendar panels) so it stays put across the mail and calendar
           screens — opened from a slot click/drag or B, driven by

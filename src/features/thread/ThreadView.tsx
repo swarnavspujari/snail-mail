@@ -2,13 +2,19 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { backend, openExternal } from "@/lib/ipc";
 import { startReply } from "@/lib/commands";
 import { prepareEmailHtml } from "@/lib/email-render";
+import { normalizeRecipients } from "@/lib/recipients";
 import { nextFocusIndex } from "@/lib/thread-focus";
+import {
+  draftRecipientLabel,
+  draftsForThread,
+  type ThreadDraft,
+} from "@/lib/thread-drafts";
 import { useMail } from "@/stores/mail";
 import { useSettings } from "@/stores/settings";
-import { useUi } from "@/stores/ui";
+import { useUi, type ComposeState } from "@/stores/ui";
 import { Avatar } from "@/components/Avatar";
 import { ContactPanel } from "@/components/ContactPanel";
-import { CalendarPanel } from "@/features/calendar/CalendarPanel";
+import { DayPanel } from "@/features/calendar/DayPanel";
 import { HoverHint } from "@/components/HoverHint";
 import { Kbd } from "@/components/Kbd";
 import { Label } from "@/components/Label";
@@ -393,6 +399,77 @@ function PendingCard({ p }: { p: PendingMessage }) {
   );
 }
 
+/**
+ * An unsent draft written on this thread, docked where it was written.
+ *
+ * Backing out of a reply autosaves it and closes the dock — and until now that
+ * was the last you saw of it anywhere except G-D. Clicking (or Enter) puts it
+ * straight back in the reply dock with its row identity intact, so resuming
+ * edits the same draft rather than starting a second one.
+ *
+ * Deliberately a card and not an auto-opened editor: opening the dock on every
+ * visit to a thread with a draft would put you in compose just for reading it,
+ * which turns E / R / H into typing and re-arms the autosave on mail you only
+ * glanced at.
+ */
+function DraftCard({ d }: { d: ThreadDraft }) {
+  const to = draftRecipientLabel(d.to);
+  const resume = () => {
+    if (!d.payload) {
+      // Unreadable payload — nothing to reopen, so offer the one honest
+      // action instead of a composer full of undefined.
+      void backend.deleteDraft(d.id, d.account);
+      void useMail.getState().loadDrafts();
+      useUi.getState().showToast("Draft was unreadable — removed");
+      return;
+    }
+    const p = d.payload as unknown as ComposeState;
+    useUi.getState().startCompose({
+      ...p,
+      // Drafts saved before Bcc/Drive links existed lack those fields; ones
+      // saved before chips hold recipients as a single string.
+      to: normalizeRecipients(p.to),
+      cc: normalizeRecipients(p.cc),
+      bcc: normalizeRecipients(p.bcc),
+      attachments: p.attachments ?? [],
+      driveLinks: p.driveLinks ?? [],
+      // A reply resumed from here must dock in THIS thread, whatever the row
+      // says — and never as "new", which would open the modal composer.
+      mode: p.mode === "new" ? "reply" : p.mode,
+      threadId: d.threadId,
+      draftId: d.id,
+      draftAccount: d.account,
+    });
+  };
+
+  return (
+    <button
+      onClick={resume}
+      className="zb-fade-in block w-full overflow-hidden rounded-[10px] border border-line bg-raised text-left hover:border-line-strong"
+      title="Resume this draft"
+    >
+      <div className="flex w-full items-center gap-3 px-[18px] py-3">
+        <div className="min-w-0 flex-1">
+          <div className="flex items-baseline gap-2">
+            <span className="font-semibold text-ok">Draft</span>
+            {to && (
+              <span className="truncate text-[13px] text-ink-2">to {to}</span>
+            )}
+          </div>
+        </div>
+        <span className="shrink-0 text-[12px] text-ink-3">
+          {fmtWhen(d.updatedAt)}
+        </span>
+      </div>
+      {d.preview && (
+        <div className="truncate px-[18px] pb-4 pt-0 text-[14px] leading-[1.65] text-ink">
+          {d.preview}
+        </div>
+      )}
+    </button>
+  );
+}
+
 function InstantReplies() {
   const suggestions = useUi((s) => s.suggestions);
   const idx = useUi((s) => s.suggestionIndex);
@@ -447,6 +524,7 @@ export function ThreadView() {
   const messages = useMail((s) => s.openMessages);
   const threadId = useMail((s) => s.openThreadId);
   const pendingAll = useMail((s) => s.pendingMessages);
+  const allDrafts = useMail((s) => s.drafts);
   const blankHealDone = useMail((s) => s.blankHealDone);
   const myEmail = useSettings((s) => s.accounts.active);
   const keyHints = useSettings((s) => s.settings.showKeyHints);
@@ -459,6 +537,17 @@ export function ThreadView() {
   // Optimistic sent replies for this thread (Superhuman-style "Sending…" rows),
   // appended after the real messages until they reconcile away.
   const pendingHere = pendingAll.filter((p) => p.threadId === threadId);
+  // Unsent drafts written on this thread. The one currently open in the dock
+  // is excluded — the dock IS that draft, and showing both would read as two.
+  const draftsHere = useMemo(
+    () =>
+      threadId
+        ? draftsForThread(allDrafts, threadId).filter(
+            (d) => !(compose?.draftId === d.id && compose?.draftAccount === d.account)
+          )
+        : [],
+    [allDrafts, threadId, compose?.draftId, compose?.draftAccount]
+  );
   // Superhuman-style: older messages collapse; the last (and any unread)
   // stay open. User toggles override until the thread changes.
   const [overrides, setOverrides] = useState<Record<string, boolean>>({});
@@ -682,6 +771,9 @@ export function ThreadView() {
               {pendingHere.map((p) => (
                 <PendingCard key={p.localId} p={p} />
               ))}
+              {draftsHere.map((d) => (
+                <DraftCard key={`${d.account}:${d.id}`} d={d} />
+              ))}
             </div>
             {/* Threaded inline in the conversation column at the email's width. */}
             {replyingHere && <ReplyDock />}
@@ -695,7 +787,7 @@ export function ThreadView() {
           willing to trade away when you asked to see your day. Toggling back
           restores it. */}
       {calendarOpen ? (
-        <CalendarPanel />
+        <DayPanel />
       ) : (
         <ContactPanel
           name={contact.fromName}

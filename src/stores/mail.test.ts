@@ -10,11 +10,12 @@ const backend = vi.hoisted(() => ({
   getThread: vi.fn(),
   refetchMessageBody: vi.fn(),
   splitCounts: vi.fn().mockResolvedValue({}),
+  listDrafts: vi.fn().mockResolvedValue([]),
 }));
 
 vi.mock("@/lib/ipc", () => ({ backend, isTauri: false }));
 
-import { clearMailCaches, useMail } from "./mail";
+import { clearMailCaches, splitCountOf, useMail } from "./mail";
 
 function msg(over: Partial<Message>): Message {
   return {
@@ -186,5 +187,38 @@ describe("label views", () => {
     await vi.waitFor(() => {
       expect(useMail.getState().labelThreads).toEqual([]);
     });
+  });
+});
+
+describe("split badge counts", () => {
+  const inboxOf = (n: number, splitId: string) =>
+    Array.from({ length: n }, (_, i) =>
+      thread({ id: `t${i}`, split: splitId })
+    );
+
+  test("a complete local list beats a stale backend count", () => {
+    // The shape of the reported bug: triage emptied `inbox` optimistically and
+    // splitCounts still held the pre-archive number until the debounced
+    // refresh landed, so the tab read "2" over an empty inbox.
+    expect(splitCountOf([], { important: 2 }, "important")).toBe(0);
+  });
+
+  test("the local list is used even when it agrees", () => {
+    expect(splitCountOf(inboxOf(3, "important"), { important: 3 }, "important")).toBe(3);
+  });
+
+  test("a truncated list defers to the backend's whole-mailbox SQL", () => {
+    // 500 rows is list_threads' display window, so the list may be a prefix —
+    // counting it locally would under-report a big mailbox.
+    const counts = { important: 1200 };
+    expect(splitCountOf(inboxOf(500, "important"), counts, "important")).toBe(1200);
+  });
+
+  test("a truncated list with no backend count yet falls back to its own length", () => {
+    expect(splitCountOf(inboxOf(500, "important"), {}, "important")).toBe(500);
+  });
+
+  test("an unknown split is zero, not undefined", () => {
+    expect(splitCountOf([], {}, "nope")).toBe(0);
   });
 });

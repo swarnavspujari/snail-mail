@@ -37,7 +37,11 @@ export const DEFAULT_SHORTCUTS: Record<string, string> = {
   "thread.reply": "r",
   "thread.replyAll": "a",
   "thread.forward": "f",
-  "thread.introReply": "ctrl+shift+i",
+  // "mod+", never "ctrl+": eventToken() folds Ctrl and Cmd into a single
+  // `mod` token, so a literal "ctrl+…" expr can never match a keypress. This
+  // one shipped that way and was simply dead — the only binding in the map
+  // that didn't follow the convention, which is exactly why nobody caught it.
+  "thread.introReply": "mod+shift+i",
   "thread.replyAllOrOpen": "enter",
   "thread.star": "s",
   "thread.trash": "#|delete|backspace",

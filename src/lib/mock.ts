@@ -201,6 +201,8 @@ function loadPersisted(): PersistedState {
         ["calendar.nextDay", "right", "right|="],
         // v0.16.x: bare "1" = Inbox (mirrors "2" = Calendar).
         ["goto.inbox", "g i", "g i|1"],
+        // v0.27: "ctrl+shift+i" was unmatchable (the engine emits "mod+…").
+        ["thread.introReply", "ctrl+shift+i", "mod+shift+i"],
       ] as const) {
         if (merged.settings.shortcuts[key] === oldV) {
           merged.settings.shortcuts[key] = newV;

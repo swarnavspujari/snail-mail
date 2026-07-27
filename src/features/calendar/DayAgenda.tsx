@@ -1,21 +1,33 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { HoverHint } from "@/components/HoverHint";
-import { Kbd } from "@/components/Kbd";
+// One day, all of it: 12:00 AM to 11:59 PM.
+//
+// This is the grid half of both day surfaces — the mail-screen side panel
+// (DayPanel, `0`) and the week view's companion column (CalendarSidebar). They
+// used to be the SAME component mounted at two call sites, which is how a
+// change meant for one silently rewrote the other; now they share this and
+// compose the rest themselves.
+//
+// The grid used to run 7 AM–8 PM and clip everything outside, so a 6 AM flight
+// or a 9 PM dinner simply did not exist here while the week view showed both.
+// All 24 hours render; the pane scrolls and opens centred on the current time.
 import {
-  assignCalendarHues,
-  calendarHue,
-  hueVar,
-} from "@/lib/calendar-view";
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { assignCalendarHues, calendarHue, hueVar } from "@/lib/calendar-view";
 import { DAY_MS, startOfToday, useCalendar } from "@/stores/calendar";
 import { useSettings } from "@/stores/settings";
 import { useUi } from "@/stores/ui";
 import type { CalendarEvent } from "@/lib/types";
 
-const FIRST_HOUR = 7;
-const LAST_HOUR = 20;
-const PX_PER_HOUR = 52;
+const HOURS = 24;
+export const PX_PER_HOUR = 52;
+const GRID_HEIGHT = HOURS * PX_PER_HOUR;
 
 function hourLabel(h: number): string {
+  if (h === 0) return "12 am";
   if (h === 12) return "12 pm";
   return h < 12 ? `${h} am` : `${h - 12} pm`;
 }
@@ -45,12 +57,11 @@ function EventBlock({
   dayStart: number;
   hue: string;
 }) {
-  const gridStart = dayStart + FIRST_HOUR * 3600_000;
-  const gridEnd = dayStart + LAST_HOUR * 3600_000;
-  const s = Math.max(e.startMs, gridStart);
+  const gridEnd = dayStart + DAY_MS;
+  const s = Math.max(e.startMs, dayStart);
   const end = Math.min(Math.max(e.endMs, s + 15 * 60_000), gridEnd);
-  if (end <= gridStart || s >= gridEnd) return null;
-  const top = ((s - gridStart) / 3600_000) * PX_PER_HOUR;
+  if (end <= dayStart || s >= gridEnd) return null;
+  const top = ((s - dayStart) / 3600_000) * PX_PER_HOUR;
   const height = Math.max(20, ((end - s) / 3600_000) * PX_PER_HOUR - 2);
   const past = e.endMs < Date.now();
   return (
@@ -81,66 +92,62 @@ function EventBlock({
   );
 }
 
-/** Right-hand day calendar, Superhuman-style: toggleable, painted instantly
- *  from the shared day-keyed cache; a background sync keeps it fresh. Shows
- *  the day's events and nothing else. ←/→ move days while the panel has
- *  focus. Click an event for details/RSVP; click or drag an empty slot to
- *  create one. */
-export function CalendarPanel() {
-  const dayOffset = useCalendar((s) => s.dayOffset);
+/**
+ * The all-day strip + the scrolling 24-hour grid for `dayStart`.
+ *
+ * Owns everything that is genuinely about *a day*: the events, the now-line,
+ * slot drag-to-create, the placement ghost, and the scroll position. What sits
+ * ABOVE it (a date header, a mini-month, a calendars list) is the caller's
+ * business — that is the whole reason the two surfaces are separate now.
+ */
+export function DayAgenda({ dayStart }: { dayStart: number }) {
   const events = useCalendar((s) => s.eventsByDay);
   const loadedDays = useCalendar((s) => s.loadedDays);
   const calendars = useCalendar((s) => s.calendars);
   const error = useCalendar((s) => s.error);
   const hiddenCalendars = useSettings((s) => s.settings.hiddenCalendars);
-  const focused = useUi((s) => s.focusRegion === "calendar");
-  const keyHints = useSettings((s) => s.settings.showKeyHints);
+  const preview = useCalendar((s) => s.modalPreview);
   const [nowTick, setNowTick] = useState(Date.now());
   const [drag, setDrag] = useState<{ from: number; to: number } | null>(null);
-  const preview = useCalendar((s) => s.modalPreview);
   const gridRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
-  const dayStart = useMemo(() => startOfToday() + dayOffset * DAY_MS, [dayOffset]);
+
   const hues = useMemo(() => assignCalendarHues(calendars), [calendars]);
   const hidden = useMemo(() => new Set(hiddenCalendars), [hiddenCalendars]);
 
-  useEffect(() => {
-    const cal = useCalendar.getState();
-    void cal.watchRange("panel", dayStart, 1);
-    cal.requestRefresh("panel");
-    return () => useCalendar.getState().unwatchRange("panel");
-  }, [dayStart]);
-
-  useEffect(() => {
-    // The list survives in the store across remounts; the event modal
-    // (openCreate/openEdit) still fetches fresh every time.
-    if (useCalendar.getState().calendars.length === 0)
-      void useCalendar.getState().loadCalendars();
-  }, []);
+  const dayEvents = (events[dayStart] ?? []).filter(
+    (e) => !hidden.has(e.calendarId)
+  );
+  const loading = !loadedDays[dayStart];
+  const timed = dayEvents.filter((e) => !e.allDay);
+  const allDay = dayEvents.filter((e) => e.allDay);
+  const isToday = dayStart === startOfToday();
 
   useEffect(() => {
     const t = setInterval(() => setNowTick(Date.now()), 60_000);
     return () => clearInterval(t);
   }, []);
 
-  // Center the current time in view on open (Google-style); no-op when the
-  // 7am–8pm grid already fits.
-  useEffect(() => {
+  // Open with the current time in the MIDDLE of the visible grid, so "now" is
+  // never the thing you have to go looking for. Re-runs when the day changes
+  // (stepping days keeps the same vantage point) and when `loading` clears,
+  // because before that the scroller has no content to position against — the
+  // old one-shot mount effect could and did run against an empty pane.
+  useLayoutEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
     const now = new Date();
     const nowH = now.getHours() + now.getMinutes() / 60;
-    const clamped = Math.min(LAST_HOUR, Math.max(FIRST_HOUR, nowH));
-    const target = (clamped - FIRST_HOUR) * PX_PER_HOUR;
-    el.scrollTop = Math.max(0, target - el.clientHeight / 2);
-  }, []);
+    const target = nowH * PX_PER_HOUR - el.clientHeight / 2;
+    el.scrollTop = Math.max(0, Math.min(target, el.scrollHeight - el.clientHeight));
+  }, [dayStart, loading, error]);
 
-  /** Snap a pointer y to a 30-minute slot inside the visible hours. */
+  /** Snap a pointer y to a 30-minute slot anywhere in the day. */
   const msAtY = (clientY: number): number => {
     const rect = gridRef.current!.getBoundingClientRect();
-    const hours = (clientY - rect.top) / PX_PER_HOUR + FIRST_HOUR;
+    const hours = (clientY - rect.top) / PX_PER_HOUR;
     const snapped = Math.round(hours * 2) / 2;
-    return dayStart + Math.min(LAST_HOUR, Math.max(FIRST_HOUR, snapped)) * 3600_000;
+    return dayStart + Math.min(HOURS, Math.max(0, snapped)) * 3600_000;
   };
 
   const beginSlotDrag = (ev: React.MouseEvent) => {
@@ -171,15 +178,14 @@ export function CalendarPanel() {
   // previews get a ghost in the grid; an all-day one rides the all-day strip.
   const ghost = useMemo(() => {
     if (!preview || preview.allDay) return null;
-    const gridStart = dayStart + FIRST_HOUR * 3600_000;
-    const gridEnd = dayStart + LAST_HOUR * 3600_000;
+    const gridEnd = dayStart + DAY_MS;
     // Overlap first, THEN clamp — clamping first draws a sliver on every
     // other day (a real event never hits this; the store buckets those).
-    if (preview.endMs <= gridStart || preview.startMs >= gridEnd) return null;
-    const s = Math.max(preview.startMs, gridStart);
+    if (preview.endMs <= dayStart || preview.startMs >= gridEnd) return null;
+    const s = Math.max(preview.startMs, dayStart);
     const e = Math.min(Math.max(preview.endMs, s + 15 * 60_000), gridEnd);
     return {
-      top: ((s - gridStart) / 3600_000) * PX_PER_HOUR,
+      top: ((s - dayStart) / 3600_000) * PX_PER_HOUR,
       height: Math.max(20, ((e - s) / 3600_000) * PX_PER_HOUR - 2),
     };
   }, [preview, dayStart]);
@@ -189,101 +195,23 @@ export function CalendarPanel() {
     preview.startMs < dayStart + DAY_MS &&
     preview.endMs > dayStart;
 
-  const dayEvents = (events[dayStart] ?? []).filter(
-    (e) => !hidden.has(e.calendarId)
-  );
-  const loading = !loadedDays[dayStart];
-  const timed = dayEvents.filter((e) => !e.allDay);
-  const allDay = dayEvents.filter((e) => e.allDay);
-  const isToday = dayOffset === 0;
-  const nowTop =
-    isToday && nowTick > dayStart + FIRST_HOUR * 3600_000 && nowTick < dayStart + LAST_HOUR * 3600_000
-      ? ((nowTick - dayStart - FIRST_HOUR * 3600_000) / 3600_000) * PX_PER_HOUR
-      : null;
-
-  const title = new Date(dayStart).toLocaleDateString(undefined, {
-    weekday: "short",
-    month: "short",
-    day: "numeric",
-  });
+  // Every hour is on the grid now, so the now-line needs no window guard —
+  // if it is today, the line is somewhere on screen.
+  const nowTop = isToday
+    ? ((nowTick - dayStart) / 3600_000) * PX_PER_HOUR
+    : null;
 
   const dragTop = drag
-    ? ((Math.min(drag.from, drag.to) - dayStart - FIRST_HOUR * 3600_000) / 3600_000) *
-      PX_PER_HOUR
+    ? ((Math.min(drag.from, drag.to) - dayStart) / 3600_000) * PX_PER_HOUR
     : 0;
   const dragHeight = drag
     ? (Math.abs(drag.to - drag.from) / 3600_000) * PX_PER_HOUR
     : 0;
 
-  const navBtn =
-    "rounded-md border border-line px-2 py-0.5 text-ink-3 hover:bg-hover hover:text-ink";
-
   return (
-    <aside
-      onMouseDown={() => useUi.getState().setFocusRegion("calendar")}
-      className={`flex w-64 shrink-0 flex-col border-l bg-surface 2xl:w-72 ${
-        focused ? "border-accent/40" : "border-line"
-      }`}
-    >
-      <div className="flex items-center gap-2 px-4 py-3">
-        <span className="flex-1 text-[14px] font-semibold text-ink">
-          {title}
-          {!isToday && (
-            <button
-              className="ml-2 rounded px-1.5 text-[11px] text-accent-strong hover:bg-hover"
-              onClick={() => useCalendar.getState().goToday()}
-            >
-              today
-            </button>
-          )}
-        </span>
-        {focused && keyHints && (
-          <span className="text-[10.5px] text-ink-3">
-            <Kbd>←</Kbd>
-            <Kbd>→</Kbd>
-          </span>
-        )}
-        <HoverHint label="New event" command="calendar.newEvent" placement="bottom">
-          <button
-            className={navBtn}
-            aria-label="New event"
-            onClick={() => {
-              const start = dayStart + 9 * 3600_000;
-              useCalendar.getState().openCreate(start, start + 3600_000);
-            }}
-          >
-            +
-          </button>
-        </HoverHint>
-        <HoverHint label="Previous day" command="calendar.prevDay" placement="bottom">
-          <button
-            className={navBtn}
-            aria-label="Previous day"
-            onClick={() => useCalendar.getState().shiftDay(-1)}
-          >
-            ‹
-          </button>
-        </HoverHint>
-        <HoverHint label="Next day" command="calendar.nextDay" placement="bottom">
-          <button
-            className={navBtn}
-            aria-label="Next day"
-            onClick={() => useCalendar.getState().shiftDay(1)}
-          >
-            ›
-          </button>
-        </HoverHint>
-      </div>
-
-      {/* Nothing between the date header and the agenda. This panel answers
-          "what is on today"; the mini-month and the per-calendar checkboxes
-          both pushed the answer below the fold. ←/→ move days, and calendar
-          visibility is a setting you change rarely — both live in the full
-          Calendar surface's own settings — per-calendar visibility lives in
-          Settings -> Mail, which is where it was already editable. */}
-
+    <>
       {(allDay.length > 0 || ghostAllDay) && (
-        <div className="space-y-1 px-4 pb-2 pt-2">
+        <div className="shrink-0 space-y-1 px-4 pb-2 pt-2">
           {ghostAllDay && (
             <div className="cal-ghost block w-full truncate rounded-md py-1 pl-[11px] pr-2 text-left text-[12px] font-medium">
               New event
@@ -322,15 +250,21 @@ export function CalendarPanel() {
             Loading calendar…
           </div>
         ) : (
-          <div className="relative mx-3 my-2" style={{ height: (LAST_HOUR - FIRST_HOUR) * PX_PER_HOUR }}>
-            {Array.from({ length: LAST_HOUR - FIRST_HOUR }, (_, i) => (
-              <div
-                key={i}
-                className="absolute left-0 right-0 border-t border-line"
-                style={{ top: i * PX_PER_HOUR }}
-              >
-                <span className="absolute -top-2 left-0 bg-surface pr-1 text-[10.5px] text-ink-3">
-                  {hourLabel(FIRST_HOUR + i)}
+          <div className="relative mx-3 my-2" style={{ height: GRID_HEIGHT }}>
+            {Array.from({ length: HOURS }, (_, i) => (
+              <div key={i}>
+                {/* no rule above 12 am — it is the top edge of the grid */}
+                {i > 0 && (
+                  <div
+                    className="absolute left-0 right-0 border-t border-line"
+                    style={{ top: i * PX_PER_HOUR }}
+                  />
+                )}
+                <span
+                  className="absolute left-0 bg-surface pr-1 text-[10.5px] text-ink-3"
+                  style={{ top: i === 0 ? 0 : i * PX_PER_HOUR - 8 }}
+                >
+                  {hourLabel(i)}
                 </span>
               </div>
             ))}
@@ -364,15 +298,20 @@ export function CalendarPanel() {
                   New event
                 </div>
               )}
+              {/* Anchored near the working day rather than at 12 am, so an
+                  empty day says so where the eye already is. */}
               {timed.length === 0 && !drag && !ghost && (
-                <div className="pointer-events-none pt-10 text-center text-[12px] text-ink-3">
+                <div
+                  className="pointer-events-none absolute inset-x-0 text-center text-[12px] text-ink-3"
+                  style={{ top: 9 * PX_PER_HOUR }}
+                >
                   Nothing scheduled.
                 </div>
               )}
             </div>
             {nowTop !== null && (
               <div
-                className="pointer-events-none absolute left-10 right-0 border-t-2 border-bad"
+                className="pointer-events-none absolute left-10 right-0 z-[2] border-t-2 border-bad"
                 style={{ top: nowTop }}
               >
                 <span className="absolute -left-1 -top-[5px] h-2 w-2 rounded-full bg-bad" />
@@ -381,6 +320,6 @@ export function CalendarPanel() {
           </div>
         )}
       </div>
-    </aside>
+    </>
   );
 }

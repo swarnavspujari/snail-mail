@@ -3,7 +3,13 @@ import { backend, type BulkArchiveResult, type MailView } from "@/lib/ipc";
 import { threadInSplit } from "@/lib/split-query";
 import { reconcilePendingMessages, type PendingMessage } from "@/lib/pending";
 import { useSettings } from "./settings";
-import type { Message, SearchResult, Thread, ThreadId } from "@/lib/types";
+import type {
+  DraftEntry,
+  Message,
+  SearchResult,
+  Thread,
+  ThreadId,
+} from "@/lib/types";
 
 // Guards against a slow full-history search landing after the query moved on.
 let lastSearchQuery = "";
@@ -44,6 +50,10 @@ interface MailState {
   trash: Thread[];
   /** Threads for the active "label:…" view. */
   labelThreads: Thread[];
+  /** Every unsent draft on the active account. Small (tens at most) and read
+   *  locally, so it is held whole rather than queried per thread — the thread
+   *  view and the list rows both project out of it. */
+  drafts: DraftEntry[];
 
   listView: MailView;
   activeSplitId: string;
@@ -76,6 +86,10 @@ interface MailState {
   noMoreOlder: boolean;
 
   refresh: () => Promise<void>;
+  /** Re-read the draft list. Called by refresh(), and again whenever a
+   *  composer closes — that is the moment a draft appears, changes or is
+   *  consumed by a send. */
+  loadDrafts: () => Promise<void>;
   setListView: (v: MailView) => void;
   setActiveSplit: (id: string) => void;
   cycleSplit: (dir: 1 | -1) => void;
@@ -126,6 +140,36 @@ export function splitThreads(inbox: Thread[], splitId: string): Thread[] {
   );
 }
 
+/** The display window `list_threads` returns (store/mod.rs `LIMIT 500`). An
+ *  inbox list shorter than this is therefore the WHOLE inbox. */
+const INBOX_PAGE = 500;
+
+/**
+ * A split's badge count.
+ *
+ * Two sources disagree about how current they are. `splitCounts` is SQL over
+ * the whole mailbox — right at any size, but it only moves on a `refresh()`,
+ * which rides a 400ms debounce behind the backend's `mail:updated`. The local
+ * list moves in the same tick as the optimistic triage that emptied it, but
+ * stops at 500 rows.
+ *
+ * Preferring the backend number unconditionally is what left the tab reading
+ * "2" over a visibly empty inbox for a beat after the last conversation was
+ * archived. So: while the local list is complete it is both exact AND the
+ * fresher of the two, and it wins; a truncated list falls back to SQL, where
+ * a moment of staleness is invisible anyway (nobody at 500+ conversations is
+ * watching for the badge to reach zero).
+ */
+export function splitCountOf(
+  inbox: Thread[],
+  splitCounts: Record<string, number>,
+  splitId: string
+): number {
+  const local = splitThreads(inbox, splitId).length;
+  if (inbox.length < INBOX_PAGE) return local;
+  return splitCounts[splitId] ?? local;
+}
+
 /** The splits visible for the active account, in settings order. */
 export function accountSplits() {
   const st = useSettings.getState();
@@ -151,6 +195,7 @@ export const useMail = create<MailState>((set, get) => ({
   starred: [],
   trash: [],
   labelThreads: [],
+  drafts: [],
   listView: "inbox",
   activeSplitId: "important",
   splitCounts: {},
@@ -177,6 +222,7 @@ export const useMail = create<MailState>((set, get) => ({
       backend.listThreads("starred").then((starred) => set({ starred })),
       backend.listThreads("trash").then((trash) => set({ trash })),
       backend.splitCounts().then((splitCounts) => set({ splitCounts })),
+      get().loadDrafts(),
       labelView
         ? backend.listThreads(labelView).then((labelThreads) => {
             labelCache.set(labelView, labelThreads);
@@ -201,6 +247,15 @@ export const useMail = create<MailState>((set, get) => ({
       const ids = new Set(visible.map((t) => t.id));
       const pruned = new Set([...s.selectedIds].filter((id) => ids.has(id)));
       if (pruned.size !== s.selectedIds.size) set({ selectedIds: pruned });
+    }
+  },
+
+  loadDrafts: async () => {
+    try {
+      set({ drafts: await backend.listDrafts() });
+    } catch {
+      // A draft list that can't be read must not take the mailbox down with
+      // it; the thread and its rows simply show no draft this pass.
     }
   },
 
@@ -230,9 +285,7 @@ export const useMail = create<MailState>((set, get) => ({
     if (s.listView !== "inbox") return;
     const ids = accountSplits()
       .filter(
-        (sp) =>
-          !sp.hideWhenEmpty ||
-          (s.splitCounts[sp.id] ?? splitThreads(s.inbox, sp.id).length) > 0
+        (sp) => !sp.hideWhenEmpty || splitCountOf(s.inbox, s.splitCounts, sp.id) > 0
       )
       .map((sp) => sp.id);
     if (ids.length === 0) return;

@@ -1,4 +1,4 @@
-# Builds the Windows installer on every version tag and publishes it (plus the
+# Builds the installers on every version tag and publishes them (plus the
 # updater artifacts + latest.json feed) to a GitHub Release. The in-app updater
 # points at .../releases/latest/download/latest.json.
 #
@@ -6,10 +6,16 @@
 #   TAURI_SIGNING_PRIVATE_KEY           minisign key for updater artifacts
 #   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  its password ("" if none)
 #
-# Authenticode (SmartScreen) signing is a documented opt-in — when the Azure
-# Trusted Signing account exists, follow docs/DISTRIBUTION.md §"Wiring the
-# signature into CI" (adds AZURE_* secrets + a signCommand in tauri.conf.json).
-# Until then installers are unsigned and testers see the SmartScreen prompt.
+# Windows: Authenticode (SmartScreen) signing is a documented opt-in — when the
+# Azure Trusted Signing account exists, follow docs/DISTRIBUTION.md
+# §"Wiring the signature into CI". Until then installers are unsigned and
+# testers see the SmartScreen prompt.
+#
+# macOS: the job below is SELF-ENABLING. It stays skipped until the six APPLE_*
+# secrets exist, and starts building, signing and notarizing the moment they
+# do — no edit to this file. Shipping an unsigned .app would be worse than
+# shipping nothing: Gatekeeper refuses to open it at all, where Windows only
+# warns. See docs/DISTRIBUTION.md §"Signing the macOS build".
 name: release
 
 on:
@@ -20,6 +26,52 @@ permissions:
   contents: write
 
 jobs:
+  # Secrets cannot be read in a job-level `if:`, so the presence check has to
+  # happen inside a job and come back out as an output.
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      macos: ${{ steps.check.outputs.macos }}
+    steps:
+      - name: is macOS signing configured?
+        id: check
+        env:
+          IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          CERT: ${{ secrets.APPLE_CERTIFICATE }}
+          CERT_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # An app-specific password, not the Apple ID password.
+        run: |
+          set -u
+          present=0
+          missing=""
+          for pair in "APPLE_SIGNING_IDENTITY:$IDENTITY" "APPLE_CERTIFICATE:$CERT" \
+                      "APPLE_CERTIFICATE_PASSWORD:$CERT_PASSWORD" "APPLE_ID:$APPLE_ID" \
+                      "APPLE_PASSWORD:$APPLE_PASSWORD" "APPLE_TEAM_ID:$TEAM_ID"; do
+            if [ -n "${pair#*:}" ]; then
+              present=$((present + 1))
+            else
+              missing="$missing ${pair%%:*}"
+            fi
+          done
+          if [ "$present" -eq 6 ]; then
+            echo "macos=true" >> "$GITHUB_OUTPUT"
+            echo "macOS signing configured — building the signed, notarized app."
+          elif [ "$present" -eq 0 ]; then
+            echo "macos=false" >> "$GITHUB_OUTPUT"
+            echo "macOS signing not set up yet — skipping that build (Windows is unaffected)."
+            echo "See docs/DISTRIBUTION.md §'Signing the macOS build' for the six secrets."
+          else
+            # A PARTIAL set is the one state worth failing on: it means someone
+            # started the setup and stopped, and a silent skip reads exactly
+            # like "not started yet" — for as many releases as it takes anyone
+            # to notice macOS never shipped.
+            echo "::error::macOS signing is half-configured ($present/6 secrets). Missing:$missing. Set all six, or none." >&2
+            exit 1
+          fi
+
   release-windows:
     runs-on: windows-latest
     steps:
@@ -103,3 +155,107 @@ jobs:
           releaseDraft: false
           prerelease: false
           includeUpdaterJson: true
+
+  # Universal (Intel + Apple silicon) .app and .dmg, Developer ID signed and
+  # notarized. Runs after Windows because it PATCHES that job's latest.json
+  # rather than writing its own — see the merge step.
+  release-macos:
+    needs: [gate, release-windows]
+    if: needs.gate.outputs.macos == 'true'
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: universal-apple-darwin
+      - run: npm ci
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # --- Developer ID signing. Tauri imports the .p12 into a throwaway
+          # keychain and signs the .app with the identity named below. ---
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          # --- Notarization. Present = Tauri submits the bundle to Apple and
+          # staples the ticket; absent = signed but NOT notarized, which
+          # Gatekeeper still refuses on a machine that downloaded it. ---
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          SNAIL_GMAIL_CLIENT_ID: ${{ secrets.SNAIL_GMAIL_CLIENT_ID }}
+          SNAIL_GMAIL_CLIENT_SECRET: ${{ secrets.SNAIL_GMAIL_CLIENT_SECRET }}
+          SNAIL_UNSPLASH_ACCESS_KEY: ${{ secrets.SNAIL_UNSPLASH_ACCESS_KEY }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseDraft: false
+          prerelease: false
+          # Deliberately false. Both jobs writing latest.json means the second
+          # one to finish REPLACES the first's platform map, silently cutting
+          # the other OS off from updates. The next step merges instead.
+          includeUpdaterJson: false
+          args: --target universal-apple-darwin
+
+      - name: add macOS to the updater feed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          bundle=src-tauri/target/universal-apple-darwin/release/bundle/macos
+          sig_path=$(ls "$bundle"/*.app.tar.gz.sig | head -1)
+          sig=$(cat "$sig_path")
+          # Ask the release what it actually named the asset rather than
+          # reconstructing it — the bundler's naming has changed before.
+          url=$(gh release view "$TAG" --json assets \
+                --jq '.assets[] | select(.name | endswith(".app.tar.gz")) | .url' | head -1)
+          if [ -z "$url" ]; then
+            echo "::error::no .app.tar.gz asset on $TAG — the updater feed would advertise macOS with no artifact" >&2
+            exit 1
+          fi
+          gh release download "$TAG" --pattern latest.json --output latest.json --clobber
+          # One universal binary serves both architectures, so both keys point
+          # at the same artifact. The updater looks up exactly these names.
+          jq --arg url "$url" --arg sig "$sig" \
+             '.platforms["darwin-x86_64"] = {signature: $sig, url: $url}
+            | .platforms["darwin-aarch64"] = {signature: $sig, url: $url}' \
+             latest.json > latest.merged.json
+          mv latest.merged.json latest.json
+          echo "updater feed now covers: $(jq -r '.platforms | keys | join(", ")' latest.json)"
+          gh release upload "$TAG" latest.json --clobber
+
+      - name: verify the signature and the notarization ticket
+        run: |
+          set -euo pipefail
+          app=$(ls -d src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app | head -1)
+          # Deep-verify the signature over every nested binary.
+          codesign --verify --deep --strict --verbose=2 "$app"
+          # The one that matters: Gatekeeper's own verdict on a downloaded app.
+          # `codesign` passing while this fails is exactly the state that ships
+          # an app nobody can open.
+          spctl --assess --type execute --verbose=4 "$app"
+          # Only present if the notarization ticket was stapled.
+          xcrun stapler validate "$app"
+
+      - name: note the macOS download in the release body
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          body=$(gh release view "$TAG" --json body --jq .body)
+          printf '%s\n\n%s\n' "$body" \
+            "macOS: download the \`.dmg\` below (universal — Intel and Apple silicon). Signed and notarized, so it opens without a Gatekeeper prompt." \
+            > body.md
+          gh release edit "$TAG" --notes-file body.md

@@ -118,7 +118,7 @@ export const SHORTCUTS_CATALOG: CatalogSection[] = [
       { label: "Superhuman AI", keys: "mod+j", commands: ["compose.ai"], status: "ready", note: "Write with AI" },
       { label: "Attach", keys: "mod+shift+u", status: "partial", note: "Via the 📎 button in compose" },
       { label: "Discard Draft", keys: "mod+shift+,", status: "partial", note: "Via the 🗑 button in compose" },
-      { label: "Instant Intro (to BCC)", keys: "mod+shift+i", status: "planned" },
+      { label: "Instant Intro (to BCC)", keys: "mod+shift+i", commands: ["thread.introReply"], status: "ready" },
       { label: "Remind me", keys: "mod+shift+h", status: "planned", note: "Reminder-on-send" },
       { label: "Send later", keys: "mod+shift+l", commands: ["compose.sendLater"], status: "ready" },
       { label: "Use Snippet Inline", keys: ";", status: "partial", note: "Ctrl+; opens the snippet picker today" },

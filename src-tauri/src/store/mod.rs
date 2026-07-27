@@ -398,6 +398,12 @@ pub fn default_settings() -> Settings {
         ("thread.snooze", "h"),
         ("thread.reply", "r"),
         ("thread.forward", "f"),
+        // Double-opt-in intro reply. This entry was missing here entirely while
+        // the command existed on the front end, so `get_settings` merged in no
+        // expr for it and `commandBindings()` dropped the command as unbound —
+        // the key did nothing on desktop, in any build. Parity with defaults.ts
+        // is what this list is FOR; a command absent from it is a dead key.
+        ("thread.introReply", "mod+shift+i"),
         ("thread.replyAllOrOpen", "enter"),
         // J/K change conversation; arrows scroll the open email (reader) or
         // move the cursor (list). v0.11 dropped down/up from list.next/prev.
@@ -627,6 +633,11 @@ pub fn get_settings(conn: &Connection) -> Settings {
                 ("calendar.nextDay", "right", "right|="),
                 // v0.16.x: bare "1" = Inbox (mirrors "2" = Calendar).
                 ("goto.inbox", "g i", "g i|1"),
+                // v0.27: the intro-reply key shipped as a literal "ctrl+…",
+                // which the keyboard engine (mod = Ctrl/Cmd) can never match.
+                // Only browser-demo saves ever held it — desktop had no entry
+                // at all — but migrate it so a save that crossed over heals.
+                ("thread.introReply", "ctrl+shift+i", "mod+shift+i"),
             ] {
                 if let Some(v) = s.shortcuts.get_mut(key) {
                     if v == old {

@@ -1535,8 +1535,8 @@ fn finish_event_write(
     }
 }
 
-/// The daily Unsplash photo for empty rest states: cached 24h, stale-if-error,
-/// hard-capped at 50 API requests/hour locally.
+/// The daily Unsplash photo for empty rest states: held until the next local
+/// 12:01 AM, stale-if-error, hard-capped at 50 API requests/hour locally.
 #[tauri::command]
 async fn get_daily_photo(state: State<'_, AppState>) -> Result<Option<DailyPhoto>, String> {
     let (cached, key) = {
@@ -1547,8 +1547,11 @@ async fn get_daily_photo(state: State<'_, AppState>) -> Result<Option<DailyPhoto
             unsplash::access_key(),
         )
     };
+    // Same local calendar day (12:01 AM boundary) = same photo. NOT a rolling
+    // 24h from fetched_at, which rotated at whatever time of day the last fetch
+    // happened to land and drifted later every time a day was missed.
     if let Some(c) = &cached {
-        if now_ms() - c.photo.fetched_at < unsplash::DAY_MS {
+        if unsplash::photo_day(c.photo.fetched_at) == unsplash::photo_day(now_ms()) {
             return Ok(Some(c.photo.clone()));
         }
     }
