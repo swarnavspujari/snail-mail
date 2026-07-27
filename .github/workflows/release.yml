@@ -224,7 +224,7 @@ jobs:
             echo "::error::no .app.tar.gz asset on $TAG — the updater feed would advertise macOS with no artifact" >&2
             exit 1
           fi
-          gh release download "$TAG" --pattern latest.json --output latest.json --clobber
+          gh release download "$TAG" --pattern latest.json --clobber
           # One universal binary serves both architectures, so both keys point
           # at the same artifact. The updater looks up exactly these names.
           jq --arg url "$url" --arg sig "$sig" \
@@ -248,14 +248,23 @@ jobs:
           # Only present if the notarization ticket was stapled.
           xcrun stapler validate "$app"
 
-      - name: note the macOS download in the release body
+      # Written whole rather than read-and-appended: if tauri-action's second
+      # pass over an existing release ever blanks the body, appending would
+      # quietly lose the Windows half instead of restoring it.
+      - name: rewrite the release body to cover both platforms
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          body=$(gh release view "$TAG" --json body --jq .body)
-          printf '%s\n\n%s\n' "$body" \
-            "macOS: download the \`.dmg\` below (universal — Intel and Apple silicon). Signed and notarized, so it opens without a Gatekeeper prompt." \
-            > body.md
+          cat > body.md <<BODY
+          Snail Mail $TAG
+
+          **Windows** — \`Snail.Mail_*_x64-setup.exe\`
+          **macOS** — the \`.dmg\` below (universal: Intel and Apple silicon,
+          signed and notarized, so it opens with no Gatekeeper prompt).
+
+          Existing installs download this in the background and offer to
+          install it; if you never click, it installs when you next quit.
+          BODY
           gh release edit "$TAG" --notes-file body.md
