@@ -418,6 +418,17 @@ export const useUi = create<UiState>((set, get) => ({
   },
 }));
 
+/** Write the open compose out as a draft right now. The autosave is debounced
+ *  800ms, so the last keystrokes are still in memory whenever something is
+ *  about to take the process away — Esc, navigating to another thread, or an
+ *  update installing. Fire-and-forget: nothing here is worth blocking on. */
+export function flushComposeDraft(): void {
+  const c = useUi.getState().compose;
+  if (!c || !composeHasContent(c)) return;
+  const { draftId, draftAccount, ...payload } = c;
+  void backend.saveDraft(draftId, draftAccount, JSON.stringify(payload)).catch(() => {});
+}
+
 /** The thread the user is acting on: the open one, else the list selection. */
 export function actionTargetThreadId(): ThreadId | null {
   const mail = useMail.getState();

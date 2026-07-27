@@ -72,9 +72,9 @@ function AboutCard() {
             <Button
               variant="primary"
               size="sm"
-              onClick={() => void useUpdater.getState().restart()}
+              onClick={() => void useUpdater.getState().installNow()}
             >
-              Restart to install {ready}
+              Install v{ready} &amp; restart
             </Button>
           ) : (
             <Button
@@ -97,7 +97,7 @@ function AboutCard() {
           {ready && <Pill tone="success">{ready} downloaded</Pill>}
           <span className={error ? "text-warn" : "text-ink-2"}>
             {status ??
-              "Updates install themselves from GitHub Releases — on launch, when you refocus the window, and every few hours."}
+              "Updates are checked on launch, when you refocus the window, and every few hours, then downloaded in the background. Nothing installs until you say so — or until you quit."}
           </span>
         </div>
       </div>

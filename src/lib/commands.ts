@@ -13,6 +13,7 @@ import {
   actionTargetThreadIds,
   composeHasContent,
   escapeHtml,
+  flushComposeDraft,
   signatureHtml,
   useUi,
   type ComposeState,
@@ -276,10 +277,7 @@ export function composeGoToEmail(dir: 1 | -1) {
   if (!t) return;
   // closeCompose keeps (never deletes) the draft, but the last keystrokes may
   // predate the 800ms autosave — flush them so the draft is truly in Drafts.
-  if (composeHasContent(c)) {
-    const { draftId, draftAccount, ...payload } = c;
-    void backend.saveDraft(draftId, draftAccount, JSON.stringify(payload)).catch(() => {});
-  }
+  flushComposeDraft();
   u.closeCompose();
   void m.openThread(t.id);
 }
@@ -1208,13 +1206,9 @@ export function allCommands(): Command[] {
           // Esc keeps your work: flush a final draft save, then close. An
           // opened-then-abandoned reply (auto-filled recipients, empty body)
           // isn't worth saving — composeHasContent handles that.
-          const c = u.compose;
-          if (composeHasContent(c)) {
-            const { draftId, draftAccount, ...payload } = c;
-            void backend
-              .saveDraft(draftId, draftAccount, JSON.stringify(payload))
-              .then(() => u.showToast("Draft saved"))
-              .catch(() => {});
+          if (composeHasContent(u.compose)) {
+            flushComposeDraft();
+            u.showToast("Draft saved");
           }
           return u.closeCompose();
         }

@@ -3,7 +3,7 @@ import type { CSSProperties } from "react";
 import { backend, isTauri } from "@/lib/ipc";
 import { commandBindings, runCommandById } from "@/lib/commands";
 import { installKeyboard } from "@/lib/keyboard";
-import { startUpdateChecks, useUpdater } from "@/lib/updater";
+import { startUpdateChecks, updatePromptSuppressed, useUpdater } from "@/lib/updater";
 import { needsConnect } from "@/lib/zero-state";
 import { clearMailCaches, splitThreads, useMail } from "@/stores/mail";
 import { useProfiles, useSettings } from "@/stores/settings";
@@ -100,6 +100,9 @@ export default function App() {
   const updateReady = useUpdater((s) => s.ready);
   const updateDownloading = useUpdater((s) => s.downloading);
   const updateError = useUpdater((s) => s.error);
+  // Nothing nags while the first full-history crawl is still running — the one
+  // moment a restart costs the most. Settings → About still says so.
+  const updateSuppressed = useUi((s) => updatePromptSuppressed(s.syncProgress));
   const loaded = useSettings((s) => s.loaded);
   const onboarded = useSettings((s) => s.settings.onboarded);
   const accounts = useSettings((s) => s.accounts);
@@ -401,13 +404,13 @@ export default function App() {
           </span>
         )}
         <div className="flex-1" />
-        {updateReady ? (
+        {updateReady && !updateSuppressed ? (
           <button
             className="zb-pop-in rounded-md bg-accent px-2.5 py-1 text-[12px] font-medium text-on-accent hover:opacity-90"
-            onClick={() => void useUpdater.getState().restart()}
-            title={`${updateReady} downloaded — restart to apply`}
+            onClick={() => void useUpdater.getState().installNow()}
+            title={`v${updateReady} downloaded — install now, or leave it and it installs when you quit`}
           >
-            Update ready — Restart
+            v{updateReady} ready — Install & restart
           </button>
         ) : updateDownloading ? (
           <span className="rounded-md border border-line px-2.5 py-1 text-[12px] text-ink-3">
