@@ -4,6 +4,15 @@ Raised 2026-07-26 alongside seven items that shipped the same session. These
 four were held back because each is a design problem, not a fix. Root causes
 below are investigated, not guessed.
 
+> **Status: all four shipped in v0.26.0.** The design that was actually built
+> is `2026-07-26-deferred-usage-items-design.md`; the reasoning is DECISIONS
+> #149–156. Three of the root causes below turned out to be understated, and
+> the corrections are recorded in the design doc — briefly: the calendar bug is
+> a single-slot active range clobbered by two mounted views, not `loadedDays`
+> authority (#11b); `format=metadata` would permanently poison the vector index
+> and was dropped (#10); and on Windows `downloadAndInstall()` already exits the
+> process, which is the mid-session install (#12).
+
 ---
 
 ## #3 — Recipient chips (drag to reorder, × to remove)
